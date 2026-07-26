@@ -36,10 +36,14 @@ struct PDFDocumentTabBar: View {
             } label: {
                 ZStack {
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(TiyiNoteTheme.surfaceRaised)
+                        .fill(TiyiNoteTheme.selectionBackground)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(TiyiNoteTheme.selectionBorder, lineWidth: 1)
+                        }
                     Image(systemName: "scribble.variable")
                         .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(TiyiNoteTheme.copperBright)
+                        .foregroundStyle(TiyiNoteTheme.selectionForeground)
                 }
                 .frame(width: 34, height: 34)
                 .frame(width: 52, height: 46)
@@ -111,11 +115,11 @@ private struct PDFDocumentTab: View {
                 HStack(spacing: 8) {
                     Image(systemName: "doc.richtext")
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(isActive ? TiyiNoteTheme.copperBright : TiyiNoteTheme.textTertiary)
+                        .foregroundStyle(isActive ? TiyiNoteTheme.selectionForeground : TiyiNoteTheme.textTertiary)
                     Text(document.title)
                         .font(.system(size: 13, weight: isActive ? .semibold : .medium))
                         .lineLimit(1)
-                        .foregroundStyle(isActive ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textSecondary)
+                        .foregroundStyle(isActive ? TiyiNoteTheme.selectionForeground : TiyiNoteTheme.textSecondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -126,7 +130,7 @@ private struct PDFDocumentTab: View {
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(isActive ? TiyiNoteTheme.textSecondary : TiyiNoteTheme.textTertiary)
+                        .foregroundStyle(isActive ? TiyiNoteTheme.selectionForeground.opacity(0.78) : TiyiNoteTheme.textTertiary)
                         .frame(width: 26, height: 30)
                         .contentShape(Rectangle())
                 }
@@ -138,9 +142,13 @@ private struct PDFDocumentTab: View {
         .padding(.trailing, 6)
         .frame(width: isActive ? 300 : 260, height: 42)
         .background(
-            TiyiNoteTheme.surface.opacity(0.62),
+            isActive ? TiyiNoteTheme.selectionBackground : TiyiNoteTheme.surface.opacity(0.62),
             in: RoundedRectangle(cornerRadius: 11, style: .continuous)
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(isActive ? TiyiNoteTheme.selectionBorder : Color.clear, lineWidth: 1)
+        }
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(isActive ? TiyiNoteTheme.activeUnderline : Color.clear)

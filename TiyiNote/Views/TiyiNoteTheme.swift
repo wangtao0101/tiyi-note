@@ -14,14 +14,14 @@ enum TiyiNoteTheme {
     static let textSecondary = Color(red: 0.690, green: 0.684, blue: 0.663)
     static let textTertiary = Color(red: 0.440, green: 0.440, blue: 0.432)
 
-    static let copper = Color(red: 0.824, green: 0.565, blue: 0.376)
-    static let copperBright = Color(red: 0.910, green: 0.670, blue: 0.490)
-    static let selectionBackground = Color(red: 0.165, green: 0.141, blue: 0.125)
-    static let selectionBorder = Color(red: 0.420, green: 0.306, blue: 0.231)
-    static let selectionForeground = Color(red: 0.941, green: 0.788, blue: 0.659)
-    static let selectionPressed = Color(red: 0.208, green: 0.169, blue: 0.145)
-    static let activeUnderline = Color(red: 0.824, green: 0.565, blue: 0.376)
-    static let lassoBlue = Color(red: 0.039, green: 0.518, blue: 1.000)
+    // One Goodnotes-style blue language for every selected and active state.
+    static let selectionBlue = Color(red: 0.039, green: 0.518, blue: 1.000)
+    static let selectionBackground = selectionBlue.opacity(0.15)
+    static let selectionBorder = selectionBlue.opacity(0.96)
+    static let selectionForeground = selectionBlue
+    static let selectionPressed = selectionBlue.opacity(0.24)
+    static let activeUnderline = selectionBlue
+    static let lassoBlue = selectionBlue
     static let success = Color(red: 0.455, green: 0.745, blue: 0.590)
     static let danger = Color(red: 0.895, green: 0.485, blue: 0.450)
 

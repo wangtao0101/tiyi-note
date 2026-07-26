@@ -74,12 +74,12 @@ struct ToolPaletteView: View {
                             in: selectedTool == .marker ? 8...28 : 0.1...8,
                             step: selectedTool == .marker ? 1 : 0.1
                         )
-                        .tint(TiyiNoteTheme.copper)
+                        .tint(TiyiNoteTheme.selectionBlue)
                         .frame(width: 104)
 
                         Text(activeWidthLabel)
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .foregroundStyle(TiyiNoteTheme.copperBright)
+                            .foregroundStyle(TiyiNoteTheme.selectionForeground)
                             .frame(width: 28, alignment: .trailing)
                     }
 
@@ -190,9 +190,10 @@ private struct ToolButton: View {
                         lineWidth: 1
                     )
             }
-            .contentShape(Capsule())
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(SmokedCopperButtonStyle(shape: .capsule, isSelected: isSelected))
+        .buttonStyle(SelectionButtonStyle(shape: .capsule, isSelected: isSelected))
         .accessibilityLabel(tool.title)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
@@ -219,7 +220,7 @@ private struct EraserSizePicker: View {
     @Binding var selection: CanvasEraserSize
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 0) {
             ForEach(CanvasEraserSize.allCases) { size in
                 Button {
                     selection = size
@@ -229,17 +230,21 @@ private struct EraserSizePicker: View {
                             .fill(
                                 selection == size
                                     ? TiyiNoteTheme.selectionBackground
-                                    : Color.clear
+                                    : Color.white.opacity(0.045)
                             )
-                            .stroke(
-                                selection == size
-                                    ? TiyiNoteTheme.selectionForeground
-                                    : TiyiNoteTheme.textSecondary,
-                                lineWidth: selection == size ? 1.8 : 1.2
-                            )
+                            .overlay {
+                                Circle()
+                                    .stroke(
+                                        selection == size
+                                            ? TiyiNoteTheme.selectionBorder
+                                            : TiyiNoteTheme.textSecondary.opacity(0.72),
+                                        lineWidth: selection == size ? 0.9 : 0.65
+                                    )
+                            }
                             .frame(width: size.previewDiameter, height: size.previewDiameter)
                     }
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("\(size.title)号橡皮擦")
@@ -270,8 +275,8 @@ private struct ColorSwatch: View {
                             lineWidth: isSelected ? 2.2 : 1.2
                         )
                 }
-                .frame(width: 30, height: 30)
-                .contentShape(Circle())
+                .frame(width: 40, height: 40)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(inkColor.title)
@@ -308,16 +313,17 @@ private struct ToolbarIconButton: View {
                             lineWidth: 1
                         )
                 }
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(SmokedCopperButtonStyle(shape: .roundedRectangle, isSelected: isHighlighted))
+        .buttonStyle(SelectionButtonStyle(shape: .roundedRectangle, isSelected: isHighlighted))
         .disabled(!isEnabled)
         .accessibilityLabel(title)
         .accessibilityAddTraits(isHighlighted ? .isSelected : [])
     }
 }
 
-private struct SmokedCopperButtonStyle: ButtonStyle {
+private struct SelectionButtonStyle: ButtonStyle {
     enum Shape {
         case capsule
         case roundedRectangle

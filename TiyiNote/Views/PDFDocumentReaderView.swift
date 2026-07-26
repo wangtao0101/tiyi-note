@@ -177,7 +177,7 @@ struct PDFDocumentReaderView: View {
 
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(TiyiNoteTheme.copper)
+                                .fill(TiyiNoteTheme.selectionBlue)
                                 .frame(width: 5, height: 5)
                             Text("\(currentPageIndex + 1) / \(documentStore.pageCount(for: documentID))")
                                 .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -287,8 +287,8 @@ private struct PDFPageAnnotationView: View {
                         .resizable()
                         .interpolation(.high)
                         .frame(width: bounds.width, height: bounds.height)
-                        .position(x: bounds.midX, y: bounds.midY)
                         .rotationEffect(.radians(Double(annotation.rotationRadians)))
+                        .position(x: bounds.midX, y: bounds.midY)
                         .allowsHitTesting(false)
                 }
 
@@ -537,6 +537,8 @@ private struct LassoSelectionOverlay: View {
     @State private var liveLassoPath: [CGPoint] = []
     @State private var selection: LassoStrokeSelection?
     @State private var transformOriginSelection: LassoStrokeSelection?
+    @State private var inputDragMode: LassoInputDragMode?
+    @State private var inputDragStart: CGPoint?
     @State private var feedbackText: String?
 
     var body: some View {
@@ -544,14 +546,18 @@ private struct LassoSelectionOverlay: View {
             ZStack(alignment: .topLeading) {
                 if isActive {
                     LassoInputView(
+                        shouldBeginDrag: { point, touchType in
+                            touchType != .direct
+                                || selectionContains(point, displaySize: geometry.size)
+                        },
                         onBegan: { point in
-                            beginLasso(at: point, displaySize: geometry.size)
+                            beginInputDrag(at: point, displaySize: geometry.size)
                         },
                         onMoved: { point in
-                            extendLasso(to: point, displaySize: geometry.size)
+                            updateInputDrag(to: point, displaySize: geometry.size)
                         },
                         onEnded: { point in
-                            finishLasso(at: point, displaySize: geometry.size)
+                            finishInputDrag(at: point, displaySize: geometry.size)
                         },
                         onTap: { point in
                             dismissSelectionIfNeeded(at: point, displaySize: geometry.size)
@@ -592,6 +598,7 @@ private struct LassoSelectionOverlay: View {
                     }
                 }
             }
+            .coordinateSpace(name: LassoCoordinateSpace.page)
         }
         .allowsHitTesting(isActive)
         .onChange(of: isActive) { _, active in
@@ -670,8 +677,8 @@ private struct LassoSelectionOverlay: View {
                     .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
-            .position(x: displayBounds.midX, y: displayBounds.midY)
             .rotationEffect(rotation)
+            .position(x: displayBounds.midX, y: displayBounds.midY)
             .gesture(moveSelectionGesture(displaySize: displaySize))
 
         Path { path in
@@ -713,6 +720,94 @@ private struct LassoSelectionOverlay: View {
             .position(rotationAnchor)
             .gesture(rotationSelectionGesture(displaySize: displaySize))
             .accessibilityLabel("旋转选中内容")
+    }
+
+    private func beginInputDrag(at displayPoint: CGPoint, displaySize: CGSize) {
+        if let selection, selectionContains(displayPoint, displaySize: displaySize) {
+            onBeginInteraction()
+            controller.cancelStrokeTransform()
+            transformOriginSelection = nil
+            liveLassoPath = []
+            feedbackText = nil
+            inputDragMode = .movingSelection
+            inputDragStart = logicalPoint(for: displayPoint, in: displaySize)
+            _ = beginTransformIfNeeded(for: selection)
+            return
+        }
+
+        inputDragMode = .drawingLasso
+        inputDragStart = nil
+        beginLasso(at: displayPoint, displaySize: displaySize)
+    }
+
+    private func updateInputDrag(to displayPoint: CGPoint, displaySize: CGSize) {
+        switch inputDragMode {
+        case .movingSelection:
+            updateFreeformSelectionMove(to: displayPoint, displaySize: displaySize)
+        case .drawingLasso:
+            extendLasso(to: displayPoint, displaySize: displaySize)
+        case nil:
+            break
+        }
+    }
+
+    private func finishInputDrag(at displayPoint: CGPoint, displaySize: CGSize) {
+        switch inputDragMode {
+        case .movingSelection:
+            updateFreeformSelectionMove(to: displayPoint, displaySize: displaySize)
+            if let origin = transformOriginSelection, let moved = selection {
+                let translation = CGSize(
+                    width: moved.logicalBounds.midX - origin.logicalBounds.midX,
+                    height: moved.logicalBounds.midY - origin.logicalBounds.midY
+                )
+                finishTransform(
+                    CGAffineTransform(
+                        translationX: translation.width,
+                        y: translation.height
+                    ),
+                    actionName: "移动选中笔迹"
+                )
+            }
+        case .drawingLasso:
+            finishLasso(at: displayPoint, displaySize: displaySize)
+        case nil:
+            break
+        }
+        inputDragMode = nil
+        inputDragStart = nil
+    }
+
+    private func updateFreeformSelectionMove(
+        to displayPoint: CGPoint,
+        displaySize: CGSize
+    ) {
+        guard
+            let origin = transformOriginSelection,
+            let inputDragStart
+        else { return }
+
+        let current = logicalPoint(for: displayPoint, in: displaySize)
+        let translation = CGSize(
+            width: current.x - inputDragStart.x,
+            height: current.y - inputDragStart.y
+        )
+        let transform = CGAffineTransform(
+            translationX: translation.width,
+            y: translation.height
+        )
+        var movedSelection = origin
+        movedSelection.logicalBounds = origin.logicalBounds.offsetBy(
+            dx: translation.width,
+            dy: translation.height
+        )
+        movedSelection.lassoPath = origin.lassoPath.map {
+            CGPoint(
+                x: $0.x + translation.width,
+                y: $0.y + translation.height
+            )
+        }
+        updateSelection(movedSelection)
+        controller.previewStrokeTransform(transform)
     }
 
     private func beginLasso(at displayPoint: CGPoint, displaySize: CGSize) {
@@ -893,11 +988,13 @@ private struct LassoSelectionOverlay: View {
         liveLassoPath = []
         selection = nil
         transformOriginSelection = nil
+        inputDragMode = nil
+        inputDragStart = nil
         feedbackText = nil
     }
 
     private func moveSelectionGesture(displaySize: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(LassoCoordinateSpace.page))
             .onChanged { value in
                 guard let selection else { return }
                 let origin = beginTransformIfNeeded(for: selection)
@@ -936,7 +1033,7 @@ private struct LassoSelectionOverlay: View {
         handle: LassoResizeHandle,
         displaySize: CGSize
     ) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(LassoCoordinateSpace.page))
             .onChanged { value in
                 guard let selection else { return }
                 let origin = beginTransformIfNeeded(for: selection)
@@ -966,7 +1063,7 @@ private struct LassoSelectionOverlay: View {
     }
 
     private func rotationSelectionGesture(displaySize: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(LassoCoordinateSpace.page))
             .onChanged { value in
                 guard let selection else { return }
                 let origin = beginTransformIfNeeded(for: selection)
@@ -1151,6 +1248,28 @@ private struct LassoSelectionOverlay: View {
         return isInside
     }
 
+    private func selectionContains(_ displayPoint: CGPoint, displaySize: CGSize) -> Bool {
+        guard let selection else { return false }
+        let point = logicalPoint(for: displayPoint, in: displaySize)
+
+        if selection.presentation == .freeform, selection.lassoPath.count >= 3 {
+            return polygonContains(point, polygon: selection.lassoPath)
+        }
+
+        let center = selection.logicalBounds.midPoint
+        let cosine = cos(-selection.rotationRadians)
+        let sine = sin(-selection.rotationRadians)
+        let dx = point.x - center.x
+        let dy = point.y - center.y
+        let localPoint = CGPoint(
+            x: center.x + cosine * dx - sine * dy,
+            y: center.y + sine * dx + cosine * dy
+        )
+        let hitSlop = max(3, logicalPageSize.width * 0.006)
+        return selection.logicalBounds.insetBy(dx: -hitSlop, dy: -hitSlop)
+            .contains(localPoint)
+    }
+
     private func rotationHandlePosition(
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
@@ -1182,7 +1301,12 @@ private struct LassoSelectionOverlay: View {
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
     ) -> CGPoint {
-        let bounds = displayRect(for: selection.axisAlignedBounds, in: displaySize)
+        // In box mode rotation must not orbit the action bar. The unrotated
+        // logical frame stays stable while the content and handles rotate.
+        let toolbarBounds = selection.presentation == .box
+            ? selection.logicalBounds
+            : selection.axisAlignedBounds
+        let bounds = displayRect(for: toolbarBounds, in: displaySize)
         let halfToolbarWidth: CGFloat = 174
         let x = min(max(bounds.midX, halfToolbarWidth + 8), displaySize.width - halfToolbarWidth - 8)
         let y: CGFloat
@@ -1258,7 +1382,7 @@ private struct LassoStrokeSelection {
 
     let content: LassoSelectionContent
     var logicalBounds: CGRect
-    let lassoPath: [CGPoint]
+    var lassoPath: [CGPoint]
     var presentation: Presentation
     var rotationRadians: CGFloat
 
@@ -1286,6 +1410,15 @@ private struct LassoStrokeSelection {
         let maxY = corners.map { $0.y }.max() ?? logicalBounds.maxY
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
+}
+
+private enum LassoInputDragMode {
+    case drawingLasso
+    case movingSelection
+}
+
+private enum LassoCoordinateSpace {
+    static let page = "tiyi.lasso.page"
 }
 
 private enum LassoResizeHandle: String, CaseIterable, Identifiable {
@@ -1401,6 +1534,7 @@ private struct LassoActionBar: View {
 }
 
 private struct LassoInputView: UIViewRepresentable {
+    let shouldBeginDrag: (CGPoint, UITouch.TouchType) -> Bool
     let onBegan: (CGPoint) -> Void
     let onMoved: (CGPoint) -> Void
     let onEnded: (CGPoint) -> Void
@@ -1416,7 +1550,7 @@ private struct LassoInputView: UIViewRepresentable {
         view.backgroundColor = .clear
         view.isMultipleTouchEnabled = true
 
-        let lassoGesture = UIPanGestureRecognizer(
+        let lassoGesture = LassoPanGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.handleLassoGesture(_:))
         )
@@ -1432,6 +1566,7 @@ private struct LassoInputView: UIViewRepresentable {
         ]
 #else
         lassoGesture.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.pencil.rawValue)
         ]
 #endif
@@ -1515,6 +1650,27 @@ private struct LassoInputView: UIViewRepresentable {
         ) -> Bool {
             otherGestureRecognizer is UIPinchGestureRecognizer
         }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let panGesture = gestureRecognizer as? LassoPanGestureRecognizer else {
+                return true
+            }
+            return parent.shouldBeginDrag(
+                panGesture.location(in: panGesture.view),
+                panGesture.initialTouchType
+            )
+        }
+    }
+}
+
+private final class LassoPanGestureRecognizer: UIPanGestureRecognizer {
+    private(set) var initialTouchType: UITouch.TouchType = .direct
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let firstTouch = touches.first {
+            initialTouchType = firstTouch.type
+        }
+        super.touchesBegan(touches, with: event)
     }
 }
 
