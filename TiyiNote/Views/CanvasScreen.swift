@@ -7,11 +7,11 @@ struct CanvasScreen: View {
     @StateObject private var documentStore = DrawingDocumentStore()
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
-    @AppStorage("canvas.tool") private var selectedTool = CanvasToolKind.pen
+    @State private var selectedTool = CanvasToolKind.pen
     @AppStorage("canvas.color") private var selectedColor = InkPaletteColor.graphite
-    @AppStorage("canvas.penWidth") private var penWidth = 4.0
+    @AppStorage("canvas.penWidth.v2") private var penWidth = 0.7
     @AppStorage("canvas.markerWidth") private var markerWidth = 16.0
-    @AppStorage("canvas.fingerDrawing") private var fingerDrawingEnabled = false
+    @AppStorage("canvas.eraserSize") private var eraserSize = CanvasEraserSize.medium
     @AppStorage("pdfWorkspace.showsThumbnails") private var showsThumbnails = false
 
     @State private var activeController: CanvasController?
@@ -41,7 +41,7 @@ struct CanvasScreen: View {
                     selectedColor: $selectedColor,
                     penWidth: $penWidth,
                     markerWidth: $markerWidth,
-                    fingerDrawingEnabled: $fingerDrawingEnabled,
+                    eraserSize: $eraserSize,
                     showsThumbnails: $showsThumbnails,
                     activeController: activeController,
                     onClear: requestClearCurrentPage
@@ -56,8 +56,11 @@ struct CanvasScreen: View {
                         selectedColor: selectedColor,
                         penWidth: penWidth,
                         markerWidth: markerWidth,
-                        fingerDrawingEnabled: fingerDrawingEnabled,
+                        eraserSize: eraserSize,
                         initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
+                        onSelectLassoTool: {
+                            selectedTool = .lasso
+                        },
                         onActiveCanvasChanged: { controller, pageIndex in
                             activeController = controller
                             activePageIndex = pageIndex
@@ -105,10 +108,6 @@ struct CanvasScreen: View {
     }
 
     private func prepareWorkspace() {
-#if targetEnvironment(simulator)
-        fingerDrawingEnabled = true
-#endif
-
         if !documentStore.openDocumentIDs.contains(activeDocumentID) {
             activeDocumentID = documentStore.openDocuments.first?.id ?? ""
         }

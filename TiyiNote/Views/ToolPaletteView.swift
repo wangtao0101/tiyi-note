@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct ToolPaletteView: View {
@@ -5,7 +6,7 @@ struct ToolPaletteView: View {
     @Binding var selectedColor: InkPaletteColor
     @Binding var penWidth: Double
     @Binding var markerWidth: Double
-    @Binding var fingerDrawingEnabled: Bool
+    @Binding var eraserSize: CanvasEraserSize
     @Binding var showsThumbnails: Bool
 
     let activeController: CanvasController?
@@ -13,6 +14,13 @@ struct ToolPaletteView: View {
 
     private var activeWidth: Binding<Double> {
         selectedTool == .marker ? $markerWidth : $penWidth
+    }
+
+    private var activeWidthLabel: String {
+        let width = activeWidth.wrappedValue
+        return width < 3
+            ? String(format: "%.1f", width)
+            : String(format: "%.0f", width)
     }
 
     var body: some View {
@@ -42,7 +50,7 @@ struct ToolPaletteView: View {
 
                 PaletteDivider()
 
-                if selectedTool != .eraser {
+                if selectedTool.usesInkSettings {
                     HStack(spacing: 8) {
                         ForEach(InkPaletteColor.allCases) { inkColor in
                             ColorSwatch(
@@ -63,29 +71,33 @@ struct ToolPaletteView: View {
 
                         Slider(
                             value: activeWidth,
-                            in: selectedTool == .marker ? 8...28 : 1.5...12
+                            in: selectedTool == .marker ? 8...28 : 0.1...8,
+                            step: selectedTool == .marker ? 1 : 0.1
                         )
                         .tint(TiyiNoteTheme.copper)
                         .frame(width: 104)
 
-                        Text("\(Int(activeWidth.wrappedValue))")
+                        Text(activeWidthLabel)
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
                             .foregroundStyle(TiyiNoteTheme.copperBright)
-                            .frame(width: 22, alignment: .trailing)
+                            .frame(width: 28, alignment: .trailing)
                     }
 
+                    PaletteDivider()
+                }
+
+                if selectedTool == .eraser {
+                    EraserSizePicker(selection: $eraserSize)
                     PaletteDivider()
                 }
 
                 if let activeController {
                     ActiveCanvasControls(
                         controller: activeController,
-                        fingerDrawingEnabled: $fingerDrawingEnabled,
                         onClear: onClear
                     )
                 } else {
                     InactiveCanvasControls(
-                        fingerDrawingEnabled: $fingerDrawingEnabled,
                         onClear: onClear
                     )
                 }
@@ -104,7 +116,6 @@ struct ToolPaletteView: View {
 
 private struct ActiveCanvasControls: View {
     @ObservedObject var controller: CanvasController
-    @Binding var fingerDrawingEnabled: Bool
     let onClear: () -> Void
 
     var body: some View {
@@ -121,42 +132,27 @@ private struct ActiveCanvasControls: View {
                 isEnabled: controller.canRedo,
                 action: controller.redo
             )
-            CommonCanvasControls(
-                fingerDrawingEnabled: $fingerDrawingEnabled,
-                onClear: onClear
-            )
+            CommonCanvasControls(onClear: onClear)
         }
     }
 }
 
 private struct InactiveCanvasControls: View {
-    @Binding var fingerDrawingEnabled: Bool
     let onClear: () -> Void
 
     var body: some View {
         HStack(spacing: 4) {
             ToolbarIconButton(symbol: "arrow.uturn.backward", title: "撤销", isEnabled: false) {}
             ToolbarIconButton(symbol: "arrow.uturn.forward", title: "重做", isEnabled: false) {}
-            CommonCanvasControls(
-                fingerDrawingEnabled: $fingerDrawingEnabled,
-                onClear: onClear
-            )
+            CommonCanvasControls(onClear: onClear)
         }
     }
 }
 
 private struct CommonCanvasControls: View {
-    @Binding var fingerDrawingEnabled: Bool
     let onClear: () -> Void
 
     var body: some View {
-        ToolbarIconButton(
-            symbol: fingerDrawingEnabled ? "hand.draw.fill" : "hand.draw",
-            title: fingerDrawingEnabled ? "关闭手指书写" : "开启手指书写",
-            isHighlighted: fingerDrawingEnabled
-        ) {
-            fingerDrawingEnabled.toggle()
-        }
         ToolbarIconButton(
             symbol: "trash",
             title: "清空当前页批注",
@@ -173,18 +169,16 @@ private struct ToolButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: tool.symbolName)
-                    .font(.system(size: 16, weight: .semibold))
-                if isSelected {
-                    Text(tool.title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .transition(.opacity.combined(with: .move(edge: .leading)))
+            Group {
+                if tool == .marker {
+                    HighlighterToolIcon()
+                } else {
+                    Image(systemName: tool.symbolName)
+                        .font(.system(size: 16, weight: .semibold))
                 }
             }
             .foregroundStyle(isSelected ? TiyiNoteTheme.selectionForeground : TiyiNoteTheme.textSecondary)
-            .padding(.horizontal, isSelected ? 13 : 10)
-            .frame(height: 38)
+            .frame(width: 38, height: 38)
             .background {
                 Capsule()
                     .fill(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
@@ -204,6 +198,57 @@ private struct ToolButton: View {
     }
 }
 
+private struct HighlighterToolIcon: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 1.5)
+                .frame(width: 8, height: 17)
+                .rotationEffect(.degrees(38))
+                .offset(y: -1)
+            Capsule()
+                .frame(width: 18, height: 2.5)
+                .opacity(0.72)
+                .offset(y: 8)
+        }
+        .frame(width: 20, height: 20)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct EraserSizePicker: View {
+    @Binding var selection: CanvasEraserSize
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(CanvasEraserSize.allCases) { size in
+                Button {
+                    selection = size
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(
+                                selection == size
+                                    ? TiyiNoteTheme.selectionBackground
+                                    : Color.clear
+                            )
+                            .stroke(
+                                selection == size
+                                    ? TiyiNoteTheme.selectionForeground
+                                    : TiyiNoteTheme.textSecondary,
+                                lineWidth: selection == size ? 1.8 : 1.2
+                            )
+                            .frame(width: size.previewDiameter, height: size.previewDiameter)
+                    }
+                    .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(size.title)号橡皮擦")
+                .accessibilityAddTraits(selection == size ? .isSelected : [])
+            }
+        }
+    }
+}
+
 private struct ColorSwatch: View {
     let inkColor: InkPaletteColor
     let isSelected: Bool
@@ -213,18 +258,17 @@ private struct ColorSwatch: View {
         Button(action: action) {
             Circle()
                 .fill(inkColor.color)
-                .frame(width: 22, height: 22)
+                .frame(width: 21, height: 21)
                 .overlay {
                     Circle()
-                        .stroke(TiyiNoteTheme.selectionForeground, lineWidth: 2)
-                        .padding(2)
-                        .opacity(isSelected ? 1 : 0)
-                }
-                .overlay {
-                    Circle()
-                        .stroke(TiyiNoteTheme.selectionBorder, lineWidth: 2)
-                        .padding(-3)
-                        .opacity(isSelected ? 1 : 0)
+                        .stroke(
+                            isSelected
+                                ? TiyiNoteTheme.selectionBorder
+                                : (inkColor == .graphite
+                                    ? Color.white.opacity(0.72)
+                                    : Color.white.opacity(0.30)),
+                            lineWidth: isSelected ? 2.2 : 1.2
+                        )
                 }
                 .frame(width: 30, height: 30)
                 .contentShape(Circle())

@@ -21,6 +21,7 @@ enum TiyiNoteTheme {
     static let selectionForeground = Color(red: 0.941, green: 0.788, blue: 0.659)
     static let selectionPressed = Color(red: 0.208, green: 0.169, blue: 0.145)
     static let activeUnderline = Color(red: 0.824, green: 0.565, blue: 0.376)
+    static let lassoBlue = Color(red: 0.039, green: 0.518, blue: 1.000)
     static let success = Color(red: 0.455, green: 0.745, blue: 0.590)
     static let danger = Color(red: 0.895, green: 0.485, blue: 0.450)
 

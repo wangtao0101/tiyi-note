@@ -16,6 +16,49 @@ struct PDFWorkspaceDocument: Identifiable, Hashable {
     let isBundled: Bool
 }
 
+struct CanvasImageAnnotation: Identifiable {
+    let id: UUID
+    let image: UIImage
+    var logicalBounds: CGRect
+    var rotationRadians: CGFloat
+}
+
+private struct StoredCanvasImageAnnotation: Codable {
+    let id: UUID
+    let pngData: Data
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let rotationRadians: Double
+
+    init?(_ annotation: CanvasImageAnnotation) {
+        guard let pngData = annotation.image.pngData() else { return nil }
+        id = annotation.id
+        self.pngData = pngData
+        x = Double(annotation.logicalBounds.minX)
+        y = Double(annotation.logicalBounds.minY)
+        width = Double(annotation.logicalBounds.width)
+        height = Double(annotation.logicalBounds.height)
+        rotationRadians = Double(annotation.rotationRadians)
+    }
+
+    var annotation: CanvasImageAnnotation? {
+        guard let image = UIImage(data: pngData) else { return nil }
+        return CanvasImageAnnotation(
+            id: id,
+            image: image,
+            logicalBounds: CGRect(
+                x: CGFloat(x),
+                y: CGFloat(y),
+                width: CGFloat(width),
+                height: CGFloat(height)
+            ),
+            rotationRadians: CGFloat(rotationRadians)
+        )
+    }
+}
+
 private struct ImportedPDFRecord: Codable {
     let id: String
     let title: String
@@ -209,6 +252,20 @@ final class DrawingDocumentStore: ObservableObject {
         return drawing
     }
 
+    func loadImageAnnotations(
+        forPage pageIndex: Int,
+        in documentID: String
+    ) -> [CanvasImageAnnotation] {
+        guard
+            let data = try? Data(contentsOf: imageAnnotationsURL(forPage: pageIndex, in: documentID)),
+            let storedAnnotations = try? JSONDecoder().decode(
+                [StoredCanvasImageAnnotation].self,
+                from: data
+            )
+        else { return [] }
+        return storedAnnotations.compactMap(\.annotation)
+    }
+
     func scheduleSave(
         _ drawing: PKDrawing,
         forPage pageIndex: Int,
@@ -238,6 +295,40 @@ final class DrawingDocumentStore: ObservableObject {
         }
     }
 
+    func scheduleSave(
+        _ imageAnnotations: [CanvasImageAnnotation],
+        forPage pageIndex: Int,
+        in documentID: String
+    ) {
+        let saveKey = "\(drawingKey(documentID: documentID, pageIndex: pageIndex))#images"
+        pendingSaves[saveKey]?.cancel()
+        guard
+            let data = try? JSONEncoder().encode(
+                imageAnnotations.compactMap(StoredCanvasImageAnnotation.init)
+            )
+        else {
+            saveState = .failed("图片批注无法保存")
+            return
+        }
+        saveState = .saving
+        let targetURL = imageAnnotationsURL(forPage: pageIndex, in: documentID)
+        pendingSaves[saveKey] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard !Task.isCancelled else { return }
+            do {
+                try await Task.detached(priority: .utility) {
+                    try data.write(to: targetURL, options: .atomic)
+                }.value
+                guard !Task.isCancelled else { return }
+                self?.pendingSaves[saveKey] = nil
+                self?.saveState = self?.pendingSaves.isEmpty == true ? .saved(Date()) : .saving
+            } catch {
+                self?.pendingSaves[saveKey] = nil
+                self?.saveState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
     func flush(
         _ drawing: PKDrawing,
         forPage pageIndex: Int,
@@ -250,6 +341,33 @@ final class DrawingDocumentStore: ObservableObject {
         do {
             try drawing.dataRepresentation().write(
                 to: drawingURL(forPage: pageIndex, in: documentID),
+                options: .atomic
+            )
+            saveState = pendingSaves.isEmpty ? .saved(Date()) : .saving
+        } catch {
+            saveState = .failed(error.localizedDescription)
+        }
+    }
+
+    func flush(
+        _ imageAnnotations: [CanvasImageAnnotation],
+        forPage pageIndex: Int,
+        in documentID: String
+    ) {
+        let saveKey = "\(drawingKey(documentID: documentID, pageIndex: pageIndex))#images"
+        pendingSaves[saveKey]?.cancel()
+        pendingSaves[saveKey] = nil
+        guard
+            let data = try? JSONEncoder().encode(
+                imageAnnotations.compactMap(StoredCanvasImageAnnotation.init)
+            )
+        else {
+            saveState = .failed("图片批注无法保存")
+            return
+        }
+        do {
+            try data.write(
+                to: imageAnnotationsURL(forPage: pageIndex, in: documentID),
                 options: .atomic
             )
             saveState = pendingSaves.isEmpty ? .saved(Date()) : .saving
@@ -377,6 +495,12 @@ final class DrawingDocumentStore: ObservableObject {
         return documentDrawingsDirectory.appendingPathComponent(
             String(format: "page-%04d.drawing", pageIndex + 1)
         )
+    }
+
+    private func imageAnnotationsURL(forPage pageIndex: Int, in documentID: String) -> URL {
+        drawingURL(forPage: pageIndex, in: documentID)
+            .deletingPathExtension()
+            .appendingPathExtension("images.json")
     }
 
     private func drawingKey(documentID: String, pageIndex: Int) -> String {
