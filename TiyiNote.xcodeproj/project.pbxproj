@@ -1,0 +1,406 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000101 /* TiyiNoteApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000201 /* TiyiNoteApp.swift */; };
+		100000000000000000000102 /* CanvasTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000202 /* CanvasTool.swift */; };
+		100000000000000000000103 /* CanvasController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000203 /* CanvasController.swift */; };
+		100000000000000000000104 /* DrawingDocumentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000204 /* DrawingDocumentStore.swift */; };
+		100000000000000000000105 /* CanvasScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000205 /* CanvasScreen.swift */; };
+		100000000000000000000106 /* PencilCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000206 /* PencilCanvasView.swift */; };
+		100000000000000000000107 /* ToolPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000207 /* ToolPaletteView.swift */; };
+		100000000000000000000108 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000208 /* Assets.xcassets */; };
+		100000000000000000000109 /* PDFPageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000211 /* PDFPageView.swift */; };
+		100000000000000000000110 /* Congruence.pdf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000212 /* Congruence.pdf */; };
+		100000000000000000000111 /* PDFWorkspaceChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000213 /* PDFWorkspaceChrome.swift */; };
+		100000000000000000000112 /* PDFDocumentReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000214 /* PDFDocumentReaderView.swift */; };
+		100000000000000000000113 /* Geometry.pdf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000215 /* Geometry.pdf */; };
+		100000000000000000000114 /* TiyiNoteTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000216 /* TiyiNoteTheme.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		100000000000000000000201 /* TiyiNoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteApp.swift; sourceTree = "<group>"; };
+		100000000000000000000202 /* CanvasTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasTool.swift; sourceTree = "<group>"; };
+		100000000000000000000203 /* CanvasController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasController.swift; sourceTree = "<group>"; };
+		100000000000000000000204 /* DrawingDocumentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DrawingDocumentStore.swift; sourceTree = "<group>"; };
+		100000000000000000000205 /* CanvasScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasScreen.swift; sourceTree = "<group>"; };
+		100000000000000000000206 /* PencilCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilCanvasView.swift; sourceTree = "<group>"; };
+		100000000000000000000207 /* ToolPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolPaletteView.swift; sourceTree = "<group>"; };
+		100000000000000000000208 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		100000000000000000000209 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000210 /* TiyiNote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TiyiNote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000211 /* PDFPageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFPageView.swift; sourceTree = "<group>"; };
+		100000000000000000000212 /* Congruence.pdf */ = {isa = PBXFileReference; lastKnownFileType = image.pdf; path = Congruence.pdf; sourceTree = "<group>"; };
+		100000000000000000000213 /* PDFWorkspaceChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFWorkspaceChrome.swift; sourceTree = "<group>"; };
+		100000000000000000000214 /* PDFDocumentReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFDocumentReaderView.swift; sourceTree = "<group>"; };
+		100000000000000000000215 /* Geometry.pdf */ = {isa = PBXFileReference; lastKnownFileType = image.pdf; path = Geometry.pdf; sourceTree = "<group>"; };
+		100000000000000000000216 /* TiyiNoteTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteTheme.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		100000000000000000000301 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		100000000000000000000401 = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000402 /* TiyiNote */,
+				100000000000000000000408 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		100000000000000000000402 /* TiyiNote */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000403 /* App */,
+				100000000000000000000404 /* Models */,
+				100000000000000000000405 /* Services */,
+				100000000000000000000406 /* Views */,
+				100000000000000000000407 /* Resources */,
+				100000000000000000000209 /* Info.plist */,
+			);
+			path = TiyiNote;
+			sourceTree = "<group>";
+		};
+		100000000000000000000403 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000201 /* TiyiNoteApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		100000000000000000000404 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000202 /* CanvasTool.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		100000000000000000000405 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000203 /* CanvasController.swift */,
+				100000000000000000000204 /* DrawingDocumentStore.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		100000000000000000000406 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000205 /* CanvasScreen.swift */,
+				100000000000000000000206 /* PencilCanvasView.swift */,
+				100000000000000000000207 /* ToolPaletteView.swift */,
+				100000000000000000000211 /* PDFPageView.swift */,
+				100000000000000000000213 /* PDFWorkspaceChrome.swift */,
+				100000000000000000000214 /* PDFDocumentReaderView.swift */,
+				100000000000000000000216 /* TiyiNoteTheme.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		100000000000000000000407 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000208 /* Assets.xcassets */,
+				100000000000000000000212 /* Congruence.pdf */,
+				100000000000000000000215 /* Geometry.pdf */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		100000000000000000000408 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000210 /* TiyiNote.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		100000000000000000000501 /* TiyiNote */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000702 /* Build configuration list for PBXNativeTarget "TiyiNote" */;
+			buildPhases = (
+				100000000000000000000302 /* Sources */,
+				100000000000000000000301 /* Frameworks */,
+				100000000000000000000303 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = TiyiNote;
+			productName = TiyiNote;
+			productReference = 100000000000000000000210 /* TiyiNote.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		100000000000000000000601 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2660;
+				LastUpgradeCheck = 2660;
+				TargetAttributes = {
+					100000000000000000000501 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+				};
+			};
+			buildConfigurationList = 100000000000000000000701 /* Build configuration list for PBXProject "TiyiNote" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				"zh-Hans",
+			);
+			mainGroup = 100000000000000000000401;
+			productRefGroup = 100000000000000000000408 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				100000000000000000000501 /* TiyiNote */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		100000000000000000000303 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000108 /* Assets.xcassets in Resources */,
+				100000000000000000000110 /* Congruence.pdf in Resources */,
+				100000000000000000000113 /* Geometry.pdf in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		100000000000000000000302 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000101 /* TiyiNoteApp.swift in Sources */,
+				100000000000000000000102 /* CanvasTool.swift in Sources */,
+				100000000000000000000103 /* CanvasController.swift in Sources */,
+				100000000000000000000104 /* DrawingDocumentStore.swift in Sources */,
+				100000000000000000000105 /* CanvasScreen.swift in Sources */,
+				100000000000000000000106 /* PencilCanvasView.swift in Sources */,
+				100000000000000000000107 /* ToolPaletteView.swift in Sources */,
+				100000000000000000000109 /* PDFPageView.swift in Sources */,
+				100000000000000000000111 /* PDFWorkspaceChrome.swift in Sources */,
+				100000000000000000000112 /* PDFDocumentReaderView.swift in Sources */,
+				100000000000000000000114 /* TiyiNoteTheme.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		100000000000000000000801 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		100000000000000000000802 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		100000000000000000000803 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TiyiNote/Info.plist;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tiyi.note;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		100000000000000000000804 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TiyiNote/Info.plist;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tiyi.note;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		100000000000000000000701 /* Build configuration list for PBXProject "TiyiNote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000801 /* Debug */,
+				100000000000000000000802 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000702 /* Build configuration list for PBXNativeTarget "TiyiNote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000803 /* Debug */,
+				100000000000000000000804 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 100000000000000000000601 /* Project object */;
+}

@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode build products
+build/
+DerivedData/
+*.xcarchive
+*.xcresult
+*.dSYM
+*.dSYM.zip
+*.ipa
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Swift Package Manager caches
+.build/
+.swiftpm/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+*.swp
+*.swo
+*~
