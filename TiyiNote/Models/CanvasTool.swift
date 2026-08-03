@@ -3,34 +3,57 @@ import SwiftUI
 
 enum CanvasToolKind: String, CaseIterable, Identifiable {
     case pen
+    case fountainPen
+    case pencil
+    case marker
     case eraser
     case lasso
-    case marker
+    case text
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .pen: "钢笔"
+        case .pen: "圆珠笔"
+        case .fountainPen: "钢笔"
+        case .pencil: "铅笔"
         case .marker: "荧光笔"
         case .eraser: "橡皮擦"
         case .lasso: "套索"
+        case .text: "文本"
         }
     }
 
     var symbolName: String {
         switch self {
         case .pen: "pencil.tip"
+        case .fountainPen: "pencil.and.scribble"
+        case .pencil: "pencil"
         case .eraser: "eraser.fill"
         case .lasso: "lasso"
         case .marker: "highlighter"
+        case .text: "textformat"
         }
     }
 
     var usesInkSettings: Bool {
         switch self {
-        case .pen, .marker: true
-        case .eraser, .lasso: false
+        case .pen, .fountainPen, .pencil, .marker: true
+        case .eraser, .lasso, .text: false
+        }
+    }
+}
+
+enum CanvasEraserMode: String, CaseIterable, Identifiable {
+    case precision
+    case stroke
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .precision: "精细"
+        case .stroke: "整笔"
         }
     }
 }
@@ -100,4 +123,25 @@ enum InkPaletteColor: String, CaseIterable, Identifiable {
     }
 
     var color: Color { Color(uiColor: uiColor) }
+
+    var rgbaHex: String {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        return String(
+            format: "#%02X%02X%02X%02X",
+            Int((red * 255).rounded()),
+            Int((green * 255).rounded()),
+            Int((blue * 255).rounded()),
+            Int((alpha * 255).rounded())
+        )
+    }
+
+    static func nearest(to rgbaHex: String) -> Self {
+        allCases.first {
+            $0.rgbaHex.caseInsensitiveCompare(rgbaHex) == .orderedSame
+        } ?? .graphite
+    }
 }

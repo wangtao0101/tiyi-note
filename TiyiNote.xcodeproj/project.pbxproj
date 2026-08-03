@@ -21,7 +21,29 @@
 		100000000000000000000112 /* PDFDocumentReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000214 /* PDFDocumentReaderView.swift */; };
 		100000000000000000000113 /* Geometry.pdf in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000215 /* Geometry.pdf */; };
 		100000000000000000000114 /* TiyiNoteTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000216 /* TiyiNoteTheme.swift */; };
+		100000000000000000000115 /* PlatformCapabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000217 /* PlatformCapabilities.swift */; };
+		100000000000000000000116 /* LibraryModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000218 /* LibraryModels.swift */; };
+		100000000000000000000117 /* RootWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000219 /* RootWorkspaceView.swift */; };
+		100000000000000000000118 /* LibraryBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000220 /* LibraryBrowserView.swift */; };
+		100000000000000000000119 /* CloudSyncModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000221 /* CloudSyncModels.swift */; };
+		100000000000000000000120 /* CloudLibrarySyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000222 /* CloudLibrarySyncCoordinator.swift */; };
+		100000000000000000000121 /* CloudKitSmokeHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000223 /* CloudKitSmokeHarness.swift */; };
+		100000000000000000000122 /* LibraryFeatureSmokeHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000224 /* LibraryFeatureSmokeHarness.swift */; };
+		100000000000000000000123 /* PageModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000225 /* PageModels.swift */; };
+		100000000000000000000124 /* CollaborationModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000226 /* CollaborationModels.swift */; };
+		100000000000000000000125 /* AutomaticBackupCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000227 /* AutomaticBackupCoordinator.swift */; };
+		100000000000000000000126 /* TiyiNoteTextInteractionUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000228 /* TiyiNoteTextInteractionUITests.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		100000000000000000000901 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 100000000000000000000601 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 100000000000000000000501;
+			remoteInfo = TiyiNote;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		100000000000000000000201 /* TiyiNoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteApp.swift; sourceTree = "<group>"; };
@@ -40,10 +62,30 @@
 		100000000000000000000214 /* PDFDocumentReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFDocumentReaderView.swift; sourceTree = "<group>"; };
 		100000000000000000000215 /* Geometry.pdf */ = {isa = PBXFileReference; lastKnownFileType = image.pdf; path = Geometry.pdf; sourceTree = "<group>"; };
 		100000000000000000000216 /* TiyiNoteTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteTheme.swift; sourceTree = "<group>"; };
+		100000000000000000000217 /* PlatformCapabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlatformCapabilities.swift; sourceTree = "<group>"; };
+		100000000000000000000218 /* LibraryModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryModels.swift; sourceTree = "<group>"; };
+		100000000000000000000219 /* RootWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootWorkspaceView.swift; sourceTree = "<group>"; };
+		100000000000000000000220 /* LibraryBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryBrowserView.swift; sourceTree = "<group>"; };
+		100000000000000000000221 /* CloudSyncModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncModels.swift; sourceTree = "<group>"; };
+		100000000000000000000222 /* CloudLibrarySyncCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudLibrarySyncCoordinator.swift; sourceTree = "<group>"; };
+		100000000000000000000223 /* CloudKitSmokeHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitSmokeHarness.swift; sourceTree = "<group>"; };
+		100000000000000000000224 /* LibraryFeatureSmokeHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryFeatureSmokeHarness.swift; sourceTree = "<group>"; };
+		100000000000000000000225 /* PageModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PageModels.swift; sourceTree = "<group>"; };
+		100000000000000000000226 /* CollaborationModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CollaborationModels.swift; sourceTree = "<group>"; };
+		100000000000000000000227 /* AutomaticBackupCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomaticBackupCoordinator.swift; sourceTree = "<group>"; };
+		100000000000000000000228 /* TiyiNoteTextInteractionUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteTextInteractionUITests.swift; sourceTree = "<group>"; };
+		100000000000000000000229 /* TiyiNoteUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TiyiNoteUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		100000000000000000000301 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		100000000000000000000304 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -57,6 +99,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000402 /* TiyiNote */,
+				100000000000000000000409 /* TiyiNoteUITests */,
 				100000000000000000000408 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -78,6 +121,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000201 /* TiyiNoteApp.swift */,
+				100000000000000000000219 /* RootWorkspaceView.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -86,6 +130,11 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000202 /* CanvasTool.swift */,
+				100000000000000000000217 /* PlatformCapabilities.swift */,
+				100000000000000000000218 /* LibraryModels.swift */,
+				100000000000000000000221 /* CloudSyncModels.swift */,
+				100000000000000000000225 /* PageModels.swift */,
+				100000000000000000000226 /* CollaborationModels.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -95,6 +144,10 @@
 			children = (
 				100000000000000000000203 /* CanvasController.swift */,
 				100000000000000000000204 /* DrawingDocumentStore.swift */,
+				100000000000000000000222 /* CloudLibrarySyncCoordinator.swift */,
+				100000000000000000000223 /* CloudKitSmokeHarness.swift */,
+				100000000000000000000224 /* LibraryFeatureSmokeHarness.swift */,
+				100000000000000000000227 /* AutomaticBackupCoordinator.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -102,6 +155,7 @@
 		100000000000000000000406 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				100000000000000000000220 /* LibraryBrowserView.swift */,
 				100000000000000000000205 /* CanvasScreen.swift */,
 				100000000000000000000206 /* PencilCanvasView.swift */,
 				100000000000000000000207 /* ToolPaletteView.swift */,
@@ -127,8 +181,17 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000210 /* TiyiNote.app */,
+				100000000000000000000229 /* TiyiNoteUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		100000000000000000000409 /* TiyiNoteUITests */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000228 /* TiyiNoteTextInteractionUITests.swift */,
+			);
+			path = TiyiNoteUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -151,6 +214,24 @@
 			productReference = 100000000000000000000210 /* TiyiNote.app */;
 			productType = "com.apple.product-type.application";
 		};
+		100000000000000000000502 /* TiyiNoteUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000703 /* Build configuration list for PBXNativeTarget "TiyiNoteUITests" */;
+			buildPhases = (
+				100000000000000000000305 /* Sources */,
+				100000000000000000000304 /* Frameworks */,
+				100000000000000000000306 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				100000000000000000000902 /* PBXTargetDependency */,
+			);
+			name = TiyiNoteUITests;
+			productName = TiyiNoteUITests;
+			productReference = 100000000000000000000229 /* TiyiNoteUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -163,6 +244,10 @@
 				TargetAttributes = {
 					100000000000000000000501 = {
 						CreatedOnToolsVersion = 26.6;
+					};
+					100000000000000000000502 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = 100000000000000000000501;
 					};
 				};
 			};
@@ -181,6 +266,7 @@
 			projectRoot = "";
 			targets = (
 				100000000000000000000501 /* TiyiNote */,
+				100000000000000000000502 /* TiyiNoteUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -193,6 +279,13 @@
 				100000000000000000000108 /* Assets.xcassets in Resources */,
 				100000000000000000000110 /* Congruence.pdf in Resources */,
 				100000000000000000000113 /* Geometry.pdf in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		100000000000000000000306 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -214,10 +307,37 @@
 				100000000000000000000111 /* PDFWorkspaceChrome.swift in Sources */,
 				100000000000000000000112 /* PDFDocumentReaderView.swift in Sources */,
 				100000000000000000000114 /* TiyiNoteTheme.swift in Sources */,
+				100000000000000000000115 /* PlatformCapabilities.swift in Sources */,
+				100000000000000000000116 /* LibraryModels.swift in Sources */,
+				100000000000000000000117 /* RootWorkspaceView.swift in Sources */,
+				100000000000000000000118 /* LibraryBrowserView.swift in Sources */,
+				100000000000000000000119 /* CloudSyncModels.swift in Sources */,
+				100000000000000000000120 /* CloudLibrarySyncCoordinator.swift in Sources */,
+				100000000000000000000121 /* CloudKitSmokeHarness.swift in Sources */,
+				100000000000000000000122 /* LibraryFeatureSmokeHarness.swift in Sources */,
+				100000000000000000000123 /* PageModels.swift in Sources */,
+				100000000000000000000124 /* CollaborationModels.swift in Sources */,
+				100000000000000000000125 /* AutomaticBackupCoordinator.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		100000000000000000000305 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000126 /* TiyiNoteTextInteractionUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		100000000000000000000902 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 100000000000000000000501 /* TiyiNote */;
+			targetProxy = 100000000000000000000901 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		100000000000000000000801 /* Debug */ = {
@@ -326,8 +446,10 @@
 		100000000000000000000803 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				APS_ENVIRONMENT = development;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = TiyiNote/TiyiNote.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 73P2BH4AUD;
@@ -335,15 +457,18 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TiyiNote/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				ICLOUD_CONTAINER_ENVIRONMENT = Development;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tiyi.note;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = com.tiyi.note.mac;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SUPPORTS_MACCATALYST = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_STRICT_CONCURRENCY = minimal;
 				SWIFT_VERSION = 5.0;
@@ -354,8 +479,10 @@
 		100000000000000000000804 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				APS_ENVIRONMENT = production;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = TiyiNote/TiyiNote.Release.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 73P2BH4AUD;
@@ -363,19 +490,72 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TiyiNote/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				ICLOUD_CONTAINER_ENVIRONMENT = Production;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tiyi.note;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = com.tiyi.note.mac;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SUPPORTS_MACCATALYST = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_STRICT_CONCURRENCY = minimal;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		100000000000000000000805 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 73P2BH4AUD;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.tiyi.note.uitests;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = com.tiyi.note.mac.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = TiyiNote;
+			};
+			name = Debug;
+		};
+		100000000000000000000806 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 73P2BH4AUD;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.tiyi.note.uitests;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = com.tiyi.note.mac.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = TiyiNote;
 			};
 			name = Release;
 		};
@@ -396,6 +576,15 @@
 			buildConfigurations = (
 				100000000000000000000803 /* Debug */,
 				100000000000000000000804 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000703 /* Build configuration list for PBXNativeTarget "TiyiNoteUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000805 /* Debug */,
+				100000000000000000000806 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

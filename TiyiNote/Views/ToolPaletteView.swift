@@ -1,15 +1,66 @@
 import Foundation
 import SwiftUI
 
+struct ReadOnlyToolPaletteView: View {
+    @Binding var showsThumbnails: Bool
+    let onSearch: () -> Void
+    let onDocumentAction: (DocumentOutputAction) -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ToolbarIconButton(
+                symbol: "rectangle.split.1x2",
+                title: showsThumbnails ? "关闭页面缩略图" : "打开页面缩略图",
+                isHighlighted: showsThumbnails
+            ) {
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    showsThumbnails.toggle()
+                }
+            }
+
+            PaletteDivider()
+
+            ToolbarIconButton(
+                symbol: "magnifyingglass",
+                title: "搜索 PDF",
+                action: onSearch
+            )
+
+            DocumentOutputMenu(onAction: onDocumentAction)
+
+            PaletteDivider()
+
+            Label("只读", systemImage: "eye")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(TiyiNoteTheme.textSecondary)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 52)
+        .background(TiyiNoteTheme.toolbar)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(TiyiNoteTheme.hairline)
+                .frame(height: 1)
+        }
+    }
+}
+
 struct ToolPaletteView: View {
     @Binding var selectedTool: CanvasToolKind
     @Binding var selectedColor: InkPaletteColor
     @Binding var penWidth: Double
     @Binding var markerWidth: Double
     @Binding var eraserSize: CanvasEraserSize
+    @Binding var eraserMode: CanvasEraserMode
     @Binding var showsThumbnails: Bool
 
     let activeController: CanvasController?
+    let onSearch: () -> Void
+    let onDocumentAction: (DocumentOutputAction) -> Void
+    let onInsertImage: () -> Void
+    let onInsertShape: (PageShapeKind) -> Void
     let onClear: () -> Void
 
     private var activeWidth: Binding<Double> {
@@ -24,20 +75,8 @@ struct ToolPaletteView: View {
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 0) {
             HStack(spacing: 10) {
-                ToolbarIconButton(
-                    symbol: "rectangle.split.1x2",
-                    title: showsThumbnails ? "关闭页面缩略图" : "打开页面缩略图",
-                    isHighlighted: showsThumbnails
-                ) {
-                    withAnimation(.easeInOut(duration: 0.22)) {
-                        showsThumbnails.toggle()
-                    }
-                }
-
-                PaletteDivider()
-
                 HStack(spacing: 5) {
                     ForEach(CanvasToolKind.allCases) { tool in
                         ToolButton(tool: tool, isSelected: selectedTool == tool) {
@@ -49,48 +88,121 @@ struct ToolPaletteView: View {
                 }
 
                 PaletteDivider()
+            }
+            .padding(.leading, 14)
 
-                if selectedTool.usesInkSettings {
-                    HStack(spacing: 8) {
-                        ForEach(InkPaletteColor.allCases) { inkColor in
-                            ColorSwatch(
-                                inkColor: inkColor,
-                                isSelected: selectedColor == inkColor
-                            ) {
-                                selectedColor = inkColor
-                            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ToolbarIconButton(
+                        symbol: "rectangle.split.1x2",
+                        title: showsThumbnails ? "关闭页面缩略图" : "打开页面缩略图",
+                        isHighlighted: showsThumbnails
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            showsThumbnails.toggle()
                         }
                     }
 
                     PaletteDivider()
 
-                    HStack(spacing: 8) {
-                        Image(systemName: "line.diagonal")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(TiyiNoteTheme.textSecondary)
+                    if selectedTool.usesInkSettings {
+                        HStack(spacing: 8) {
+                            ForEach(InkPaletteColor.allCases) { inkColor in
+                                ColorSwatch(
+                                    inkColor: inkColor,
+                                    isSelected: selectedColor == inkColor
+                                ) {
+                                    selectedColor = inkColor
+                                }
+                            }
+                        }
 
-                        Slider(
-                            value: activeWidth,
-                            in: selectedTool == .marker ? 8...28 : 0.1...8,
-                            step: selectedTool == .marker ? 1 : 0.1
+                        PaletteDivider()
+                    }
+
+                    ToolbarIconButton(
+                        symbol: "magnifyingglass",
+                        title: "搜索 PDF",
+                        action: onSearch
+                    )
+
+                    DocumentOutputMenu(onAction: onDocumentAction)
+
+                    PaletteDivider()
+
+                    HStack(spacing: 4) {
+                        ToolbarIconButton(
+                            symbol: "photo",
+                            title: "插入图片",
+                            action: onInsertImage
                         )
-                        .tint(TiyiNoteTheme.selectionBlue)
-                        .frame(width: 104)
-
-                        Text(activeWidthLabel)
-                            .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .foregroundStyle(TiyiNoteTheme.selectionForeground)
-                            .frame(width: 28, alignment: .trailing)
+                        Menu {
+                            ForEach(PageShapeKind.allCases) { shape in
+                                Button {
+                                    onInsertShape(shape)
+                                } label: {
+                                    Label(shape.title, systemImage: shape.symbolName)
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "square.on.circle")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(TiyiNoteTheme.textPrimary)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("插入图形")
                     }
 
                     PaletteDivider()
                 }
+                .padding(.horizontal, 10)
+            }
+            .accessibilityIdentifier("tool-settings-scroll")
 
-                if selectedTool == .eraser {
-                    EraserSizePicker(selection: $eraserSize)
-                    PaletteDivider()
+            if selectedTool.usesInkSettings {
+                HStack(spacing: 8) {
+                    Image(systemName: "line.diagonal")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(TiyiNoteTheme.textSecondary)
+
+                    InkWidthSlider(
+                        value: activeWidth,
+                        range: selectedTool == .marker ? 8...28 : 0.1...8,
+                        step: selectedTool == .marker ? 1 : 0.1
+                    )
+
+                    Text(activeWidthLabel)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(TiyiNoteTheme.selectionForeground)
+                        .frame(width: 28, alignment: .trailing)
                 }
+                .padding(.horizontal, 8)
+            }
 
+            if selectedTool == .eraser {
+                HStack(spacing: 8) {
+                    Picker("橡皮模式", selection: $eraserMode) {
+                        ForEach(CanvasEraserMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 116)
+                    .accessibilityIdentifier("eraser-mode-picker")
+
+                    if eraserMode == .precision {
+                        EraserSizePicker(selection: $eraserSize)
+                    }
+                }
+                .padding(.horizontal, 8)
+            }
+
+            Rectangle()
+                .fill(TiyiNoteTheme.hairline)
+                .frame(width: 1, height: 30)
+
+            Group {
                 if let activeController {
                     ActiveCanvasControls(
                         controller: activeController,
@@ -102,7 +214,7 @@ struct ToolPaletteView: View {
                     )
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 8)
         }
         .frame(height: 58)
         .background(TiyiNoteTheme.toolbar)
@@ -111,6 +223,56 @@ struct ToolPaletteView: View {
                 .fill(TiyiNoteTheme.hairline)
                 .frame(height: 1)
         }
+    }
+}
+
+private struct InkWidthSlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+
+    private let sliderWidth: CGFloat = 104
+
+    var body: some View {
+        Slider(value: $value, in: range, step: step)
+            .tint(TiyiNoteTheme.selectionBlue)
+            .frame(width: sliderWidth, height: 32)
+            .accessibilityIdentifier("ink-width-slider")
+    }
+}
+
+private struct DocumentOutputMenu: View {
+    let onAction: (DocumentOutputAction) -> Void
+
+    var body: some View {
+        Menu {
+            Button { onAction(.flattenedPDF) } label: {
+                Label("分享扁平 PDF", systemImage: "doc.richtext")
+            }
+            Button { onAction(.pageImages) } label: {
+                Label("导出页面图片", systemImage: "photo.on.rectangle.angled")
+            }
+            Button { onAction(.editablePackage) } label: {
+                Label("导出可编辑文稿", systemImage: "shippingbox")
+            }
+            Divider()
+            Button { onAction(.collaboration) } label: {
+                Label("多人协作", systemImage: "person.2.badge.plus")
+            }
+            Button { onAction(.conflictVersions) } label: {
+                Label("冲突版本", systemImage: "arrow.triangle.branch")
+            }
+            Button { onAction(.printDocument) } label: {
+                Label("打印", systemImage: "printer")
+            }
+        } label: {
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(TiyiNoteTheme.textPrimary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("导出、分享和打印")
     }
 }
 
@@ -195,6 +357,8 @@ private struct ToolButton: View {
         }
         .buttonStyle(SelectionButtonStyle(shape: .capsule, isSelected: isSelected))
         .accessibilityLabel(tool.title)
+        .accessibilityIdentifier("tool-\(tool.rawValue)")
+        .accessibilityValue(isSelected ? "selected" : "not-selected")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
@@ -280,6 +444,8 @@ private struct ColorSwatch: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(inkColor.title)
+        .accessibilityIdentifier("ink-color-\(inkColor.rawValue)")
+        .accessibilityValue(isSelected ? "selected" : "not-selected")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
