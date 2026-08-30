@@ -9,7 +9,7 @@ struct RootWorkspaceView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @ObservedObject var documentStore: DrawingDocumentStore
-    @StateObject private var automaticBackupCoordinator: AutomaticBackupCoordinator
+    let onExit: (() -> Void)?
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
     @State private var destination = RootDestination.library
@@ -20,11 +20,12 @@ struct RootWorkspaceView: View {
     @State private var isPreparingCollaboration = false
     @State private var collaborationErrorMessage: String?
 
-    init(documentStore: DrawingDocumentStore) {
+    init(
+        documentStore: DrawingDocumentStore,
+        onExit: (() -> Void)? = nil
+    ) {
         self.documentStore = documentStore
-        _automaticBackupCoordinator = StateObject(
-            wrappedValue: AutomaticBackupCoordinator(documentStore: documentStore)
-        )
+        self.onExit = onExit
     }
 
     var body: some View {
@@ -33,7 +34,11 @@ struct RootWorkspaceView: View {
             case .library:
                 LibraryBrowserView(
                     documentStore: documentStore,
-                    automaticBackupCoordinator: automaticBackupCoordinator,
+                    onExit: onExit,
+                    onSyncNow: {
+                        await refreshSharedDocuments()
+                        await synchronizeAllCloudZones()
+                    },
                     onOpenDocument: openDocument,
                     canEditDocument: canEditDocument,
                     onCollaborateDocument: presentCollaboration
@@ -50,17 +55,7 @@ struct RootWorkspaceView: View {
             }
         }
         .animation(.easeInOut(duration: 0.16), value: destination)
-        .preferredColorScheme(.dark)
-        .overlay(alignment: .bottomLeading) {
-            if destination == .library {
-                HStack(spacing: 8) {
-                    CloudSyncStatusView(status: documentStore.cloudSyncStatus)
-                    AutomaticBackupStatusView(state: automaticBackupCoordinator.state)
-                }
-                    .padding(12)
-                    .padding(.bottom, 68)
-            }
-        }
+        .tint(TiyiNoteTheme.selectionBlue)
         .overlay {
             if isPreparingCollaboration {
                 ZStack {
@@ -102,9 +97,14 @@ struct RootWorkspaceView: View {
             await synchronizeAllCloudZones()
         }
         .task(id: collaborationPollingIdentity) {
-            guard scenePhase == .active, !sharedSyncCoordinators.isEmpty else { return }
+            guard scenePhase == .active else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                // Keep discovering invitations even before the first shared document exists.
+                // Active collaborations use a short interval; an empty library polls quietly.
+                let interval: UInt64 = sharedSyncCoordinators.isEmpty
+                    ? 30_000_000_000
+                    : 4_000_000_000
+                try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled else { return }
                 // Refresh CKShare permission before accepting another local edit window. Push is
                 // only a latency hint; polling also catches owner downgrades/revocations.
@@ -115,7 +115,6 @@ struct RootWorkspaceView: View {
             }
         }
         .onChange(of: documentStore.cloudSyncGeneration) { _, _ in
-            automaticBackupCoordinator.scheduleBackup()
             Task {
                 await scheduleAllCloudZones()
             }
@@ -259,7 +258,11 @@ struct RootWorkspaceView: View {
                 await cloudSyncCoordinator.setExcludedDocumentIDs(Set(zonesByDocumentID.keys))
             }
         } catch {
-            collaborationErrorMessage = error.localizedDescription
+            // Shared-zone discovery is background maintenance. Apple gateway/network failures
+            // retry automatically and must not interrupt the user with a collaboration alert.
+            if cloudKitTransientRetryDelay(for: error) == nil {
+                collaborationErrorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -279,7 +282,6 @@ struct RootWorkspaceView: View {
         for coordinator in sharedSyncCoordinators.values {
             await coordinator.syncNow()
         }
-        automaticBackupCoordinator.scheduleBackup()
     }
 
     @MainActor
@@ -399,115 +401,4 @@ private struct CloudSharingControllerView: UIViewControllerRepresentable {
 private enum RootDestination: Hashable {
     case library
     case workspace
-}
-
-private struct CloudSyncStatusView: View {
-    let status: CloudLibrarySyncStatus
-
-    var body: some View {
-        HStack(spacing: 6) {
-            if showsProgress {
-                ProgressView()
-                    .controlSize(.mini)
-            } else {
-                Image(systemName: symbol)
-            }
-            Text(label)
-        }
-        .font(.system(size: 11, weight: .semibold))
-        .foregroundStyle(color)
-        .padding(.horizontal, 10)
-        .frame(height: 30)
-        .background(TiyiNoteTheme.chrome.opacity(0.94), in: Capsule())
-        .overlay {
-            Capsule().stroke(TiyiNoteTheme.hairline, lineWidth: 1)
-        }
-        .accessibilityLabel(label)
-    }
-
-    private var showsProgress: Bool {
-        switch status {
-        case .scheduled, .syncing: true
-        default: false
-        }
-    }
-
-    private var symbol: String {
-        switch status {
-        case .idle, .scheduled, .syncing: "icloud"
-        case .succeeded: "checkmark.icloud.fill"
-        case .waitingForAccount: "person.crop.circle.badge.exclamationmark"
-        case .waitingForNetwork: "wifi.slash"
-        case .failed: "exclamationmark.icloud.fill"
-        }
-    }
-
-    private var label: String {
-        switch status {
-        case .idle: "iCloud 待同步"
-        case .scheduled, .syncing: "iCloud 同步中"
-        case .succeeded: "iCloud 已同步"
-        case .waitingForAccount: "请登录 iCloud"
-        case .waitingForNetwork: "等待网络"
-        case .failed: "iCloud 同步失败"
-        }
-    }
-
-    private var color: Color {
-        switch status {
-        case .succeeded: TiyiNoteTheme.success
-        case .waitingForAccount, .waitingForNetwork, .failed: TiyiNoteTheme.danger
-        default: TiyiNoteTheme.textSecondary
-        }
-    }
-}
-
-private struct AutomaticBackupStatusView: View {
-    let state: AutomaticBackupState
-
-    var body: some View {
-        if case .disabled = state {
-            EmptyView()
-        } else {
-            HStack(spacing: 6) {
-                if case .backingUp = state {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Image(systemName: symbol)
-                }
-                Text(label)
-            }
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(color)
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(TiyiNoteTheme.chrome.opacity(0.94), in: Capsule())
-            .overlay { Capsule().stroke(TiyiNoteTheme.hairline, lineWidth: 1) }
-            .accessibilityLabel(label)
-        }
-    }
-
-    private var symbol: String {
-        switch state {
-        case .failed: "externaldrive.badge.exclamationmark"
-        default: "checkmark.circle.fill"
-        }
-    }
-
-    private var label: String {
-        switch state {
-        case .disabled: ""
-        case .ready: "备份已开启"
-        case .backingUp: "正在备份"
-        case .failed: "自动备份失败"
-        }
-    }
-
-    private var color: Color {
-        switch state {
-        case .failed: TiyiNoteTheme.danger
-        case .ready: TiyiNoteTheme.success
-        default: TiyiNoteTheme.textSecondary
-        }
-    }
 }

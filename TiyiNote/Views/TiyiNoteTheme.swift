@@ -1,18 +1,49 @@
 import SwiftUI
+import UIKit
 
 enum TiyiNoteTheme {
-    static let workspace = Color(red: 0.028, green: 0.030, blue: 0.034)
-    static let chrome = Color(red: 0.045, green: 0.047, blue: 0.053)
-    static let toolbar = Color(red: 0.075, green: 0.078, blue: 0.087)
-    static let sidebar = Color(red: 0.037, green: 0.037, blue: 0.041)
-    static let surface = Color(red: 0.095, green: 0.098, blue: 0.108)
-    static let surfaceRaised = Color(red: 0.125, green: 0.129, blue: 0.142)
-    static let surfaceSelected = Color(red: 0.158, green: 0.162, blue: 0.177)
+    static let workspace = adaptive(
+        light: rgb(0.969, 0.976, 0.984),
+        dark: rgb(0.028, 0.030, 0.034)
+    )
+    static let chrome = adaptive(
+        light: rgb(1.000, 1.000, 1.000),
+        dark: rgb(0.045, 0.047, 0.053)
+    )
+    static let toolbar = adaptive(
+        light: rgb(1.000, 1.000, 1.000),
+        dark: rgb(0.075, 0.078, 0.087)
+    )
+    static let sidebar = adaptive(
+        light: rgb(0.949, 0.961, 0.976),
+        dark: rgb(0.037, 0.037, 0.041)
+    )
+    static let surface = adaptive(
+        light: rgb(1.000, 1.000, 1.000),
+        dark: rgb(0.095, 0.098, 0.108)
+    )
+    static let surfaceRaised = adaptive(
+        light: rgb(0.941, 0.953, 0.969),
+        dark: rgb(0.125, 0.129, 0.142)
+    )
+    static let surfaceSelected = adaptive(
+        light: rgb(0.890, 0.925, 0.980),
+        dark: rgb(0.158, 0.162, 0.177)
+    )
 
     static let paperWhite = Color(red: 0.945, green: 0.928, blue: 0.892)
-    static let textPrimary = Color(red: 0.955, green: 0.945, blue: 0.922)
-    static let textSecondary = Color(red: 0.690, green: 0.684, blue: 0.663)
-    static let textTertiary = Color(red: 0.440, green: 0.440, blue: 0.432)
+    static let textPrimary = adaptive(
+        light: UIColor.black,
+        dark: rgb(0.955, 0.945, 0.922)
+    )
+    static let textSecondary = adaptive(
+        light: UIColor.black.withAlphaComponent(0.62),
+        dark: rgb(0.690, 0.684, 0.663)
+    )
+    static let textTertiary = adaptive(
+        light: UIColor.black.withAlphaComponent(0.42),
+        dark: rgb(0.440, 0.440, 0.432)
+    )
 
     // One Goodnotes-style blue language for every selected and active state.
     static let selectionBlue = Color(red: 0.039, green: 0.518, blue: 1.000)
@@ -25,6 +56,22 @@ enum TiyiNoteTheme {
     static let success = Color(red: 0.455, green: 0.745, blue: 0.590)
     static let danger = Color(red: 0.895, green: 0.485, blue: 0.450)
 
-    static let hairline = Color.white.opacity(0.095)
-    static let strongHairline = Color.white.opacity(0.15)
+    static let hairline = adaptive(
+        light: UIColor.black.withAlphaComponent(0.075),
+        dark: UIColor.white.withAlphaComponent(0.095)
+    )
+    static let strongHairline = adaptive(
+        light: UIColor.black.withAlphaComponent(0.125),
+        dark: UIColor.white.withAlphaComponent(0.15)
+    )
+
+    private static func adaptive(light: UIColor, dark: UIColor) -> Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark ? dark : light
+        })
+    }
+
+    private static func rgb(_ red: CGFloat, _ green: CGFloat, _ blue: CGFloat) -> UIColor {
+        UIColor(red: red, green: green, blue: blue, alpha: 1)
+    }
 }

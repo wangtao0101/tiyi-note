@@ -467,7 +467,7 @@ private struct EmptyPDFWorkspaceView: View {
                     .buttonStyle(.borderedProminent)
             }
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(TiyiNoteTheme.textPrimary)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

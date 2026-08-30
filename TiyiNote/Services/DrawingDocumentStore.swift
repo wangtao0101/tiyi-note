@@ -186,6 +186,7 @@ final class DrawingDocumentStore: ObservableObject {
     @Published private(set) var pageAssetGeneration: UInt64 = 0
     @Published private(set) var pageAssetRevisions: [LibraryPageReference: UInt64] = [:]
     @Published private(set) var cloudSyncStatus: CloudLibrarySyncStatus = .idle
+    @Published private(set) var lastCloudSyncAt: Date?
     @Published private(set) var cloudSyncGeneration = 0
 
     private let fileManager: FileManager
@@ -220,6 +221,7 @@ final class DrawingDocumentStore: ObservableObject {
     ) {
         self.fileManager = fileManager
         self.userDefaults = userDefaults
+        lastCloudSyncAt = userDefaults.object(forKey: Self.lastCloudSyncAtKey) as? Date
 
         let applicationSupport = fileManager.urls(
             for: .applicationSupportDirectory,
@@ -338,6 +340,7 @@ final class DrawingDocumentStore: ObservableObject {
 
     private static let replicaActorKeychainService = "com.tiyi.note.collaboration-replica"
     private static let replicaActorKeychainAccount = "actor-id"
+    private static let lastCloudSyncAtKey = "cloudSync.lastSucceededAt"
 
     private static func replicaActorIDFromKeychain() -> String? {
         let query: [String: Any] = [
@@ -3122,6 +3125,10 @@ final class DrawingDocumentStore: ObservableObject {
 
     func cloudSyncDidUpdateStatus(_ status: CloudLibrarySyncStatus) {
         cloudSyncStatus = status
+        if case .succeeded(let date) = status {
+            lastCloudSyncAt = date
+            userDefaults.set(date, forKey: Self.lastCloudSyncAtKey)
+        }
     }
 
     func setReadOnlySharedDocumentIDs(_ documentIDs: Set<String>) {
@@ -4687,6 +4694,11 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func defaultBundledMetadata() -> [LibraryDocumentMetadata] {
+        let includesBundledSamples = Bundle.main.object(
+            forInfoDictionaryKey: "TiyiDocumentsIncludesBundledSamples"
+        ) as? Bool ?? true
+        guard includesBundledSamples else { return [] }
+
         // A fixed old timestamp lets a genuinely renamed/moved CloudKit sample always win over a
         // pristine sample installed for the first time on another device.
         let pristineDate = Date(timeIntervalSince1970: 0)

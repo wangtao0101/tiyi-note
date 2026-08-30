@@ -34,7 +34,7 @@ private actor CloudLibrarySyncTransactionGate {
 /// Synchronizes the shared library model through one custom zone in the user's private database.
 /// It uses zone-change tokens rather than queries, so the CloudKit schema needs no query indexes.
 actor CloudLibrarySyncCoordinator {
-    static let containerIdentifier = "iCloud.com.tiyi.note"
+    static let containerIdentifier = "iCloud.com.tiyi.app"
     static let defaultZoneName = "TiyiNoteLibrary"
     static let documentShareZonePrefix = "TiyiNoteDocument."
 
@@ -240,7 +240,10 @@ actor CloudLibrarySyncCoordinator {
     }
 
     private weak var dataSource: (any CloudLibrarySyncDataSource)?
-    private let logger = Logger(subsystem: "com.tiyi.note", category: "CloudSync")
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.tiyi.chat",
+        category: "CloudSync"
+    )
     private let container: CKContainer
     private let database: CKDatabase
     private let databaseScope: CKDatabase.Scope
@@ -2556,39 +2559,15 @@ actor CloudLibrarySyncCoordinator {
     private func reportFailure(_ error: Error) async {
         if let syncError = error as? SyncError, case .accountUnavailable = syncError {
             await reportStatus(.waitingForAccount)
-        } else if isNetworkError(error) {
+        } else if cloudKitTransientRetryDelay(for: error) != nil {
             await reportStatus(.waitingForNetwork)
         } else {
             await reportStatus(.failed(error.localizedDescription))
         }
     }
 
-    private func isNetworkError(_ error: Error) -> Bool {
-        guard let error = error as? CKError else { return false }
-        switch error.code {
-        case .networkUnavailable, .networkFailure, .serviceUnavailable, .zoneBusy:
-            return true
-        default:
-            return false
-        }
-    }
-
     private func retryDelayIfTransient(_ error: Error) -> TimeInterval? {
-        guard let error = error as? CKError else { return nil }
-        let suggested = (error.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
-        let httpStatus = (error.userInfo["CKHTTPStatus"] as? NSNumber)?.intValue
-        switch error.code {
-        case .networkUnavailable, .networkFailure, .serviceUnavailable, .zoneBusy,
-             .requestRateLimited:
-            return max(suggested ?? 15, 2)
-        case .serverRejectedRequest where httpStatus.map({ $0 >= 500 }) == true:
-            // A newly provisioned container can briefly surface Apple backend failures as
-            // serverRejectedRequest instead of serviceUnavailable. Retry only 5xx responses;
-            // schema/permission rejections remain terminal and visible to the user.
-            return max(suggested ?? 15, 2)
-        default:
-            return nil
-        }
+        cloudKitTransientRetryDelay(for: error)
     }
 
     private func scheduleRetry(after delay: TimeInterval) {
@@ -2599,6 +2578,39 @@ actor CloudLibrarySyncCoordinator {
             guard !Task.isCancelled else { return }
             await self?.synchronizeReportingErrors()
         }
+    }
+}
+
+/// CloudKit sometimes wraps an Apple gateway 5xx in `serverRejectedRequest` (code 15).
+/// Treat only transport/service failures as retryable; schema and permission rejections stay
+/// visible because retrying them cannot repair the configuration.
+func cloudKitTransientRetryDelay(for error: Error) -> TimeInterval? {
+    guard let cloudError = error as? CKError else { return nil }
+
+    let suggested = (cloudError.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
+    let fallbackDelay = max(suggested ?? 15, 2)
+    switch cloudError.code {
+    case .networkUnavailable, .networkFailure, .serviceUnavailable, .zoneBusy,
+         .requestRateLimited:
+        return fallbackDelay
+    case .serverRejectedRequest:
+        let directStatus = (cloudError.userInfo["CKHTTPStatus"] as? NSNumber)?.intValue
+        let underlyingStatus = (cloudError.userInfo[NSUnderlyingErrorKey] as? NSError)?
+            .userInfo["CKHTTPStatus"] as? NSNumber
+        guard (directStatus ?? underlyingStatus?.intValue).map({ $0 >= 500 }) == true else {
+            return nil
+        }
+        return fallbackDelay
+    case .partialFailure:
+        guard let partialErrors = cloudError.userInfo[CKPartialErrorsByItemIDKey]
+            as? [AnyHashable: Error],
+              !partialErrors.isEmpty
+        else { return nil }
+        let delays = partialErrors.values.compactMap(cloudKitTransientRetryDelay(for:))
+        guard delays.count == partialErrors.count else { return nil }
+        return delays.max()
+    default:
+        return nil
     }
 }
 

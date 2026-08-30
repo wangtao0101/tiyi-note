@@ -95,21 +95,18 @@ frontier 保存，会创建独立 actor 分支，避免错误宣称它已经看�
 处理动作本身也写入 operation，其他参与者会看到相同结果。日志回收只有在 CKShare 当前
 所有参与者 ACK 对应 frontier 后才安全；现阶段仅计算安全集合，不执行破坏性 GC。
 
-## 同步与备份
+## iCloud 同步
 
-CloudKit 是同步层，不是备份：一个设备上的永久删除会同步到其他设备。独立的自动备份由
-用户在 Files/iCloud Drive 中选择目录，应用持久化目录授权，并在文稿稳定落盘后 debounce
-生成版本化 `.tiyinote` 包。备份先在同一卷 staging，rename 成功后才裁剪旧版本，默认每个
-文稿保留 10 版，可设置 3–30 版；状态和失败原因会显示在资料库界面。
-
-从自动备份恢复时会为文稿、页面、operation 和对象重写身份，因此可以恢复已永久删除的
-内容，同时不会与 CloudKit 中旧 ID 的删除墓碑冲突。
+CloudKit 是资料库唯一的云同步通道：文稿变化、应用进入前台以及远端推送都会触发自动同步。
+资料库工具栏的 iCloud 状态面板显示当前状态和上次成功时间，并提供“现在同步”操作。产品界面
+不再提供 Files/iCloud Drive 目录、版本保留或独立自动备份设置。一个设备上的永久删除仍会同步
+到其他设备。
 
 ## 运行要求
 
 - Xcode 26 或兼容版本
-- iOS / iPadOS 17 及以上
-- macOS 14 及以上（Mac Catalyst）
+- iOS / iPadOS 26 及以上
+- macOS 26 及以上（Mac Catalyst）
 
 用 Xcode 打开 `TiyiNote.xcodeproj`，选择 iPad、iPhone 模拟器或 `My Mac (Mac Catalyst)` 后运行。
 
@@ -133,7 +130,7 @@ xcodebuild -project TiyiNote.xcodeproj \
 
 ## iCloud 配置
 
-项目使用 CloudKit 容器 `iCloud.com.tiyi.note`。要进行真实跨设备同步，需要：
+项目使用统一的 CloudKit 容器 `iCloud.com.tiyi.app`。要进行真实跨设备同步，需要：
 
 1. 在 Apple Developer 后台为开发团队启用该容器。
 2. 在 Xcode Signing & Capabilities 中选择有权使用该容器的 Team。

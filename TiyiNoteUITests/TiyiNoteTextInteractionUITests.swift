@@ -1957,12 +1957,12 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(app.buttons["网格视图"].waitForExistence(timeout: 3))
 
         tapHittableButton("搜索文稿", in: app)
-        let search = app.textFields["搜索文稿和文件夹"]
+        let search = app.searchFields["搜索文稿和文件夹"]
         XCTAssertTrue(search.waitForExistence(timeout: 3))
         search.typeText("重命名")
         XCTAssertTrue(app.staticTexts["重命名画板"].firstMatch.waitForExistence(timeout: 3))
         XCTAssertFalse(app.staticTexts["UITest Two"].exists)
-        tapHittableButton("取消", in: app)
+        tapHittableButton("搜索文稿", in: app)
 
         openContextMenu(for: app.staticTexts["重命名画板"].firstMatch, in: app)
         tapHittableButton("移到回收站", in: app)
@@ -2227,8 +2227,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["回收站是空的"].waitForExistence(timeout: 4))
     }
 
-    func testLibraryScannerFailureAndAutomaticBackupControlsGiveVisibleResults() throws {
-        let app = launchIsolatedApp(prefix: "library-backup-ui")
+    func testLibraryScannerFailureAndCloudSyncControlsGiveVisibleResults() throws {
+        let app = launchIsolatedApp(prefix: "library-cloud-sync-ui")
         XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 8))
 
         tapHittableButton("新建", in: app)
@@ -2239,8 +2239,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         scannerCancel.tap()
         XCTAssertTrue(scannerCancel.waitForNonExistence(timeout: 4))
 
-        let automaticBackup = app.buttons["自动备份设置"]
-        if !automaticBackup.isHittable {
+        let cloudSyncStatus = app.buttons["iCloud 同步状态"]
+        if !cloudSyncStatus.isHittable {
             let overflow = ["More", "更多"].lazy
                 .map { app.buttons[$0].firstMatch }
                 .first(where: { $0.exists && $0.isHittable })
@@ -2250,30 +2250,22 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             )
             overflow?.tap()
         }
-        tapHittableButton("自动备份设置", in: app)
-        XCTAssertTrue(app.navigationBars["自动备份"].waitForExistence(timeout: 4))
+        tapHittableButton("iCloud 同步状态", in: app)
+        XCTAssertTrue(app.navigationBars["iCloud 同步状态"].waitForExistence(timeout: 4))
+        XCTAssertTrue(app.staticTexts["资料库等待首次同步"].waitForExistence(timeout: 3))
+
+        let syncNow = app.buttons["现在同步"]
+        XCTAssertTrue(syncNow.isEnabled)
+        syncNow.tap()
         XCTAssertTrue(
-            app.staticTexts.matching(
-                NSPredicate(format: "label CONTAINS %@", "Backup Destination")
-            ).firstMatch.waitForExistence(timeout: 3)
+            app.staticTexts["资料库已同步至 iCloud"].waitForExistence(timeout: 5)
         )
-        XCTAssertTrue(app.buttons["立即备份"].isEnabled)
-        app.buttons["立即备份"].tap()
-
-        let lastBackup = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS %@", "上次：")
+        let lastSync = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "上次同步：")
         ).firstMatch
-        XCTAssertTrue(lastBackup.waitForExistence(timeout: 5))
-
-        let retention = app.buttons.matching(
-            NSPredicate(format: "label BEGINSWITH %@", "每个文稿保留 ")
-        ).firstMatch
-        XCTAssertTrue(retention.waitForExistence(timeout: 3))
-        let originalLabel = retention.label
-        retention.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)).tap()
-        waitUntil(timeout: 3) { retention.label != originalLabel }
+        XCTAssertTrue(lastSync.waitForExistence(timeout: 5))
         tapHittableButton("完成", in: app)
-        XCTAssertTrue(app.navigationBars["自动备份"].waitForNonExistence(timeout: 3))
+        XCTAssertTrue(app.navigationBars["iCloud 同步状态"].waitForNonExistence(timeout: 3))
     }
 
     func testPageInsertRotateBookmarkDuplicateDeleteAndRestore() throws {

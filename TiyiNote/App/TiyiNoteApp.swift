@@ -106,7 +106,6 @@ private struct TextInteractionUITestConfiguration {
 @MainActor
 private struct TextInteractionUITestHost: View {
     @StateObject private var documentStore: DrawingDocumentStore
-    @StateObject private var automaticBackupCoordinator: AutomaticBackupCoordinator
     @State private var showsWorkspace: Bool
     private let configurationToken: String
 
@@ -205,22 +204,6 @@ private struct TextInteractionUITestHost: View {
             forKey: "pdfWorkspace.activeDocumentID"
         )
         _documentStore = StateObject(wrappedValue: store)
-        let backupDestination: URL?
-        if configuration.token.hasPrefix("library-backup-ui") {
-            backupDestination = workspace.appendingPathComponent(
-                "Backup Destination",
-                isDirectory: true
-            )
-        } else {
-            backupDestination = nil
-        }
-        _automaticBackupCoordinator = StateObject(
-            wrappedValue: AutomaticBackupCoordinator(
-                documentStore: store,
-                userDefaults: defaults,
-                destinationOverride: backupDestination
-            )
-        )
         _showsWorkspace = State(
             initialValue: !configuration.token.hasPrefix("library-")
         )
@@ -237,7 +220,12 @@ private struct TextInteractionUITestHost: View {
             } else {
                 LibraryBrowserView(
                     documentStore: documentStore,
-                    automaticBackupCoordinator: automaticBackupCoordinator,
+                    onExit: nil,
+                    onSyncNow: {
+                        documentStore.cloudSyncDidUpdateStatus(.syncing)
+                        try? await Task.sleep(nanoseconds: 150_000_000)
+                        documentStore.cloudSyncDidUpdateStatus(.succeeded(Date()))
+                    },
                     onOpenDocument: { documentID in
                         documentStore.openDocument(documentID)
                         UserDefaults.standard.set(

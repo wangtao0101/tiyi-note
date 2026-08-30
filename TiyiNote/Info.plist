@@ -35,6 +35,10 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>TiyiCloudKitContainerIdentifier</key>
+	<string>iCloud.com.tiyi.app</string>
+	<key>CKSharingSupported</key>
+	<true/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSApplicationCategoryType</key>

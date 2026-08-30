@@ -394,7 +394,7 @@ private struct EraserSizePicker: View {
                             .fill(
                                 selection == size
                                     ? TiyiNoteTheme.selectionBackground
-                                    : Color.white.opacity(0.045)
+                                    : TiyiNoteTheme.surfaceRaised
                             )
                             .overlay {
                                 Circle()
@@ -434,8 +434,8 @@ private struct ColorSwatch: View {
                             isSelected
                                 ? TiyiNoteTheme.selectionBorder
                                 : (inkColor == .graphite
-                                    ? Color.white.opacity(0.72)
-                                    : Color.white.opacity(0.30)),
+                                    ? TiyiNoteTheme.textSecondary.opacity(0.72)
+                                    : TiyiNoteTheme.strongHairline),
                             lineWidth: isSelected ? 2.2 : 1.2
                         )
                 }

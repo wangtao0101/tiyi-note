@@ -7,7 +7,8 @@ import VisionKit
 
 struct LibraryBrowserView: View {
     @ObservedObject var documentStore: DrawingDocumentStore
-    @ObservedObject var automaticBackupCoordinator: AutomaticBackupCoordinator
+    let onExit: (() -> Void)?
+    let onSyncNow: () async -> Void
     let onOpenDocument: (String) -> Void
     let canEditDocument: (String) -> Bool
     let onCollaborateDocument: (String) -> Void
@@ -18,7 +19,6 @@ struct LibraryBrowserView: View {
     @State private var selectedFolderID: String?
     @State private var compactPath: [String] = []
     @State private var searchText = ""
-    @State private var showsSearch = false
     @State private var kindFilter = LibraryKindFilter.all
     @State private var isSelecting = false
     @State private var selectedFolderIDs = Set<String>()
@@ -34,7 +34,8 @@ struct LibraryBrowserView: View {
     @State private var showsDocumentScanner = false
     @State private var scanDestinationFolderID: String?
     @State private var errorMessage: String?
-    @State private var showsAutomaticBackupSettings = false
+    @State private var showsCloudSyncStatus = false
+    @State private var splitVisibility = NavigationSplitViewVisibility.all
 
     @AppStorage("library.layoutMode") private var layoutRawValue = LibraryLayoutMode.list.rawValue
     @AppStorage("library.sortOrder") private var sortRawValue = LibrarySortOrder.modifiedNewest.rawValue
@@ -47,7 +48,6 @@ struct LibraryBrowserView: View {
                 regularBrowser
             }
         }
-        .background(TiyiNoteTheme.workspace)
         .fileImporter(
             isPresented: $showsPDFImporter,
             allowedContentTypes: [.pdf, .tiyiNoteDocument],
@@ -98,8 +98,11 @@ struct LibraryBrowserView: View {
                 }
             )
         }
-        .sheet(isPresented: $showsAutomaticBackupSettings) {
-            AutomaticBackupSettingsView(coordinator: automaticBackupCoordinator)
+        .sheet(isPresented: $showsCloudSyncStatus) {
+            CloudSyncStatusSheet(
+                documentStore: documentStore,
+                onSyncNow: onSyncNow
+            )
         }
         .alert(nameAction?.title ?? "名称", isPresented: nameActionIsPresented) {
             TextField("名称", text: $draftName)
@@ -136,23 +139,32 @@ struct LibraryBrowserView: View {
     }
 
     private var regularBrowser: some View {
-        NavigationSplitView {
-            LibrarySidebar(
-                documentStore: documentStore,
-                scope: scope,
-                selectedFolderID: selectedFolderID,
-                onSelectScope: { scope = $0 },
-                onSelectFolder: { folderID in
-                    scope = .documents
-                    selectedFolderID = folderID
-                    finishSelecting()
+        NavigationSplitView(columnVisibility: $splitVisibility) {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    if onExit != nil {
+                        embeddedSidebarExitButton
+                    }
+                    Spacer(minLength: 0)
+                    embeddedSidebarToggleButton
                 }
-            )
-            .navigationTitle("Tiyi Note")
+                .padding(.horizontal, 12)
+                .frame(height: 44)
+
+                LibrarySidebar(
+                    documentStore: documentStore,
+                    scope: scope,
+                    selectedFolderID: selectedFolderID,
+                    onSelectScope: { scope = $0 }
+                )
+            }
+            .navigationSplitViewColumnWidth(min: 210, ideal: 238, max: 280)
+            .toolbarVisibility(.hidden, for: .navigationBar)
         } detail: {
             libraryPage(folderID: scope == .documents ? selectedFolderID : nil)
         }
         .navigationSplitViewStyle(.balanced)
+        .toolbar(removing: .title)
     }
 
     private var compactBrowser: some View {
@@ -204,38 +216,9 @@ struct LibraryBrowserView: View {
             canEditDocument: canEditDocument
         )
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    showsAutomaticBackupSettings = true
-                } label: {
-                    Image(systemName: automaticBackupCoordinator.isEnabled
-                        ? "externaldrive.fill.badge.checkmark"
-                        : "externaldrive.badge.plus")
-                }
-                .accessibilityLabel("自动备份设置")
-
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        showsSearch.toggle()
-                        if !showsSearch { searchText = "" }
-                    }
-                } label: {
-                    Image(systemName: "magnifyingglass")
-                }
-                .accessibilityLabel("搜索文稿")
-            }
-        }
+        .toolbarVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .top, spacing: 0) {
-            if showsSearch {
-                LibrarySearchBar(text: $searchText) {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        searchText = ""
-                        showsSearch = false
-                    }
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
+            libraryNavigationBar
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if isSelecting {
@@ -271,6 +254,113 @@ struct LibraryBrowserView: View {
 
     private var isCompact: Bool {
         horizontalSizeClass == .compact
+    }
+
+    private var embeddedSidebarToggleButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                splitVisibility = .detailOnly
+            }
+        } label: {
+            LibraryToolbarIcon(symbol: "sidebar.left", fontSize: 15, frameSize: 30)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("隐藏侧栏")
+    }
+
+    private var embeddedSidebarExitButton: some View {
+        Button {
+            onExit?()
+        } label: {
+            LibraryToolbarIcon(symbol: "chevron.left", fontSize: 15, frameSize: 30)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("返回首页")
+    }
+
+    private var floatingSidebarToggleButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                splitVisibility = splitVisibility == .detailOnly ? .all : .detailOnly
+            }
+        } label: {
+            LibraryToolbarIcon(symbol: "sidebar.left", fontSize: 14, frameSize: 30)
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .controlSize(.small)
+        .accessibilityLabel(splitVisibility == .detailOnly ? "显示侧栏" : "隐藏侧栏")
+    }
+
+    private var floatingSidebarExitButton: some View {
+        Button {
+            onExit?()
+        } label: {
+            LibraryToolbarIcon(symbol: "chevron.left", fontSize: 14, frameSize: 30)
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .controlSize(.small)
+        .accessibilityLabel("返回首页")
+    }
+
+    private var libraryNavigationBar: some View {
+        HStack(spacing: 10) {
+            if !isCompact, splitVisibility == .detailOnly {
+                if onExit != nil {
+                    floatingSidebarExitButton
+                }
+                floatingSidebarToggleButton
+            } else if isCompact, let onExit {
+                Button(action: onExit) {
+                    LibraryToolbarIcon(symbol: "chevron.left", fontSize: 14, frameSize: 30)
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
+                .accessibilityLabel("返回首页")
+            }
+
+            LibraryInlineSearchField(text: $searchText)
+
+            Spacer(minLength: 0)
+
+            Button {
+                showsCloudSyncStatus = true
+            } label: {
+                LibraryToolbarIcon(symbol: cloudStatusSymbol, fontSize: 14, frameSize: 30)
+            }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .controlSize(.small)
+            .accessibilityLabel("iCloud 同步状态")
+            .accessibilityValue(cloudStatusLabel)
+        }
+        .padding(.horizontal, isCompact ? 16 : 20)
+        .frame(height: 44)
+        .background(TiyiNoteTheme.chrome)
+    }
+
+    private var cloudStatusSymbol: String {
+        switch documentStore.cloudSyncStatus {
+        case .idle, .scheduled, .syncing: "icloud"
+        case .succeeded: "checkmark.icloud.fill"
+        case .waitingForAccount: "person.crop.circle.badge.exclamationmark"
+        case .waitingForNetwork: "wifi.slash"
+        case .failed: "exclamationmark.icloud.fill"
+        }
+    }
+
+    private var cloudStatusLabel: String {
+        switch documentStore.cloudSyncStatus {
+        case .idle: "待同步"
+        case .scheduled: "等待同步"
+        case .syncing: "同步中"
+        case .succeeded: "已同步"
+        case .waitingForAccount: "请登录 iCloud"
+        case .waitingForNetwork: "等待网络"
+        case .failed: "同步失败"
+        }
     }
 
     private var layoutMode: LibraryLayoutMode {
@@ -585,36 +675,73 @@ struct LibraryBrowserView: View {
     }
 }
 
-private struct LibrarySearchBar: View {
-    @Binding var text: String
-    let onCancel: () -> Void
-    @FocusState private var isFocused: Bool
+private struct LibraryToolbarIcon: View {
+    let symbol: String
+    var isActive = false
+    var tint: Color? = nil
+    var fontSize: CGFloat = 14
+    var frameSize: CGFloat = 34
 
     var body: some View {
-        HStack(spacing: 10) {
+        Image(systemName: symbol)
+            .font(.system(size: fontSize, weight: .semibold))
+            .foregroundStyle(
+                isActive
+                    ? TiyiNoteTheme.selectionBlue
+                    : (tint ?? TiyiNoteTheme.textPrimary)
+            )
+            .frame(width: frameSize, height: frameSize)
+            .contentShape(Rectangle())
+    }
+}
+
+private struct LibraryInlineSearchField: View {
+    @Binding var text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(TiyiNoteTheme.textSecondary)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(TiyiNoteTheme.textPrimary)
+
             TextField("搜索文稿和文件夹", text: $text)
                 .textFieldStyle(.plain)
-                .focused($isFocused)
+                .font(.system(size: 14))
+                .foregroundStyle(TiyiNoteTheme.textPrimary)
+
             if !text.isEmpty {
                 Button {
                     text = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(TiyiNoteTheme.textSecondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("清除搜索")
             }
-            Button("取消", action: onCancel)
-                .buttonStyle(.plain)
-                .foregroundStyle(TiyiNoteTheme.selectionBlue)
         }
-        .padding(.horizontal, 16)
-        .frame(height: 48)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .bottom) { Divider().overlay(TiyiNoteTheme.hairline) }
-        .onAppear { isFocused = true }
+        .padding(.horizontal, 12)
+        .frame(minWidth: 170, idealWidth: 250, maxWidth: 300)
+        .frame(height: 32)
+        .contentShape(Rectangle())
+        .glassEffect(.regular.interactive(), in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("搜索文稿和文件夹")
+    }
+}
+
+private struct LibraryGlassControlGroup<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        GlassEffectContainer(spacing: 8) {
+            content
+        }
     }
 }
 
@@ -644,12 +771,13 @@ private struct LibraryContentPage: View {
     let onDropPDFs: ([URL]) -> Bool
     let canEditDocument: (String) -> Bool
 
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var isDropTargeted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             pageHeader
-            if scope == .documents, searchText.isEmpty {
+            if scope == .documents, searchText.isEmpty, folderID != nil {
                 LibraryBreadcrumbs(
                     folderID: folderID,
                     folders: documentStore.folders,
@@ -665,7 +793,7 @@ private struct LibraryContentPage: View {
                 content
             }
         }
-        .background(TiyiNoteTheme.workspace)
+        .background(TiyiNoteTheme.chrome)
         .overlay {
             if isDropTargeted, PlatformCapabilities.current.canImportPDF {
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -757,72 +885,105 @@ private struct LibraryContentPage: View {
     }
 
     private var pageHeader: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            Text(pageTitle)
-                .font(.system(size: 42, weight: .bold, design: .rounded))
-                .foregroundStyle(TiyiNoteTheme.textPrimary)
-                .lineLimit(1)
-
-            HStack(spacing: 12) {
-                Menu {
-                    ForEach(LibraryKindFilter.allCases) { filter in
-                        Button {
-                            onSetFilter(filter)
-                        } label: {
-                            Label(filter.title, systemImage: filter == kindFilter ? "checkmark" : filter.symbol)
-                        }
+        VStack(alignment: .leading) {
+            if isCompactLayout {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        filterControl
+                        primaryAction
+                        utilityControls
                     }
+                }
+            } else {
+                HStack(spacing: 8) {
+                    filterControl
+                    Spacer(minLength: 16)
+                    primaryAction
+                    utilityControls
+                }
+            }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, isCompactLayout ? 16 : 20)
+        .padding(.vertical, 6)
+        .background(TiyiNoteTheme.chrome)
+    }
+
+    private var filterControl: some View {
+        Menu {
+            ForEach(LibraryKindFilter.allCases) { filter in
+                Button {
+                    onSetFilter(filter)
                 } label: {
-                    Label(kindFilter.title, systemImage: "line.3.horizontal.decrease")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(TiyiNoteTheme.textPrimary)
+                    Label(
+                        filter.title,
+                        systemImage: filter == kindFilter ? "checkmark" : filter.symbol
+                    )
                 }
+            }
+        } label: {
+            Label(kindFilter.title, systemImage: "line.3.horizontal.decrease")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(TiyiNoteTheme.textPrimary)
+                .padding(.horizontal, 2)
+                .frame(height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("筛选：\(kindFilter.title)")
+    }
 
-                Spacer(minLength: 8)
-
-                if PlatformCapabilities.current.canManageLibrary, scope == .documents {
-                    Menu {
-                        Button(action: onNewCanvas) {
-                            Label("新建画板", systemImage: "rectangle.and.pencil.and.ellipsis")
-                        }
-                        Button(action: onNewFolder) {
-                            Label("新建文件夹", systemImage: "folder.badge.plus")
-                        }
-                        if PlatformCapabilities.current.canImportPDF {
-                            Button(action: onImportPDF) {
-                                Label("导入 PDF", systemImage: "square.and.arrow.down")
-                            }
-                        }
-                        if PlatformCapabilities.current.canScanDocuments {
-                            Button(action: onScanDocument) {
-                                Label("扫描文稿", systemImage: "doc.viewfinder")
-                            }
-                        }
-                    } label: {
-                        Label("新建", systemImage: "plus")
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 18)
-                            .frame(height: 44)
-                            .background(TiyiNoteTheme.selectionBlue, in: Capsule())
+    @ViewBuilder
+    private var primaryAction: some View {
+        if PlatformCapabilities.current.canManageLibrary, scope == .documents {
+            Menu {
+                Button(action: onNewCanvas) {
+                    Label("新建画板", systemImage: "rectangle.and.pencil.and.ellipsis")
+                }
+                Button(action: onNewFolder) {
+                    Label("新建文件夹", systemImage: "folder.badge.plus")
+                }
+                if PlatformCapabilities.current.canImportPDF {
+                    Button(action: onImportPDF) {
+                        Label("导入 PDF", systemImage: "square.and.arrow.down")
                     }
                 }
-
-                if PlatformCapabilities.current.canManageLibrary,
-                   scope == .trash,
-                   !folders.isEmpty || !documents.isEmpty {
-                    Button("清空", role: .destructive, action: onEmptyTrash)
-                        .font(.system(size: 15, weight: .semibold))
+                if PlatformCapabilities.current.canScanDocuments {
+                    Button(action: onScanDocument) {
+                        Label("扫描文稿", systemImage: "doc.viewfinder")
+                    }
                 }
+            } label: {
+                Label("新建", systemImage: "plus")
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 2)
+                    .frame(height: 28)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(TiyiNoteTheme.selectionBlue)
+        } else if PlatformCapabilities.current.canManageLibrary,
+                  scope == .trash,
+                  !folders.isEmpty || !documents.isEmpty {
+            Button("清空", role: .destructive, action: onEmptyTrash)
+                .font(.system(size: 13, weight: .semibold))
+                .buttonStyle(.glass)
+                .tint(TiyiNoteTheme.danger)
+        }
+    }
 
+    private var utilityControls: some View {
+        LibraryGlassControlGroup {
+            HStack(spacing: 8) {
                 Button {
                     onSetLayout(layoutMode == .list ? .grid : .list)
                 } label: {
-                    Image(systemName: layoutMode == .list ? "square.grid.2x2" : "list.bullet")
-                        .frame(width: 38, height: 38)
+                    LibraryToolbarIcon(
+                        symbol: layoutMode == .list ? "square.grid.2x2" : "list.bullet",
+                        fontSize: 13,
+                        frameSize: 28
+                    )
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(TiyiNoteTheme.textPrimary)
+                .buttonStyle(.glass)
                 .accessibilityLabel(layoutMode == .list ? "网格视图" : "列表视图")
 
                 Menu {
@@ -830,14 +991,20 @@ private struct LibraryContentPage: View {
                         Button {
                             onSetSort(order)
                         } label: {
-                            Label(order.title, systemImage: order == sortOrder ? "checkmark" : order.symbol)
+                            Label(
+                                order.title,
+                                systemImage: order == sortOrder ? "checkmark" : order.symbol
+                            )
                         }
                     }
                 } label: {
-                    Image(systemName: "arrow.up.arrow.down")
-                        .frame(width: 38, height: 38)
+                    LibraryToolbarIcon(
+                        symbol: "arrow.up.arrow.down",
+                        fontSize: 13,
+                        frameSize: 28
+                    )
                 }
-                .foregroundStyle(TiyiNoteTheme.textPrimary)
+                .buttonStyle(.glass)
                 .accessibilityLabel("排序：\(sortOrder.title)")
 
                 if PlatformCapabilities.current.canManageLibrary,
@@ -849,18 +1016,22 @@ private struct LibraryContentPage: View {
                             selectedDocumentIDs.removeAll()
                         }
                     } label: {
-                        Image(systemName: isSelecting ? "checkmark.circle.fill" : "checklist")
-                            .frame(width: 38, height: 38)
+                        LibraryToolbarIcon(
+                            symbol: isSelecting ? "checkmark.circle.fill" : "checklist",
+                            isActive: isSelecting,
+                            fontSize: 13,
+                            frameSize: 28
+                        )
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(isSelecting ? TiyiNoteTheme.selectionBlue : TiyiNoteTheme.textPrimary)
+                    .buttonStyle(.glass)
                     .accessibilityLabel(isSelecting ? "完成选择" : "选择项目")
                 }
             }
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 22)
-        .padding(.bottom, 16)
+    }
+
+    private var isCompactLayout: Bool {
+        horizontalSizeClass == .compact
     }
 
     @ViewBuilder
@@ -898,7 +1069,8 @@ private struct LibraryContentPage: View {
                         )
                     }
                 }
-                .padding(.horizontal, 24)
+                .padding(.horizontal, isCompactLayout ? 16 : 20)
+                .padding(.vertical, 8)
             } else {
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 170, maximum: 240), spacing: 18)],
@@ -935,8 +1107,8 @@ private struct LibraryContentPage: View {
                         )
                     }
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 8)
+                .padding(.horizontal, isCompactLayout ? 12 : 20)
+                .padding(.vertical, 12)
             }
         }
         .scrollIndicators(.hidden)
@@ -950,21 +1122,12 @@ private struct LibraryContentPage: View {
         } actions: {
             if scope == .documents, PlatformCapabilities.current.canManageLibrary {
                 Button("新建画板", action: onNewCanvas)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.glassProminent)
+                    .tint(TiyiNoteTheme.selectionBlue)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .foregroundStyle(TiyiNoteTheme.textSecondary)
-    }
-
-    private var pageTitle: String {
-        if !searchText.isEmpty { return "搜索结果" }
-        if scope == .documents,
-           let folderID,
-           let folder = documentStore.folder(withID: folderID) {
-            return folder.title
-        }
-        return scope.title
     }
 
     private var emptyTitle: String {
@@ -1143,63 +1306,51 @@ private struct LibrarySidebar: View {
     let scope: LibraryScope
     let selectedFolderID: String?
     let onSelectScope: (LibraryScope) -> Void
-    let onSelectFolder: (String?) -> Void
 
     var body: some View {
-        List {
-            Section {
+        ScrollView {
+            LazyVStack(spacing: 4) {
                 ForEach(LibraryScope.allCases) { item in
                     Button {
                         onSelectScope(item)
                     } label: {
-                        HStack {
+                        HStack(spacing: 9) {
                             Label(item.title, systemImage: item.symbol)
                             Spacer()
                             if item == .trash, trashCount > 0 {
                                 Text("\(trashCount)")
-                                    .font(.caption.weight(.semibold))
+                                    .font(.caption2.weight(.bold))
                                     .foregroundStyle(TiyiNoteTheme.textSecondary)
+                                    .padding(.horizontal, 6)
+                                    .frame(height: 20)
+                                    .background(TiyiNoteTheme.surfaceRaised, in: Capsule())
                             }
                         }
-                    }
-                    .listRowBackground(
-                        scope == item && selectedFolderID == nil
-                            ? TiyiNoteTheme.selectionBackground
-                            : Color.clear
-                    )
-                }
-            }
-
-            if !nodes.isEmpty {
-                Section("文件夹") {
-                    OutlineGroup(nodes, children: \.children) { node in
-                        Button {
-                            onSelectFolder(node.id)
-                        } label: {
-                            Label {
-                                Text(node.folder.title).lineLimit(1)
-                            } icon: {
-                                Image(systemName: node.folder.icon.systemImageName)
-                                    .foregroundStyle(node.folder.color.swiftUIColor)
-                            }
-                        }
-                        .listRowBackground(
-                            scope == .documents && selectedFolderID == node.id
-                                ? TiyiNoteTheme.selectionBackground
-                                : Color.clear
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(
+                            scope == item && selectedFolderID == nil
+                                ? TiyiNoteTheme.selectionBlue
+                                : TiyiNoteTheme.textPrimary
                         )
+                        .padding(.horizontal, 10)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 38)
+                        .background(
+                            scope == item && selectedFolderID == nil
+                                ? TiyiNoteTheme.selectionBackground
+                                : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        )
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, 12)
+            .padding(.top, 2)
         }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
-        .background(TiyiNoteTheme.sidebar)
+        .scrollIndicators(.hidden)
         .foregroundStyle(TiyiNoteTheme.textPrimary)
-    }
-
-    private var nodes: [LibraryFolderNode] {
-        LibraryPath.tree(from: documentStore.folders.filter { $0.trashedAt == nil })
     }
 
     private var trashCount: Int {
@@ -1218,42 +1369,48 @@ private struct LibraryFolderListRow: View {
     let onCommand: (LibraryItemCommand) -> Void
 
     var body: some View {
-        HStack(spacing: 18) {
-            FolderArtwork(folder: folder)
-                .frame(width: 106, height: 74)
+        HStack(spacing: 12) {
+            FolderListArtwork(folder: folder)
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(folder.title)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(TiyiNoteTheme.textPrimary)
                     .lineLimit(2)
                 Text(detail)
-                    .font(.system(size: 14))
+                    .font(.system(size: 12))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
             }
             Spacer(minLength: 8)
             if isSelecting {
                 SelectionIndicator(isSelected: isSelected)
             } else if scope != .trash {
+                Image(systemName: "chevron.right")
+                    .foregroundStyle(TiyiNoteTheme.textTertiary)
                 Button {
                     guard canManage else { return }
                     onCommand(.toggleFolderFavorite(folder.id, !folder.isFavorite))
                 } label: {
                     Image(systemName: folder.isFavorite ? "star.fill" : "star")
-                        .font(.system(size: 23))
-                        .foregroundStyle(folder.isFavorite ? Color.yellow : TiyiNoteTheme.textPrimary)
-                        .frame(width: 44, height: 44)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(folder.isFavorite ? Color.orange : TiyiNoteTheme.textSecondary)
+                        .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.plain)
                 .disabled(!canManage)
-                Image(systemName: "chevron.right")
-                    .foregroundStyle(TiyiNoteTheme.textTertiary)
             }
         }
-        .padding(.vertical, 14)
+        .padding(.leading, 0)
+        .padding(.trailing, 10)
+        .padding(.vertical, 10)
+        .background(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(TiyiNoteTheme.hairline)
+                .frame(height: 1)
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
-        .overlay(alignment: .bottom) { Divider().overlay(TiyiNoteTheme.hairline) }
         .contextMenu { itemMenu }
     }
 
@@ -1296,17 +1453,16 @@ private struct LibraryDocumentListRow: View {
     let onCommand: (LibraryItemCommand) -> Void
 
     var body: some View {
-        HStack(spacing: 18) {
-            DocumentArtwork(document: document, thumbnail: thumbnail)
-                .frame(width: 106, height: 74)
+        HStack(spacing: 12) {
+            DocumentListArtwork(document: document, thumbnail: thumbnail)
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(document.title)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(TiyiNoteTheme.textPrimary)
                     .lineLimit(2)
                 Text(detail)
-                    .font(.system(size: 14))
+                    .font(.system(size: 12))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
             }
             Spacer(minLength: 8)
@@ -1318,18 +1474,25 @@ private struct LibraryDocumentListRow: View {
                     onCommand(.toggleDocumentFavorite(document.id, !document.isFavorite))
                 } label: {
                     Image(systemName: document.isFavorite ? "star.fill" : "star")
-                        .font(.system(size: 23))
-                        .foregroundStyle(document.isFavorite ? Color.yellow : TiyiNoteTheme.textPrimary)
-                        .frame(width: 44, height: 44)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(document.isFavorite ? Color.orange : TiyiNoteTheme.textSecondary)
+                        .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.plain)
                 .disabled(!canManage)
             }
         }
-        .padding(.vertical, 14)
+        .padding(.leading, 0)
+        .padding(.trailing, 10)
+        .padding(.vertical, 10)
+        .background(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(TiyiNoteTheme.hairline)
+                .frame(height: 1)
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
-        .overlay(alignment: .bottom) { Divider().overlay(TiyiNoteTheme.hairline) }
         .contextMenu { itemMenu }
     }
 
@@ -1419,6 +1582,11 @@ private struct LibraryFolderGridCard: View {
                 }
             }
         }
+        .padding(6)
+        .background(
+            isSelected ? TiyiNoteTheme.selectionBackground : Color.clear,
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
         .contextMenu {
@@ -1489,6 +1657,11 @@ private struct LibraryDocumentGridCard: View {
                 }
             }
         }
+        .padding(6)
+        .background(
+            isSelected ? TiyiNoteTheme.selectionBackground : Color.clear,
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
         .contextMenu {
@@ -1524,6 +1697,44 @@ private struct LibraryDocumentGridCard: View {
                 }
             }
         }
+    }
+}
+
+private struct FolderListArtwork: View {
+    let folder: LibraryFolder
+
+    var body: some View {
+        Image(systemName: folder.icon.systemImageName)
+            .font(.system(size: 34, weight: .semibold))
+            .foregroundStyle(folder.color.swiftUIColor.gradient)
+            .frame(width: 48, height: 48, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(folder.title)文件夹外观")
+            .accessibilityValue("颜色 \(folder.color.title)；图标 \(folder.icon.title)")
+    }
+}
+
+private struct DocumentListArtwork: View {
+    let document: PDFWorkspaceDocument
+    let thumbnail: UIImage?
+
+    var body: some View {
+        Group {
+            if let thumbnail {
+                Image(uiImage: thumbnail)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 40, height: 48, alignment: .leading)
+            } else {
+                Image(systemName: document.kind == .canvas
+                    ? "rectangle.and.pencil.and.ellipsis"
+                    : "doc.richtext.fill")
+                    .font(.system(size: 30, weight: .medium))
+                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+                    .frame(width: 40, height: 48, alignment: .leading)
+            }
+        }
+        .frame(width: 48, height: 48, alignment: .leading)
     }
 }
 
@@ -1639,11 +1850,10 @@ private struct LibraryScopeBar: View {
             }
         }
         .padding(5)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(TiyiNoteTheme.hairline, lineWidth: 1)
-        }
+        .glassEffect(
+            .regular,
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
         .padding(.horizontal, 18)
         .padding(.vertical, 8)
     }
@@ -1677,11 +1887,15 @@ private struct LibrarySelectionBar: View {
             }
             Button("取消", action: onCancel)
         }
-        .buttonStyle(.bordered)
+        .buttonStyle(.plain)
         .padding(.horizontal, 18)
         .frame(minHeight: 64)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) { Divider().overlay(TiyiNoteTheme.hairline) }
+        .glassEffect(
+            .regular,
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
     }
 }
 
@@ -2009,105 +2223,167 @@ private struct LibraryMoveSheet: View {
     }
 }
 
-private struct AutomaticBackupSettingsView: View {
-    @ObservedObject var coordinator: AutomaticBackupCoordinator
-    @Environment(\.dismiss) private var dismiss
+private struct CloudSyncStatusSheet: View {
+    @ObservedObject var documentStore: DrawingDocumentStore
+    let onSyncNow: () async -> Void
 
-    @State private var selectsDirectory = false
-    @State private var errorMessage: String?
+    @Environment(\.dismiss) private var dismiss
+    @State private var isManualSyncRunning = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("备份位置") {
-                    LabeledContent("状态", value: statusLabel)
-                    if coordinator.isEnabled {
-                        LabeledContent("目录", value: coordinator.destinationDisplayName)
+                Section("云同步") {
+                    HStack(alignment: .center, spacing: 14) {
+                        ZStack {
+                            Circle()
+                                .fill(statusColor.opacity(0.12))
+                                .frame(width: 42, height: 42)
+
+                            if isSyncing {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(statusColor)
+                            } else {
+                                Image(systemName: statusSymbol)
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundStyle(statusColor)
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(statusTitle)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(TiyiNoteTheme.textPrimary)
+                            Text(statusDetail)
+                                .font(.system(size: 13))
+                                .foregroundStyle(TiyiNoteTheme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
-                    Button(coordinator.isEnabled ? "更改目录" : "选择 Files / iCloud Drive 目录") {
-                        selectsDirectory = true
-                    }
+                    .padding(.vertical, 6)
                 }
 
-                if coordinator.isEnabled {
-                    Section("版本保留") {
-                        Stepper(
-                            "每个文稿保留 \(coordinator.retentionCount) 个版本",
-                            value: Binding(
-                                get: { coordinator.retentionCount },
-                                set: coordinator.setRetentionCount
-                            ),
-                            in: 3...30
-                        )
-                        Text("新版本完整写入后才会清理最旧版本。删除或损坏当前资料库不会同步删除这些历史备份。")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
+                Section {
+                    Button(action: requestSyncNow) {
+                        HStack(spacing: 9) {
+                            if isSyncing {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
+                            Text(isSyncing ? "正在同步…" : "现在同步")
+                                .fontWeight(.semibold)
+                        }
+                        .frame(maxWidth: .infinity)
                     }
-
-                    Section {
-                        Button("立即备份") { coordinator.backupNow() }
-                            .disabled(isBackingUp)
-                        Button("关闭自动备份", role: .destructive) { coordinator.disable() }
-                    }
-                }
-
-                if case .failed(let message) = coordinator.state {
-                    Section("最近错误") {
-                        Text(message).foregroundStyle(TiyiNoteTheme.danger)
-                    }
-                }
-
-                Section("恢复") {
-                    Text("在资料库中使用“导入 PDF / 可编辑文稿”，选择任意 .tiyinote 历史版本即可恢复为安全副本。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    .buttonStyle(.glassProminent)
+                    .tint(TiyiNoteTheme.selectionBlue)
+                    .disabled(isSyncing || !canSync)
+                } footer: {
+                    Text("Tiyi 会在文稿变化、应用打开以及收到 iCloud 更新时自动同步。")
                 }
             }
-            .navigationTitle("自动备份")
+            .scrollContentBackground(.hidden)
+            .background(TiyiNoteTheme.chrome)
+            .navigationTitle("iCloud 同步状态")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
                 }
             }
-            .fileImporter(
-                isPresented: $selectsDirectory,
-                allowedContentTypes: [.folder],
-                allowsMultipleSelection: false,
-                onCompletion: configureDirectory
-            )
-            .alert("无法设置备份", isPresented: Binding(
-                get: { errorMessage != nil },
-                set: { if !$0 { errorMessage = nil } }
-            )) {
-                Button("好", role: .cancel) { errorMessage = nil }
-            } message: {
-                Text(errorMessage ?? "请重新选择一个可写目录。")
-            }
         }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 
-    private var isBackingUp: Bool {
-        if case .backingUp = coordinator.state { return true }
+    private var isSyncing: Bool {
+        if isManualSyncRunning { return true }
+        if case .syncing = documentStore.cloudSyncStatus { return true }
         return false
     }
 
-    private var statusLabel: String {
-        switch coordinator.state {
-        case .disabled: "未开启"
-        case .ready(let date):
-            date.map { "上次：\($0.formatted(date: .abbreviated, time: .shortened))" } ?? "已开启"
-        case .backingUp: "正在备份…"
-        case .failed: "需要处理"
+    private var canSync: Bool {
+        if case .waitingForAccount = documentStore.cloudSyncStatus { return false }
+        return true
+    }
+
+    private var statusSymbol: String {
+        switch documentStore.cloudSyncStatus {
+        case .idle where documentStore.lastCloudSyncAt != nil: "checkmark.icloud.fill"
+        case .idle, .scheduled, .syncing: "icloud"
+        case .succeeded: "checkmark.icloud.fill"
+        case .waitingForAccount: "person.crop.circle.badge.exclamationmark"
+        case .waitingForNetwork: "wifi.slash"
+        case .failed: "exclamationmark.icloud.fill"
         }
     }
 
-    private func configureDirectory(_ result: Result<[URL], Error>) {
-        do {
-            guard let directory = try result.get().first else { return }
-            try coordinator.configure(destination: directory)
-        } catch {
-            errorMessage = error.localizedDescription
+    private var statusTitle: String {
+        switch documentStore.cloudSyncStatus {
+        case .idle where documentStore.lastCloudSyncAt != nil: "资料库已同步至 iCloud"
+        case .idle: "资料库等待首次同步"
+        case .scheduled: "资料库已加入同步队列"
+        case .syncing: "正在同步资料库"
+        case .succeeded: "资料库已同步至 iCloud"
+        case .waitingForAccount: "需要登录 iCloud"
+        case .waitingForNetwork: "等待网络连接"
+        case .failed: "iCloud 同步失败"
+        }
+    }
+
+    private var statusDetail: String {
+        switch documentStore.cloudSyncStatus {
+        case .idle:
+            return lastSyncDescription
+        case .scheduled:
+            return "更改已保存，将在稍后自动同步。\(lastSyncSuffix)"
+        case .syncing:
+            return "正在上传和下载最新更改。\(lastSyncSuffix)"
+        case .succeeded(let date):
+            return formattedLastSync(date)
+        case .waitingForAccount:
+            return "请先在系统设置中登录 iCloud。"
+        case .waitingForNetwork:
+            return "恢复网络后会自动继续同步。\(lastSyncSuffix)"
+        case .failed(let message):
+            return message
+        }
+    }
+
+    private var statusColor: Color {
+        TiyiNoteTheme.textPrimary
+    }
+
+    private var lastSyncDescription: String {
+        guard let date = documentStore.lastCloudSyncAt else {
+            return "尚未完成首次同步。"
+        }
+        return formattedLastSync(date)
+    }
+
+    private var lastSyncSuffix: String {
+        guard let date = documentStore.lastCloudSyncAt else { return "" }
+        return " \(formattedLastSync(date))"
+    }
+
+    private func formattedLastSync(_ date: Date) -> String {
+        let time = date.formatted(date: .omitted, time: .shortened)
+        if Calendar.current.isDateInToday(date) {
+            return "上次同步：今天 \(time)"
+        }
+        return "上次同步：\(date.formatted(date: .abbreviated, time: .omitted)) \(time)"
+    }
+
+    private func requestSyncNow() {
+        guard !isSyncing, canSync else { return }
+        isManualSyncRunning = true
+        Task {
+            await onSyncNow()
+            isManualSyncRunning = false
         }
     }
 }
