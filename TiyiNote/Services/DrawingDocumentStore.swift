@@ -5,6 +5,12 @@ import PencilKit
 import Security
 import UIKit
 
+extension Notification.Name {
+    static let tiyiDrawingInteractionActivityChanged = Notification.Name(
+        "TiyiNote.DrawingInteractionActivityChanged"
+    )
+}
+
 enum LocalSaveState {
     case saved(Date?)
     case saving
@@ -129,6 +135,24 @@ private struct PendingAssetSave {
     let reference: LibraryAssetReference
 }
 
+private struct CollaborationOperationsFileSignature: Equatable {
+    let byteCount: UInt64
+    let modifiedAt: Date?
+}
+
+private struct CollaborationOperationsCacheEntry {
+    let signature: CollaborationOperationsFileSignature
+    let operations: [CollaborationOperation]
+}
+
+private struct PendingCollaborationOperationsSave {
+    let token: UUID
+    let operations: [CollaborationOperation]
+    let targetURL: URL
+    let documentID: String
+    let pageID: String
+}
+
 private enum WorkspaceTransactionPhase: String, Codable {
     case prepared
     case committed
@@ -206,8 +230,20 @@ final class DrawingDocumentStore: ObservableObject {
     private var thumbnailCache: [String: UIImage] = [:]
     private var pendingSaves: [String: Task<Void, Never>] = [:]
     private var pendingAssetSaves: [String: PendingAssetSave] = [:]
+    /// Operation archives are immutable between edits but used repeatedly by drawing load,
+    /// autosave, asset refresh, and CloudKit export. Keeping decoded values here prevents every
+    /// quiet pause from decoding the complete history again on MainActor.
+    private var collaborationOperationsCache: [String: CollaborationOperationsCacheEntry] = [:]
+    private var pendingCollaborationOperationsSaves: [String: PendingCollaborationOperationsSave] = [:]
+    private var pendingCollaborationOperationsTasks: [String: Task<Void, Never>] = [:]
     private var collaborationClock: CollaborationReplicaClock
     private var readOnlySharedDocumentIDs: Set<String> = []
+    private var activeDrawingInteractionIDs: Set<UUID> = []
+    private(set) var lastDrawingInteractionAt: Date?
+#if DEBUG
+    private(set) var debugAppendOnlyDrawingSaveCount = 0
+    private(set) var debugFullDrawingDiffSaveCount = 0
+#endif
     /// A private-zone reference can arrive before the corresponding CKShare zone is mounted.
     /// Keeping it on disk prevents a committed change token from discarding that placement.
     private var pendingDocumentReferences: [String: LibraryDocumentReference] = [:]
@@ -336,6 +372,7 @@ final class DrawingDocumentStore: ObservableObject {
 
     deinit {
         pendingSaves.values.forEach { $0.cancel() }
+        pendingCollaborationOperationsTasks.values.forEach { $0.cancel() }
     }
 
     private static let replicaActorKeychainService = "com.tiyi.note.collaboration-replica"
@@ -380,6 +417,37 @@ final class DrawingDocumentStore: ObservableObject {
         openDocumentIDs.compactMap { id in
             documents.first(where: { $0.id == id && $0.trashedAt == nil })
         }
+    }
+
+    var isDrawingInteractionActive: Bool {
+        !activeDrawingInteractionIDs.isEmpty
+    }
+
+    func setDrawingInteractionActive(_ isActive: Bool, id: UUID) {
+        let wasActive = isDrawingInteractionActive
+        if isActive {
+            activeDrawingInteractionIDs.insert(id)
+        } else {
+            activeDrawingInteractionIDs.remove(id)
+        }
+        lastDrawingInteractionAt = Date()
+        if isDrawingInteractionActive {
+            pendingCollaborationOperationsTasks.values.forEach { $0.cancel() }
+            pendingCollaborationOperationsTasks.removeAll()
+        } else if wasActive {
+            schedulePendingCollaborationOperationsSaves()
+        }
+        guard wasActive != isDrawingInteractionActive else { return }
+        NotificationCenter.default.post(
+            name: .tiyiDrawingInteractionActivityChanged,
+            object: self
+        )
+    }
+
+    func hadRecentDrawingInteraction(within interval: TimeInterval) -> Bool {
+        guard !isDrawingInteractionActive,
+              let lastDrawingInteractionAt else { return isDrawingInteractionActive }
+        return Date().timeIntervalSince(lastDrawingInteractionAt) < interval
     }
 
     func document(withID documentID: String) -> PDFWorkspaceDocument? {
@@ -2497,14 +2565,10 @@ final class DrawingDocumentStore: ObservableObject {
         return urls
             .filter { $0.lastPathComponent.hasSuffix(".operations.json") }
             .flatMap { url -> [CollaborationConflictItem] in
-                guard let data = try? Data(contentsOf: url),
-                      let archive = try? JSONDecoder().decode(
-                          CollaborationPageOperationArchive.self,
-                          from: data
-                      ),
-                      let first = archive.operations.first,
+                let operations = loadCollaborationOperations(at: url)
+                guard let first = operations.first,
                       first.documentID == documentID else { return [] }
-                let state = CollaborationMergeEngine.materialize(archive.operations)
+                let state = CollaborationMergeEngine.materialize(operations)
                 return state.conflicts.compactMap { conflict in
                     guard state.metadata["resolvedConflict:\(conflict.id)"] == nil else { return nil }
                     return CollaborationConflictItem(
@@ -2769,6 +2833,7 @@ final class DrawingDocumentStore: ObservableObject {
         _ drawing: PKDrawing,
         replacing baseDrawing: PKDrawing? = nil,
         causalContext: CollaborationVersionVector? = nil,
+        assumesOnlyAppendedStrokes: Bool = false,
         forPage pageIndex: Int,
         in documentID: String
     ) -> CollaborationVersionVector {
@@ -2782,6 +2847,7 @@ final class DrawingDocumentStore: ObservableObject {
                 drawing,
                 replacing: baseDrawing,
                 causalContext: causalContext,
+                assumesOnlyAppendedStrokes: assumesOnlyAppendedStrokes,
                 forPage: pageIndex,
                 in: documentID
             )
@@ -2793,7 +2859,20 @@ final class DrawingDocumentStore: ObservableObject {
         pendingSaves[saveKey]?.cancel()
         saveState = .saving
 
-        let data = collaborationDrawingData(forPage: pageIndex, in: documentID)
+        let data: Data
+        if hasUnseenDrawingCollaborationOperations(
+            outside: updatedContext,
+            forPage: pageIndex,
+            in: documentID
+        ) {
+            // A remote operation landed behind this editor's causal base. Materialize only in
+            // that exceptional merge case so the snapshot contains both replicas.
+            data = collaborationDrawingData(forPage: pageIndex, in: documentID)
+        } else {
+            // The live PencilKit value is already the authoritative local snapshot. Reusing it
+            // avoids replaying the entire operation history and decoding every stored stroke.
+            data = drawing.dataRepresentation()
+        }
         let targetURL = drawingURL(forPage: pageIndex, in: documentID)
         let pendingSave = PendingAssetSave(
             token: UUID(),
@@ -3045,20 +3124,41 @@ final class DrawingDocumentStore: ObservableObject {
         guard let pageID = pageID(at: pageIndex, in: documentID) else {
             return CollaborationVersionVector()
         }
-        return CollaborationMergeEngine.materialize(
-            loadCollaborationOperations(forPageID: pageID, in: documentID)
-        ).frontier
+        return collaborationFrontier(
+            from: loadCollaborationOperations(forPageID: pageID, in: documentID)
+        )
+    }
+
+    /// Returns whether the operation log contains a drawing edit the visible canvas has not
+    /// observed. Page-asset revisions also advance for local autosaves and CloudKit snapshot
+    /// echoes; those revisions must not cause a live PKCanvasView to reinstall its own drawing.
+    func hasUnseenDrawingCollaborationOperations(
+        outside context: CollaborationVersionVector,
+        forPage pageIndex: Int,
+        in documentID: String
+    ) -> Bool {
+        guard let pageID = pageID(at: pageIndex, in: documentID) else { return false }
+        return loadCollaborationOperations(forPageID: pageID, in: documentID).contains {
+            operation in
+            guard !context.contains(operation.stamp.dot) else { return false }
+            switch operation.payload {
+            case .strokeUpsert, .strokeDelete:
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     func documentMetadataCollaborationFrontier(
         for documentID: String
     ) -> CollaborationVersionVector {
-        CollaborationMergeEngine.materialize(
-            loadCollaborationOperations(
+        collaborationFrontier(
+            from: loadCollaborationOperations(
                 forPageID: CollaborationReservedID.documentMetadata,
                 in: documentID
             )
-        ).frontier
+        )
     }
 
     func hasPendingDrawingSave(forPage pageIndex: Int, in documentID: String) -> Bool {
@@ -3072,16 +3172,33 @@ final class DrawingDocumentStore: ObservableObject {
     /// Synchronously writes the captured drawing and image payloads for one page.
     @discardableResult
     func flushPendingSaves(forPage pageIndex: Int, in documentID: String) -> Bool {
-        flushPendingSaves(withKeys: [
+        let collaborationSaved: Bool
+        if let pageID = pageID(at: pageIndex, in: documentID) {
+            let operationsKey = collaborationOperationsURL(
+                forPageID: pageID,
+                in: documentID
+            ).standardizedFileURL.path
+            collaborationSaved = flushPendingCollaborationOperationsSaves(
+                withKeys: [operationsKey]
+            )
+        } else {
+            collaborationSaved = true
+        }
+        let assetsSaved = flushPendingSaves(withKeys: [
             drawingKey(documentID: documentID, pageIndex: pageIndex),
             "\(drawingKey(documentID: documentID, pageIndex: pageIndex))#elements"
         ])
+        return collaborationSaved && assetsSaved
     }
 
     /// Synchronously drains every debounce payload before the app enters the background.
     @discardableResult
     func flushAllPendingSaves() -> Bool {
-        flushPendingSaves(withKeys: Array(pendingAssetSaves.keys))
+        let collaborationSaved = flushPendingCollaborationOperationsSaves(
+            withKeys: Array(pendingCollaborationOperationsSaves.keys)
+        )
+        let assetsSaved = flushPendingSaves(withKeys: Array(pendingAssetSaves.keys))
+        return collaborationSaved && assetsSaved
     }
 
     private func flushPendingSaves(withKeys keys: [String]) -> Bool {
@@ -3261,12 +3378,12 @@ final class DrawingDocumentStore: ObservableObject {
         var operationsByID: [String: CollaborationOperation] = [:]
         for case let url as URL in enumerator
         where url.lastPathComponent.hasSuffix(".operations.json") {
-            guard let data = try? Data(contentsOf: url),
-                  let archive = try? JSONDecoder().decode(
-                    CollaborationPageOperationArchive.self,
-                    from: data
-                  ) else { continue }
-            for operation in archive.operations {
+            for operation in loadCollaborationOperations(at: url) {
+                operationsByID[operation.id] = operation
+            }
+        }
+        for pendingSave in pendingCollaborationOperationsSaves.values {
+            for operation in pendingSave.operations {
                 operationsByID[operation.id] = operation
             }
         }
@@ -4161,6 +4278,12 @@ final class DrawingDocumentStore: ObservableObject {
         kind: String,
         affectedURLs: [URL]
     ) throws -> ActiveWorkspaceTransaction {
+        let pendingOperationKeys = affectedURLs
+            .filter { $0.lastPathComponent.hasSuffix(".operations.json") }
+            .map { $0.standardizedFileURL.path }
+        guard flushPendingCollaborationOperationsSaves(withKeys: pendingOperationKeys) else {
+            throw LibraryStoreError.cannotApplyAsset(kind)
+        }
         let transactionID = UUID().uuidString.lowercased()
         let directory = transactionsDirectory.appendingPathComponent(
             transactionID,
@@ -4241,6 +4364,7 @@ final class DrawingDocumentStore: ObservableObject {
         collaborationClock = transaction.clockBefore
         pdfCache.removeAll()
         thumbnailCache.removeAll()
+        collaborationOperationsCache.removeAll()
         rebuildWorkspaceDocuments()
         pageAssetGeneration &+= 1
     }
@@ -5389,10 +5513,22 @@ final class DrawingDocumentStore: ObservableObject {
         userDefaults.set(openDocumentIDs, forKey: "pdfWorkspace.openDocumentIDs")
     }
 
+    private func collaborationFrontier(
+        from operations: [CollaborationOperation]
+    ) -> CollaborationVersionVector {
+        var frontier = CollaborationVersionVector()
+        for operation in operations {
+            frontier.formUnion(operation.stamp.context)
+            frontier.observe(operation.stamp.dot)
+        }
+        return frontier
+    }
+
     private func recordDrawingCollaborationOperations(
         _ drawing: PKDrawing,
         replacing baseDrawing: PKDrawing? = nil,
         causalContext: CollaborationVersionVector? = nil,
+        assumesOnlyAppendedStrokes: Bool = false,
         forPage pageIndex: Int,
         in documentID: String
     ) throws -> CollaborationVersionVector {
@@ -5407,20 +5543,77 @@ final class DrawingDocumentStore: ObservableObject {
             default: false
             }
         }
+        var didBootstrapDrawingHistory = false
         if !hasStrokeHistory,
            let previousData = try? Data(contentsOf: drawingURL(forPageID: page.id, in: documentID)),
            let previousDrawing = try? PKDrawing(data: previousData),
            !previousDrawing.strokes.isEmpty {
-            operations = bootstrapCollaborationOperations(
+            operations.append(contentsOf: bootstrapCollaborationOperations(
                 from: previousDrawing,
                 page: page
-            )
+            ))
+            didBootstrapDrawingHistory = true
         }
 
         for operation in operations {
             collaborationClock.observe(operation.stamp)
         }
 
+        if let baseDrawing,
+           drawing.strokes.count >= baseDrawing.strokes.count,
+           baseDrawing.strokes.isEmpty || assumesOnlyAppendedStrokes {
+            var emissionContext = causalContext ?? collaborationFrontier(from: operations)
+            func makeStamp() -> CollaborationStamp {
+                let stamp = collaborationClock.nextStamp(observedContext: emissionContext)
+                emissionContext.observe(stamp.dot)
+                return stamp
+            }
+
+            let baseStrokeCount = baseDrawing.strokes.count
+            let nextZIndex = max(
+                baseStrokeCount,
+                operations.compactMap { operation -> Int? in
+                    guard case .strokeUpsert(let stroke) = operation.payload else { return nil }
+                    return stroke.zIndex + 1
+                }.max() ?? 0
+            )
+            let appendedOperations = drawing.strokes
+                .dropFirst(baseStrokeCount)
+                .enumerated()
+                .map { offset, stroke in
+                    CollaborationOperation(
+                        workspaceID: "personal-library",
+                        documentID: documentID,
+                        pageID: page.id,
+                        stamp: makeStamp(),
+                        payload: .strokeUpsert(
+                            CollaborationInkStroke(
+                                id: UUID().uuidString.lowercased(),
+                                drawingData: PKDrawing(strokes: [stroke]).dataRepresentation(),
+                                zIndex: nextZIndex + offset
+                            )
+                        )
+                    )
+                }
+            guard didBootstrapDrawingHistory || !appendedOperations.isEmpty else {
+                return emissionContext
+            }
+#if DEBUG
+            debugAppendOnlyDrawingSaveCount += 1
+#endif
+            operations.append(contentsOf: appendedOperations)
+            scheduleCollaborationOperationsSave(
+                operations,
+                forPageID: page.id,
+                in: documentID
+            )
+            try persistCollaborationClock()
+            return emissionContext
+        }
+
+#if DEBUG
+        debugFullDrawingDiffSaveCount += 1
+#endif
         let currentState = CollaborationMergeEngine.materialize(operations)
         struct StoredStrokeIdentity {
             let stroke: CollaborationInkStroke
@@ -5453,8 +5646,12 @@ final class DrawingDocumentStore: ObservableObject {
             deletableStrokeIDs = []
             var claimedStoredIDs: Set<String> = []
             for (index, stroke) in baseDrawing.strokes.enumerated() {
-                let exactFingerprint = collaborationStrokeFingerprint(stroke)
-                let stableFingerprint = collaborationStableStrokeFingerprint(stroke)
+                // PencilKit can normalize real Apple Pencil samples while encoding them. Compare
+                // every identity on the same serialized representation used by the operation log;
+                // otherwise a previously saved live stroke can look new on each autosave.
+                let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+                let exactFingerprint = collaborationStrokeFingerprint(data)
+                let stableFingerprint = collaborationStableStrokeFingerprint(data)
                 let matched = storedIdentities.first {
                     !claimedStoredIDs.contains($0.stroke.id)
                         && $0.exactFingerprint == exactFingerprint
@@ -5500,11 +5697,12 @@ final class DrawingDocumentStore: ObservableObject {
             let stableFingerprint: String
         }
         let desiredStrokes = drawing.strokes.enumerated().map { index, stroke in
-            DesiredStroke(
+            let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+            return DesiredStroke(
                 index: index,
-                data: PKDrawing(strokes: [stroke]).dataRepresentation(),
-                exactFingerprint: collaborationStrokeFingerprint(stroke),
-                stableFingerprint: collaborationStableStrokeFingerprint(stroke)
+                data: data,
+                exactFingerprint: collaborationStrokeFingerprint(data),
+                stableFingerprint: collaborationStableStrokeFingerprint(data)
             )
         }
         var exactIdentityByDesiredIndex: [Int: CollaborationInkStroke] = [:]
@@ -5597,7 +5795,11 @@ final class DrawingDocumentStore: ObservableObject {
 
         guard !operations.isEmpty || !added.isEmpty else { return emissionContext }
         operations.append(contentsOf: added)
-        try saveCollaborationOperations(operations, forPageID: page.id, in: documentID)
+        scheduleCollaborationOperationsSave(
+            operations,
+            forPageID: page.id,
+            in: documentID
+        )
         try persistCollaborationClock()
         return emissionContext
     }
@@ -5762,15 +5964,40 @@ final class DrawingDocumentStore: ObservableObject {
         in documentID: String
     ) -> [CollaborationOperation] {
         let url = collaborationOperationsURL(forPageID: pageID, in: documentID)
-        guard let data = try? Data(contentsOf: url),
-              let archive = try? JSONDecoder().decode(
-                CollaborationPageOperationArchive.self,
-                from: data
-              ),
-              archive.schemaVersion > 0,
-              archive.schemaVersion <= CollaborationPageOperationArchive.currentSchemaVersion
-        else { return [] }
-        return archive.operations
+        return loadCollaborationOperations(at: url)
+    }
+
+    private func loadCollaborationOperations(at url: URL) -> [CollaborationOperation] {
+        let cacheKey = url.standardizedFileURL.path
+        if let pendingSave = pendingCollaborationOperationsSaves[cacheKey] {
+            return pendingSave.operations
+        }
+        guard let signature = collaborationOperationsFileSignature(at: url) else {
+            collaborationOperationsCache[cacheKey] = nil
+            return []
+        }
+        if let cached = collaborationOperationsCache[cacheKey],
+           cached.signature == signature {
+            return cached.operations
+        }
+
+        let operations: [CollaborationOperation]
+        if let data = try? Data(contentsOf: url),
+           let archive = try? JSONDecoder().decode(
+            CollaborationPageOperationArchive.self,
+            from: data
+           ),
+           archive.schemaVersion > 0,
+           archive.schemaVersion <= CollaborationPageOperationArchive.currentSchemaVersion {
+            operations = archive.operations
+        } else {
+            operations = []
+        }
+        collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
+            signature: signature,
+            operations: operations
+        )
+        return operations
     }
 
     private func saveCollaborationOperations(
@@ -5778,6 +6005,154 @@ final class DrawingDocumentStore: ObservableObject {
         forPageID pageID: String,
         in documentID: String
     ) throws {
+        let url = collaborationOperationsURL(forPageID: pageID, in: documentID)
+        let cacheKey = url.standardizedFileURL.path
+        pendingCollaborationOperationsTasks[cacheKey]?.cancel()
+        pendingCollaborationOperationsTasks[cacheKey] = nil
+        pendingCollaborationOperationsSaves[cacheKey] = nil
+        let encoded = try Self.encodedCollaborationOperations(operations)
+        try encoded.data.write(to: url, options: .atomic)
+        if let signature = collaborationOperationsFileSignature(at: url) {
+            collaborationOperationsCache[cacheKey] =
+                CollaborationOperationsCacheEntry(
+                    signature: signature,
+                    operations: encoded.operations
+                )
+        } else {
+            collaborationOperationsCache[cacheKey] = nil
+        }
+    }
+
+    /// Drawing edits use this path so the full JSON archive is encoded away from MainActor. The
+    /// decoded operation array remains immediately available to recovery and CloudKit export; a
+    /// page close or scene transition drains it synchronously if the background encoding has not
+    /// completed yet.
+    private func scheduleCollaborationOperationsSave(
+        _ operations: [CollaborationOperation],
+        forPageID pageID: String,
+        in documentID: String
+    ) {
+        let url = collaborationOperationsURL(forPageID: pageID, in: documentID)
+        let cacheKey = url.standardizedFileURL.path
+        pendingCollaborationOperationsTasks[cacheKey]?.cancel()
+        let pendingSave = PendingCollaborationOperationsSave(
+            token: UUID(),
+            operations: operations,
+            targetURL: url,
+            documentID: documentID,
+            pageID: pageID
+        )
+        pendingCollaborationOperationsSaves[cacheKey] = pendingSave
+        guard !isDrawingInteractionActive else {
+            pendingCollaborationOperationsTasks[cacheKey] = nil
+            return
+        }
+        schedulePendingCollaborationOperationsSave(pendingSave, cacheKey: cacheKey)
+    }
+
+    private func schedulePendingCollaborationOperationsSaves() {
+        guard !isDrawingInteractionActive else { return }
+        for (cacheKey, pendingSave) in pendingCollaborationOperationsSaves {
+            schedulePendingCollaborationOperationsSave(pendingSave, cacheKey: cacheKey)
+        }
+    }
+
+    private func schedulePendingCollaborationOperationsSave(
+        _ pendingSave: PendingCollaborationOperationsSave,
+        cacheKey: String
+    ) {
+        pendingCollaborationOperationsTasks[cacheKey]?.cancel()
+        pendingCollaborationOperationsTasks[cacheKey] = Task.detached(priority: .background) {
+            [weak self] in
+            do {
+                let encoded = try Self.encodedCollaborationOperations(pendingSave.operations)
+                guard !Task.isCancelled else { return }
+                await self?.finishScheduledCollaborationOperationsSave(
+                    pendingSave,
+                    cacheKey: cacheKey,
+                    encoded: encoded
+                )
+            } catch {
+                guard !Task.isCancelled else { return }
+                await self?.failScheduledCollaborationOperationsSave(
+                    pendingSave,
+                    cacheKey: cacheKey,
+                    error: error
+                )
+            }
+        }
+    }
+
+    private func finishScheduledCollaborationOperationsSave(
+        _ pendingSave: PendingCollaborationOperationsSave,
+        cacheKey: String,
+        encoded: (data: Data, operations: [CollaborationOperation])
+    ) {
+        guard pendingCollaborationOperationsSaves[cacheKey]?.token == pendingSave.token else {
+            return
+        }
+        pendingCollaborationOperationsTasks[cacheKey] = nil
+        guard !isDrawingInteractionActive else { return }
+        do {
+            try encoded.data.write(to: pendingSave.targetURL, options: .atomic)
+            pendingCollaborationOperationsSaves[cacheKey] = nil
+            if let signature = collaborationOperationsFileSignature(at: pendingSave.targetURL) {
+                collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
+                    signature: signature,
+                    operations: encoded.operations
+                )
+            } else {
+                collaborationOperationsCache[cacheKey] = nil
+            }
+        } catch {
+            saveState = .failed("协作操作无法保存：\(error.localizedDescription)")
+        }
+    }
+
+    private func failScheduledCollaborationOperationsSave(
+        _ pendingSave: PendingCollaborationOperationsSave,
+        cacheKey: String,
+        error: Error
+    ) {
+        guard pendingCollaborationOperationsSaves[cacheKey]?.token == pendingSave.token else {
+            return
+        }
+        pendingCollaborationOperationsTasks[cacheKey] = nil
+        saveState = .failed("协作操作无法保存：\(error.localizedDescription)")
+    }
+
+    private func flushPendingCollaborationOperationsSaves(withKeys keys: [String]) -> Bool {
+        var firstError: Error?
+        for cacheKey in keys {
+            pendingCollaborationOperationsTasks[cacheKey]?.cancel()
+            pendingCollaborationOperationsTasks[cacheKey] = nil
+            guard let pendingSave = pendingCollaborationOperationsSaves[cacheKey] else { continue }
+            do {
+                let encoded = try Self.encodedCollaborationOperations(pendingSave.operations)
+                try encoded.data.write(to: pendingSave.targetURL, options: .atomic)
+                pendingCollaborationOperationsSaves[cacheKey] = nil
+                if let signature = collaborationOperationsFileSignature(at: pendingSave.targetURL) {
+                    collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
+                        signature: signature,
+                        operations: encoded.operations
+                    )
+                } else {
+                    collaborationOperationsCache[cacheKey] = nil
+                }
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+        if let firstError {
+            saveState = .failed("协作操作无法保存：\(firstError.localizedDescription)")
+            return false
+        }
+        return true
+    }
+
+    nonisolated private static func encodedCollaborationOperations(
+        _ operations: [CollaborationOperation]
+    ) throws -> (data: Data, operations: [CollaborationOperation]) {
         var unique: [String: CollaborationOperation] = [:]
         for operation in operations {
             if let current = unique[operation.id] {
@@ -5786,16 +6161,25 @@ final class DrawingDocumentStore: ObservableObject {
                 unique[operation.id] = operation
             }
         }
-        let archive = CollaborationPageOperationArchive(
-            operations: unique.values.sorted {
-                $0.deterministicallyPrecedes($1)
-            }
-        )
+        let canonicalOperations = unique.values.sorted {
+            $0.deterministicallyPrecedes($1)
+        }
+        let archive = CollaborationPageOperationArchive(operations: canonicalOperations)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(archive).write(
-            to: collaborationOperationsURL(forPageID: pageID, in: documentID),
-            options: .atomic
+        return (try encoder.encode(archive), canonicalOperations)
+    }
+
+    private func collaborationOperationsFileSignature(
+        at url: URL
+    ) -> CollaborationOperationsFileSignature? {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else {
+            return nil
+        }
+        let byteCount = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        return CollaborationOperationsFileSignature(
+            byteCount: byteCount,
+            modifiedAt: attributes[.modificationDate] as? Date
         )
     }
 
@@ -6154,15 +6538,12 @@ final class DrawingDocumentStore: ObservableObject {
 
         var archivedPages: [(page: LibraryPage, state: MaterializedCollaborationPage)] = []
         for url in operationURLs {
-            guard let data = try? Data(contentsOf: url),
-                  let archive = try? JSONDecoder().decode(
-                      CollaborationPageOperationArchive.self,
-                      from: data
-                  ) else { continue }
-            for operation in archive.operations {
+            let operations = loadCollaborationOperations(at: url)
+            guard !operations.isEmpty else { continue }
+            for operation in operations {
                 collaborationClock.observe(operation.stamp)
             }
-            let state = CollaborationMergeEngine.materialize(archive.operations)
+            let state = CollaborationMergeEngine.materialize(operations)
             guard let pageData = state.metadata["pageArchive"],
                   let page = try? JSONDecoder().decode(LibraryPage.self, from: pageData),
                   page.documentID == documentID else { continue }
@@ -6590,6 +6971,16 @@ final class DrawingDocumentStore: ObservableObject {
             .filter { !availableIDs.contains($0.documentID) }
         for reference in staleReferences {
             cancelPendingSave(for: reference)
+        }
+        let staleOperationKeys = pendingCollaborationOperationsSaves.compactMap {
+            cacheKey, pendingSave in
+            availableIDs.contains(pendingSave.documentID) ? nil : cacheKey
+        }
+        for cacheKey in staleOperationKeys {
+            pendingCollaborationOperationsTasks[cacheKey]?.cancel()
+            pendingCollaborationOperationsTasks[cacheKey] = nil
+            pendingCollaborationOperationsSaves[cacheKey] = nil
+            collaborationOperationsCache[cacheKey] = nil
         }
     }
 

@@ -79,6 +79,8 @@ private enum LibraryFeatureSmokeHarness {
             try validateAutomaticBackupRecovery(token: token)
             try validateOfflineLastPageRecovery(token: token)
             try validateStaleEditorMerge(token: token)
+            try validateSequentialDrawingIdentity(token: token)
+            try validateLargeDrawingAppendFastPath(token: token)
             try validateLegacyDecoding()
             try validateCanvasToolsAndLasso()
             try validateScanPDFRenderer()
@@ -747,6 +749,238 @@ private enum LibraryFeatureSmokeHarness {
                 path: PKStrokePath(controlPoints: points, creationDate: Date())
             )
         ])
+    }
+
+    private static func validateSequentialDrawingIdentity(token: String) throws {
+        let fileManager = FileManager.default
+        let workspace = fileManager.temporaryDirectory
+            .appendingPathComponent("TiyiNoteSequentialDrawingSmoke", isDirectory: true)
+            .appendingPathComponent(token, isDirectory: true)
+        let defaultsName = "com.tiyi.note.sequential-drawing-smoke.\(token)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defaults.removePersistentDomain(forName: defaultsName)
+        defer {
+            try? fileManager.removeItem(at: workspace)
+            defaults.removePersistentDomain(forName: defaultsName)
+        }
+
+        let store = DrawingDocumentStore(
+            userDefaults: defaults,
+            workspaceDirectoryOverride: workspace
+        )
+        let document = try store.createCanvas(
+            named: "Sequential Apple Pencil Saves",
+            in: nil,
+            backgroundStyle: .blank,
+            backgroundColor: .white
+        )
+        guard let pageID = store.pageID(at: 0, in: document.id) else {
+            throw SmokeError.validationFailed("连续笔迹测试缺少页面")
+        }
+
+        let expectedStrokeCount = 8
+        var submittedDrawing = PKDrawing()
+        var context = store.collaborationFrontier(forPage: 0, in: document.id)
+        for index in 0..<expectedStrokeCount {
+            let stroke = makeNormalizationSensitiveStroke(index: index)
+            let desiredDrawing = PKDrawing(strokes: submittedDrawing.strokes + [stroke])
+            context = store.scheduleSave(
+                desiredDrawing,
+                replacing: submittedDrawing,
+                causalContext: context,
+                assumesOnlyAppendedStrokes: true,
+                forPage: 0,
+                in: document.id
+            )
+            submittedDrawing = desiredDrawing
+        }
+        guard store.flushPendingSaves(forPage: 0, in: document.id) else {
+            throw SmokeError.validationFailed("连续笔迹测试无法落盘")
+        }
+
+        let operations = store.exportCollaborationOperations().filter {
+            $0.documentID == document.id && $0.pageID == pageID
+        }
+        let strokeUpserts = operations.compactMap { operation -> CollaborationInkStroke? in
+            guard case .strokeUpsert(let stroke) = operation.payload else { return nil }
+            return stroke
+        }
+        let state = CollaborationMergeEngine.materialize(operations)
+        let idsByZIndex = Dictionary(grouping: strokeUpserts, by: \.zIndex)
+            .mapValues { Set($0.map(\.id)) }
+        let materializedIDs = Set(state.strokes.keys)
+        guard strokeUpserts.count == expectedStrokeCount,
+              Set(strokeUpserts.map(\.id)).count == expectedStrokeCount,
+              idsByZIndex.count == expectedStrokeCount,
+              idsByZIndex.values.allSatisfy({ $0.count == 1 }),
+              state.strokes.count == expectedStrokeCount,
+              store.debugAppendOnlyDrawingSaveCount == expectedStrokeCount,
+              store.debugFullDrawingDiffSaveCount == 0,
+              store.loadDrawing(forPage: 0, in: document.id).strokes.count
+                  == expectedStrokeCount else {
+            throw SmokeError.validationFailed(
+                "连续保存没有保持增量路径，或把旧笔迹重复分配 ID："
+                    + "upsert=\(strokeUpserts.count)，"
+                    + "append=\(store.debugAppendOnlyDrawingSaveCount)，"
+                    + "full=\(store.debugFullDrawingDiffSaveCount)，"
+                    + "state=\(state.strokes.count)"
+            )
+        }
+
+        let reloaded = DrawingDocumentStore(
+            userDefaults: defaults,
+            workspaceDirectoryOverride: workspace
+        )
+        let reloadedOperations = reloaded.exportCollaborationOperations().filter {
+            $0.documentID == document.id && $0.pageID == pageID
+        }
+        let reloadedState = CollaborationMergeEngine.materialize(reloadedOperations)
+        guard Set(reloadedState.strokes.keys) == materializedIDs,
+              reloadedState.strokes.count == expectedStrokeCount,
+              reloaded.loadDrawing(forPage: 0, in: document.id).strokes.count
+                  == expectedStrokeCount else {
+            throw SmokeError.validationFailed("连续笔迹重启后 ID 或内容不稳定")
+        }
+    }
+
+    private static func makeNormalizationSensitiveStroke(index: Int) -> PKStroke {
+        let xOffset = CGFloat(index) * 37.129_731
+        let yOffset = CGFloat(index % 3) * 41.713_619
+        let points = (0..<74).map { sample in
+            let progress = CGFloat(sample) / 73
+            return PKStrokePoint(
+                location: CGPoint(
+                    x: 18.317_429 + xOffset + progress * 96.583_217,
+                    y: 27.913_683 + yOffset + sin(progress * .pi * 2) * 13.719_381
+                ),
+                timeOffset: sample < 37
+                    ? TimeInterval(sample) * 0.011_731
+                    : 1.379 + TimeInterval(sample - 37) * 0.010_913,
+                size: CGSize(
+                    width: 3.413_729 + progress * 1.271_933,
+                    height: 3.193_117 + progress * 1.117_291
+                ),
+                opacity: 0.917_319 + progress * 0.071_337,
+                force: 0.231_719 + progress * 0.617_293,
+                azimuth: 0.173_119 + progress * 0.319_731,
+                altitude: 0.713_179 + progress * 0.271_933
+            )
+        }
+        return PKStroke(
+            ink: PKInk(.pen, color: UIColor(red: 0.08, green: 0.12, blue: 0.18, alpha: 1)),
+            path: PKStrokePath(
+                controlPoints: points,
+                creationDate: Date(timeIntervalSince1970: 1_725_408_000 + TimeInterval(index))
+            )
+        )
+    }
+
+    private static func validateLargeDrawingAppendFastPath(token: String) throws {
+        let fileManager = FileManager.default
+        let workspace = fileManager.temporaryDirectory
+            .appendingPathComponent("TiyiNoteLargeDrawingAppendSmoke", isDirectory: true)
+            .appendingPathComponent(token, isDirectory: true)
+        let defaultsName = "com.tiyi.note.large-drawing-append-smoke.\(token)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defaults.removePersistentDomain(forName: defaultsName)
+        defer {
+            try? fileManager.removeItem(at: workspace)
+            defaults.removePersistentDomain(forName: defaultsName)
+        }
+
+        let store = DrawingDocumentStore(
+            userDefaults: defaults,
+            workspaceDirectoryOverride: workspace
+        )
+        let document = try store.createCanvas(
+            named: "Large Drawing Append",
+            in: nil,
+            backgroundStyle: .blank,
+            backgroundColor: .white
+        )
+        let initialStrokeCount = 240
+        let initialStrokes = (0..<initialStrokeCount).flatMap { index in
+            makeSmokeDrawing(
+                offset: CGFloat(index) * 2.125,
+                color: UIColor(
+                    hue: CGFloat(index % 17) / 17,
+                    saturation: 0.72,
+                    brightness: 0.68,
+                    alpha: 1
+                )
+            ).strokes
+        }
+        let initialDrawing = PKDrawing(strokes: initialStrokes)
+        let initialInteractionID = UUID()
+        store.setDrawingInteractionActive(true, id: initialInteractionID)
+        _ = store.scheduleSave(
+            initialDrawing,
+            replacing: PKDrawing(),
+            causalContext: store.collaborationFrontier(forPage: 0, in: document.id),
+            assumesOnlyAppendedStrokes: true,
+            forPage: 0,
+            in: document.id
+        )
+        guard store.flushPendingSaves(forPage: 0, in: document.id) else {
+            throw SmokeError.validationFailed("大日志基线无法落盘")
+        }
+        store.setDrawingInteractionActive(false, id: initialInteractionID)
+
+        let reloaded = DrawingDocumentStore(
+            userDefaults: defaults,
+            workspaceDirectoryOverride: workspace
+        )
+        let baseDrawing = reloaded.loadDrawing(forPage: 0, in: document.id)
+        let appendedStrokeCount = 6
+        let appendedStrokes = (0..<appendedStrokeCount).flatMap { index in
+            makeSmokeDrawing(
+                offset: 700 + CGFloat(index) * 13,
+                color: UIColor(red: 0.12, green: 0.24, blue: 0.72, alpha: 1)
+            ).strokes
+        }
+        let desiredDrawing = PKDrawing(strokes: baseDrawing.strokes + appendedStrokes)
+        let interactionID = UUID()
+        reloaded.setDrawingInteractionActive(true, id: interactionID)
+        _ = reloaded.scheduleSave(
+            desiredDrawing,
+            replacing: baseDrawing,
+            causalContext: reloaded.collaborationFrontier(forPage: 0, in: document.id),
+            assumesOnlyAppendedStrokes: true,
+            forPage: 0,
+            in: document.id
+        )
+
+        guard let pageID = reloaded.pageID(at: 0, in: document.id) else {
+            throw SmokeError.validationFailed("大日志增量测试缺少页面")
+        }
+        let pendingOperations = reloaded.exportCollaborationOperations().filter {
+            $0.documentID == document.id && $0.pageID == pageID
+        }
+        let pendingStrokeUpsertCount = pendingOperations.reduce(into: 0) { count, operation in
+            if case .strokeUpsert = operation.payload { count += 1 }
+        }
+        let pendingDeleteCount = pendingOperations.reduce(into: 0) { count, operation in
+            if case .strokeDelete = operation.payload { count += 1 }
+        }
+        guard reloaded.debugAppendOnlyDrawingSaveCount == 1,
+              reloaded.debugFullDrawingDiffSaveCount == 0,
+              pendingStrokeUpsertCount == initialStrokeCount + appendedStrokeCount,
+              pendingDeleteCount == 0 else {
+            throw SmokeError.validationFailed("大日志新增笔画退回了全量指纹或产生误删除")
+        }
+
+        guard reloaded.flushPendingSaves(forPage: 0, in: document.id) else {
+            throw SmokeError.validationFailed("大日志增量无法落盘")
+        }
+        reloaded.setDrawingInteractionActive(false, id: interactionID)
+        let verified = DrawingDocumentStore(
+            userDefaults: defaults,
+            workspaceDirectoryOverride: workspace
+        )
+        guard verified.loadDrawing(forPage: 0, in: document.id).strokes.count
+                == initialStrokeCount + appendedStrokeCount else {
+            throw SmokeError.validationFailed("大日志增量重启后丢失")
+        }
     }
 
     private enum ExportPixelProbe {

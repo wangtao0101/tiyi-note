@@ -311,7 +311,16 @@ struct PDFDocumentReaderView: View {
     }
 }
 
+private struct PendingDrawingPersistence {
+    var drawing: PKDrawing
+    let baseDrawing: PKDrawing
+    let causalContext: CollaborationVersionVector
+    var containsOnlyAppendedStrokes: Bool
+}
+
 private struct PDFPageAnnotationView: View {
+    private static let drawingPersistenceIdleDelay: TimeInterval = 2.0
+
     @Environment(\.scenePhase) private var scenePhase
 
     @ObservedObject var documentStore: DrawingDocumentStore
@@ -336,10 +345,15 @@ private struct PDFPageAnnotationView: View {
     @StateObject private var controller = CanvasController()
     @State private var hasLoadedDrawing = false
     @State private var loadedPageAssetRevision: UInt64 = 0
+    @State private var deferredPageAssetRevision: UInt64?
     @State private var isDrawingDirty = false
     @State private var arePageElementsDirty = false
     @State private var pageElements: [CanvasPageElement] = []
     @State private var submittedDrawing = PKDrawing()
+    @State private var pendingDrawingPersistence: PendingDrawingPersistence?
+    @State private var drawingPersistenceWorkItem: DispatchWorkItem?
+    @State private var drawingPersistenceScheduleID: UUID?
+    @State private var drawingInteractionID = UUID()
     @State private var submittedPageElements: [CanvasPageElement] = []
     @State private var drawingCollaborationContext = CollaborationVersionVector()
     @State private var elementCollaborationContext = CollaborationVersionVector()
@@ -546,6 +560,24 @@ private struct PDFPageAnnotationView: View {
         ) { _, revision in
             reloadRemotePageAssetsIfPossible(revision: revision)
         }
+        .onChange(of: controller.isUsingTool) { _, isUsingTool in
+            if isUsingTool {
+                documentStore.setDrawingInteractionActive(true, id: drawingInteractionID)
+                cancelScheduledDrawingPersistence()
+                return
+            }
+            documentStore.setDrawingInteractionActive(false, id: drawingInteractionID)
+            if pendingDrawingPersistence != nil, drawingPersistenceWorkItem == nil {
+                scheduleDrawingPersistence(
+                    after: Self.drawingPersistenceIdleDelay,
+                    documentStore: documentStore
+                )
+            }
+            if let revision = deferredPageAssetRevision {
+                deferredPageAssetRevision = nil
+                reloadRemotePageAssetsIfPossible(revision: revision)
+            }
+        }
         .sheet(
             isPresented: Binding(
                 get: { croppingImageElementID != nil },
@@ -610,18 +642,12 @@ private struct PDFPageAnnotationView: View {
 
         controller.onDrawingChanged = { [weak documentStore] drawing in
             guard isAnnotationEditingEnabled, let documentStore else { return }
-            isDrawingDirty = true
-            drawingCollaborationContext = documentStore.scheduleSave(
-                drawing,
-                replacing: submittedDrawing,
-                causalContext: drawingCollaborationContext,
-                forPage: resolvedPageIndex,
-                in: documentID
-            )
-            submittedDrawing = drawing
+            queueDrawingPersistence(drawing, documentStore: documentStore)
         }
-        controller.onBecameActive = { [weak controller] in
-            guard let controller else { return }
+        controller.onBecameActive = { [weak controller, weak documentStore] in
+            guard let controller, let documentStore else { return }
+            documentStore.setDrawingInteractionActive(true, id: drawingInteractionID)
+            cancelScheduledDrawingPersistence()
             onReady(controller, pageIndex)
         }
         controller.configureAnnotationInput(isEditable: isAnnotationEditingEnabled)
@@ -631,10 +657,15 @@ private struct PDFPageAnnotationView: View {
     }
 
     private var canvasAccessibilityValue: String {
-        "笔迹 \(controller.drawing.strokes.count)；"
+        let value = "笔迹 \(controller.drawing.strokes.count)；"
             + "可撤销 \(controller.canUndo ? "是" : "否")；"
             + "吸附 \(controller.lastSnappedShapeKind?.title ?? "无")；"
             + drawingGeometryAccessibilityValue
+#if DEBUG
+        return value + "；同步重载 \(controller.synchronizedDrawingInstallCount)"
+#else
+        return value
+#endif
     }
 
     private var drawingGeometryAccessibilityValue: String {
@@ -654,6 +685,8 @@ private struct PDFPageAnnotationView: View {
             commitTextEdit()
         }
         persistPendingPageChanges()
+        cancelScheduledDrawingPersistence()
+        documentStore.setDrawingInteractionActive(false, id: drawingInteractionID)
         controller.onDrawingChanged = nil
         controller.onBecameActive = nil
         onRelease(controller, pageIndex)
@@ -687,6 +720,79 @@ private struct PDFPageAnnotationView: View {
             in: documentID
         )
         submittedPageElements = pageElements
+    }
+
+    /// PencilKit delivers the completed stroke on the main thread. Building collaboration
+    /// fingerprints and rewriting the operation journal in that same callback can delay the next
+    /// Pencil contact on a page with many strokes. Coalesce a burst of handwriting and persist it
+    /// only after a short idle window; page/scene transitions still flush it synchronously.
+    private func queueDrawingPersistence(
+        _ drawing: PKDrawing,
+        documentStore: DrawingDocumentStore
+    ) {
+        isDrawingDirty = true
+        let previousDrawing = pendingDrawingPersistence?.drawing ?? submittedDrawing
+        let appendsStrokes = selectedTool.usesInkSettings
+            && drawing.strokes.count > previousDrawing.strokes.count
+        if var pendingDrawingPersistence {
+            pendingDrawingPersistence.drawing = drawing
+            pendingDrawingPersistence.containsOnlyAppendedStrokes =
+                pendingDrawingPersistence.containsOnlyAppendedStrokes && appendsStrokes
+            self.pendingDrawingPersistence = pendingDrawingPersistence
+        } else {
+            pendingDrawingPersistence = PendingDrawingPersistence(
+                drawing: drawing,
+                baseDrawing: submittedDrawing,
+                causalContext: drawingCollaborationContext,
+                containsOnlyAppendedStrokes: appendsStrokes
+            )
+        }
+        scheduleDrawingPersistence(
+            after: Self.drawingPersistenceIdleDelay,
+            documentStore: documentStore
+        )
+    }
+
+    private func scheduleDrawingPersistence(
+        after delay: TimeInterval,
+        documentStore: DrawingDocumentStore
+    ) {
+        cancelScheduledDrawingPersistence()
+        let scheduleID = UUID()
+        drawingPersistenceScheduleID = scheduleID
+        let workItem = DispatchWorkItem { [weak documentStore] in
+            guard drawingPersistenceScheduleID == scheduleID,
+                  let documentStore else { return }
+            drawingPersistenceWorkItem = nil
+            drawingPersistenceScheduleID = nil
+            if controller.isUsingTool {
+                return
+            }
+            persistQueuedDrawingChange(documentStore: documentStore)
+        }
+        drawingPersistenceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func cancelScheduledDrawingPersistence() {
+        drawingPersistenceWorkItem?.cancel()
+        drawingPersistenceWorkItem = nil
+        drawingPersistenceScheduleID = nil
+    }
+
+    private func persistQueuedDrawingChange(documentStore: DrawingDocumentStore) {
+        cancelScheduledDrawingPersistence()
+        guard let pendingDrawingPersistence else { return }
+        self.pendingDrawingPersistence = nil
+        drawingCollaborationContext = documentStore.scheduleSave(
+            pendingDrawingPersistence.drawing,
+            replacing: pendingDrawingPersistence.baseDrawing,
+            causalContext: pendingDrawingPersistence.causalContext,
+            assumesOnlyAppendedStrokes: pendingDrawingPersistence.containsOnlyAppendedStrokes,
+            forPage: resolvedPageIndex,
+            in: documentID
+        )
+        submittedDrawing = pendingDrawingPersistence.drawing
     }
 
     private func consumePageElementInsertionRequest() {
@@ -1105,6 +1211,9 @@ private struct PDFPageAnnotationView: View {
     /// Flushes only payloads produced by a real edit. Read-only pages and pages that were merely
     /// viewed never create empty annotation assets or alter CloudKit conflict timestamps.
     private func persistPendingPageChanges() {
+        if pendingDrawingPersistence != nil {
+            persistQueuedDrawingChange(documentStore: documentStore)
+        }
         guard
             isAnnotationEditingEnabled,
             documentStore.document(withID: documentID) != nil,
@@ -1122,12 +1231,34 @@ private struct PDFPageAnnotationView: View {
     /// causal frontier. Operation replay then merges that delta with the downloaded edits.
     private func reloadRemotePageAssetsIfPossible(revision: UInt64) {
         guard hasLoadedDrawing, revision != loadedPageAssetRevision else { return }
+        guard !controller.isUsingTool else {
+            deferredPageAssetRevision = max(deferredPageAssetRevision ?? 0, revision)
+            return
+        }
+        if let deferredPageAssetRevision, revision >= deferredPageAssetRevision {
+            self.deferredPageAssetRevision = nil
+        }
 
-        let drawingHasPendingSave = documentStore.hasPendingDrawingSave(
-            forPage: resolvedPageIndex,
-            in: documentID
-        )
-        if !isDrawingDirty || !drawingHasPendingSave {
+        let drawingHasPendingSave = pendingDrawingPersistence != nil
+            || documentStore.hasPendingDrawingSave(
+                forPage: resolvedPageIndex,
+                in: documentID
+            )
+        let hasUnseenDrawingOperations = documentStore
+            .hasUnseenDrawingCollaborationOperations(
+                outside: drawingCollaborationContext,
+                forPage: resolvedPageIndex,
+                in: documentID
+            )
+        if !hasUnseenDrawingOperations {
+            // A local debounce write, an echoed CKAsset, or our own immutable operations can all
+            // advance the asset revision. The visible canvas already owns this exact edit. Even a
+            // semantically identical `canvasView.drawing = ...` can clear PencilKit's active
+            // render tiles on hardware, so acknowledge the save without touching the canvas.
+            if !drawingHasPendingSave {
+                isDrawingDirty = false
+            }
+        } else if !isDrawingDirty || !drawingHasPendingSave {
             let mergedDrawing = documentStore.loadDrawing(
                 forPage: resolvedPageIndex,
                 in: documentID

@@ -6,6 +6,8 @@ import SwiftUI
 import UIKit
 
 struct RootWorkspaceView: View {
+    private static let automaticCloudQuietWindow: TimeInterval = 5.0
+
     @Environment(\.scenePhase) private var scenePhase
 
     @ObservedObject var documentStore: DrawingDocumentStore
@@ -106,6 +108,10 @@ struct RootWorkspaceView: View {
                     : 4_000_000_000
                 try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled else { return }
+                guard !documentStore.isDrawingInteractionActive,
+                      !documentStore.hadRecentDrawingInteraction(
+                        within: Self.automaticCloudQuietWindow
+                      ) else { continue }
                 // Refresh CKShare permission before accepting another local edit window. Push is
                 // only a latency hint; polling also catches owner downgrades/revocations.
                 await refreshSharedDocuments()
@@ -117,6 +123,19 @@ struct RootWorkspaceView: View {
         .onChange(of: documentStore.cloudSyncGeneration) { _, _ in
             Task {
                 await scheduleAllCloudZones()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .tiyiDrawingInteractionActivityChanged)
+        ) { notification in
+            guard let source = notification.object as? DrawingDocumentStore,
+                  source === documentStore else { return }
+            Task {
+                if documentStore.isDrawingInteractionActive {
+                    await cancelScheduledCloudZones()
+                } else {
+                    await scheduleAllCloudZones()
+                }
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -148,6 +167,13 @@ struct RootWorkspaceView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .tiyiCloudKitRemoteChange)) { _ in
             Task {
+                guard !documentStore.isDrawingInteractionActive,
+                      !documentStore.hadRecentDrawingInteraction(
+                        within: Self.automaticCloudQuietWindow
+                      ) else {
+                    await scheduleAllCloudZones()
+                    return
+                }
                 await refreshSharedDocuments()
                 await synchronizeAllCloudZones()
             }
@@ -267,11 +293,24 @@ struct RootWorkspaceView: View {
     }
 
     private func scheduleAllCloudZones() async {
+        guard !documentStore.isDrawingInteractionActive else {
+            await cancelScheduledCloudZones()
+            return
+        }
         if let cloudSyncCoordinator {
             await cloudSyncCoordinator.scheduleSync()
         }
         for coordinator in sharedSyncCoordinators.values {
             await coordinator.scheduleSync()
+        }
+    }
+
+    private func cancelScheduledCloudZones() async {
+        if let cloudSyncCoordinator {
+            await cloudSyncCoordinator.cancelScheduledSync()
+        }
+        for coordinator in sharedSyncCoordinators.values {
+            await coordinator.cancelScheduledSync()
         }
     }
 

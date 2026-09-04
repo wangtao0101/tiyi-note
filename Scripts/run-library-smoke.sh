@@ -8,9 +8,13 @@ derived_data_directory="${TMPDIR:-/tmp}/tiyi-note-library-smoke"
 app_path="${derived_data_directory}/Build/Products/Debug-iphonesimulator/TiyiNote.app"
 smoke_token="$(date '+%Y%m%d-%H%M%S')"
 
-device_id="$(xcrun simctl list devices booted | awk -F '[()]' '/Booted/ { print $2; exit }')"
+device_id="$(xcrun simctl list devices booted | sed -nE \
+  's/.*\(([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\).*/\1/p' \
+  | head -n 1)"
 if [[ -z "${device_id}" ]]; then
-  device_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPad/ { print $2; exit }')"
+  device_id="$(xcrun simctl list devices available | sed -nE \
+    '/iPad/ s/.*\(([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\).*/\1/p' \
+    | head -n 1)"
   [[ -n "${device_id}" ]] || { print -u2 "没有可用的 iOS 模拟器"; exit 1; }
   xcrun simctl boot "${device_id}"
   open -a Simulator

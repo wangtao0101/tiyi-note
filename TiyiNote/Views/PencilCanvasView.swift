@@ -21,7 +21,9 @@ struct PencilCanvasView: UIViewRepresentable {
 
     func updateUIView(_ uiView: PageCanvasContainerView, context: Context) {
         context.coordinator.parent = self
-        uiView.logicalPageSize = logicalPageSize
+        if uiView.logicalPageSize != logicalPageSize {
+            uiView.logicalPageSize = logicalPageSize
+        }
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
@@ -70,7 +72,10 @@ struct PencilCanvasView: UIViewRepresentable {
 final class PageCanvasContainerView: UIView {
     let canvasView: PKCanvasView
     var logicalPageSize: CGSize {
-        didSet { setNeedsLayout() }
+        didSet {
+            guard logicalPageSize != oldValue else { return }
+            setNeedsLayout()
+        }
     }
 
     init(canvasView: PKCanvasView, logicalPageSize: CGSize) {
@@ -91,14 +96,22 @@ final class PageCanvasContainerView: UIView {
         super.layoutSubviews()
         guard logicalPageSize.width > 0, logicalPageSize.height > 0 else { return }
 
-        canvasView.transform = .identity
-        canvasView.bounds = CGRect(origin: .zero, size: logicalPageSize)
-        canvasView.center = CGPoint(x: bounds.midX, y: bounds.midY)
-        canvasView.contentSize = logicalPageSize
-        canvasView.contentOffset = .zero
-
         let scaleX = bounds.width / logicalPageSize.width
         let scaleY = bounds.height / logicalPageSize.height
-        canvasView.transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
+        let targetBounds = CGRect(origin: .zero, size: logicalPageSize)
+        let targetCenter = CGPoint(x: bounds.midX, y: bounds.midY)
+        let targetTransform = CGAffineTransform(scaleX: scaleX, y: scaleY)
+        guard canvasView.bounds != targetBounds
+                || canvasView.center != targetCenter
+                || canvasView.contentSize != logicalPageSize
+                || canvasView.contentOffset != .zero
+                || canvasView.transform != targetTransform else { return }
+
+        canvasView.transform = .identity
+        canvasView.bounds = targetBounds
+        canvasView.center = targetCenter
+        canvasView.contentSize = logicalPageSize
+        canvasView.contentOffset = .zero
+        canvasView.transform = targetTransform
     }
 }

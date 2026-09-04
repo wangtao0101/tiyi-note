@@ -8,6 +8,9 @@ final class CanvasController: NSObject, ObservableObject {
     @Published private(set) var canRedo = false
     @Published private(set) var isUsingTool = false
     @Published private(set) var lastSnappedShapeKind: PageShapeKind?
+#if DEBUG
+    private(set) var synchronizedDrawingInstallCount = 0
+#endif
 
     var onDrawingChanged: ((PKDrawing) -> Void)?
     var onBecameActive: (() -> Void)?
@@ -15,6 +18,7 @@ final class CanvasController: NSObject, ObservableObject {
     private var isInstallingDrawing = false
     private var strokeTransformSession: StrokeTransformSession?
     private var toolInteractionOriginDrawing: PKDrawing?
+    private var toolInteractionEndWorkItem: DispatchWorkItem?
     private var undoDrawings: [PKDrawing] = []
     private var redoDrawings: [PKDrawing] = []
     private var lastObservedDrawing = PKDrawing()
@@ -25,6 +29,11 @@ final class CanvasController: NSObject, ObservableObject {
     private var shapeGesturePoints: [CGPoint] = []
     private var shapeSnapInkStyle: ShapeSnapInkStyle?
     private var shapeHoldWorkItem: DispatchWorkItem?
+    private var shapeSnapCommitWorkItem: DispatchWorkItem?
+    private var pendingShapeSnap: PendingShapeSnap?
+    private var authoritativeSnappedDrawing: PKDrawing?
+    private var committedShapeSnapAwaitingTouchEnd = false
+    private var shapeTouchHasEnded = false
     private var isCommittingShapeSnap = false
     private var shapeTrackingGestureRecognizer: UILongPressGestureRecognizer?
     private var isAnnotationInputEditable = true
@@ -79,9 +88,19 @@ final class CanvasController: NSObject, ObservableObject {
         undoDrawings.removeAll()
         redoDrawings.removeAll()
         toolInteractionOriginDrawing = nil
+        toolInteractionEndWorkItem?.cancel()
+        toolInteractionEndWorkItem = nil
         pendingUntrackedOriginDrawing = nil
         pendingUntrackedHistoryWorkItem?.cancel()
         pendingUntrackedHistoryWorkItem = nil
+        shapeSnapCommitWorkItem?.cancel()
+        shapeSnapCommitWorkItem = nil
+        pendingShapeSnap = nil
+        authoritativeSnappedDrawing = nil
+        committedShapeSnapAwaitingTouchEnd = false
+        shapeTouchHasEnded = false
+        isCommittingShapeSnap = false
+        isUsingTool = false
         refreshHistoryState()
     }
 
@@ -89,6 +108,13 @@ final class CanvasController: NSObject, ObservableObject {
         _ drawing: PKDrawing,
         preservingHistory: Bool
     ) {
+        // A page asset revision may arrive from autosave or CloudKit while PencilKit still owns an
+        // in-flight stroke. The page view defers those revisions; keep this controller-level guard
+        // as the final invariant against replacing a live transaction.
+        guard !isUsingTool else { return }
+#if DEBUG
+        synchronizedDrawingInstallCount += 1
+#endif
         guard preservingHistory else {
             installInitialDrawing(drawing)
             return
@@ -376,7 +402,13 @@ final class CanvasController: NSObject, ObservableObject {
         return Set(firstIndex..<(firstIndex + strokes.count))
     }
 
-    private func installCanvasDrawing(_ drawing: PKDrawing) {
+    private func installCanvasDrawing(
+        _ drawing: PKDrawing,
+        preservingShapeAuthority: Bool = false
+    ) {
+        if !preservingShapeAuthority {
+            authoritativeSnappedDrawing = nil
+        }
         isInstallingDrawing = true
         canvasView.drawing = drawing
         lastObservedDrawing = drawing
@@ -441,13 +473,13 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     private func refreshHistoryState() {
-        canUndo = !undoDrawings.isEmpty
-        canRedo = !redoDrawings.isEmpty
-    }
-
-    private func refreshHistoryStateSoon() {
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshHistoryState()
+        let nextCanUndo = !undoDrawings.isEmpty
+        let nextCanRedo = !redoDrawings.isEmpty
+        if canUndo != nextCanUndo {
+            canUndo = nextCanUndo
+        }
+        if canRedo != nextCanRedo {
+            canRedo = nextCanRedo
         }
     }
 
@@ -457,6 +489,14 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     private func beginToolInteraction() {
+        toolInteractionEndWorkItem?.cancel()
+        toolInteractionEndWorkItem = nil
+        guard !isUsingTool else { return }
+
+        // A snapped drawing remains authoritative after lift only to reject a late cancellation
+        // callback from the gesture that produced it. A genuinely new Pencil contact starts a new
+        // transaction and can safely release that guard.
+        authoritativeSnappedDrawing = nil
         if toolInteractionOriginDrawing == nil {
             toolInteractionOriginDrawing = pendingUntrackedOriginDrawing ?? lastObservedDrawing
         }
@@ -467,24 +507,68 @@ final class CanvasController: NSObject, ObservableObject {
         onBecameActive?()
     }
 
-    private func finishToolInteraction() {
-        guard !isCommittingShapeSnap else { return }
+    private func requestToolInteractionFinish() {
+        // A delayed delegate end from the previous Pencil contact can arrive after the next one
+        // has already begun on hardware. Never let that stale end release the new transaction.
+        guard !hasActiveDrawingContact,
+              pendingShapeSnap == nil,
+              !isCommittingShapeSnap,
+              !committedShapeSnapAwaitingTouchEnd else { return }
+
+        // PencilKit's final drawing callback and its recognizer/delegate end callbacks are not
+        // ordered consistently on hardware. Keeping the interaction active until the next main
+        // turn makes the final canvas value authoritative before autosave or a deferred sync reload
+        // is allowed to run.
+        toolInteractionEndWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finishToolInteractionNow()
+        }
+        toolInteractionEndWorkItem = workItem
+        DispatchQueue.main.async(execute: workItem)
+    }
+
+    private func finishToolInteractionNow() {
+        toolInteractionEndWorkItem = nil
+        guard isUsingTool,
+              !hasActiveDrawingContact,
+              pendingShapeSnap == nil,
+              !isCommittingShapeSnap,
+              !committedShapeSnapAwaitingTouchEnd else { return }
+
         // PencilKit can report an eraser drawing change before it reports the
         // corresponding tool lifecycle callback. In that ordering the fallback
         // observer already captured the pre-erase drawing, but the end callback
         // used to cancel it without recording an undo entry.
         let originDrawing = toolInteractionOriginDrawing ?? pendingUntrackedOriginDrawing
+        let finalDrawing = canvasView.drawing
+        let didChangeDrawing = originDrawing.map { $0 != finalDrawing } ?? false
         if let origin = originDrawing,
-           origin != canvasView.drawing {
+           didChangeDrawing {
             recordUndoDrawing(origin)
         }
-        lastObservedDrawing = canvasView.drawing
+        lastObservedDrawing = finalDrawing
         pendingUntrackedOriginDrawing = nil
         pendingUntrackedHistoryWorkItem?.cancel()
         pendingUntrackedHistoryWorkItem = nil
         toolInteractionOriginDrawing = nil
+
+        // Persist one complete stroke, never PencilKit's transient samples. Besides reducing work,
+        // this prevents a 650 ms materialized snapshot from being reinstalled while the same Pencil
+        // contact is still producing that stroke.
+        if didChangeDrawing {
+            onDrawingChanged?(finalDrawing)
+        }
         isUsingTool = false
         refreshHistoryState()
+    }
+
+    private var hasActiveDrawingContact: Bool {
+        let drawingState = canvasView.drawingGestureRecognizer.state
+        if drawingState == .began || drawingState == .changed {
+            return true
+        }
+        guard let shapeState = shapeTrackingGestureRecognizer?.state else { return false }
+        return shapeState == .began || shapeState == .changed
     }
 
     @objc private func handleDrawingGesture(_ gesture: UIGestureRecognizer) {
@@ -492,7 +576,7 @@ final class CanvasController: NSObject, ObservableObject {
         case .began:
             beginToolInteraction()
         case .ended, .cancelled, .failed:
-            finishToolInteraction()
+            requestToolInteractionFinish()
         default:
             break
         }
@@ -501,14 +585,22 @@ final class CanvasController: NSObject, ObservableObject {
     @objc private func handleShapeTrackingGesture(_ gesture: UILongPressGestureRecognizer) {
         switch gesture.state {
         case .began:
+            shapeTouchHasEnded = false
+            beginToolInteraction()
             beginShapeTracking(at: gesture.location(in: canvasView))
         case .changed:
             continueShapeTracking(at: gesture.location(in: canvasView))
         case .ended, .cancelled, .failed:
+            shapeTouchHasEnded = true
             cancelShapeTracking()
             canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable
                 && selectedToolKind != .lasso
                 && selectedToolKind != .text
+            if committedShapeSnapAwaitingTouchEnd {
+                finishCommittedShapeSnapInteraction()
+            } else if pendingShapeSnap == nil {
+                requestToolInteractionFinish()
+            }
         default:
             break
         }
@@ -559,39 +651,76 @@ final class CanvasController: NSObject, ObservableObject {
     private func commitSnappedShape(_ candidate: ShapeSnapCandidate) {
         guard let originDrawing = shapeGestureOriginDrawing,
               let inkStyle = shapeSnapInkStyle,
-              let stroke = regularStroke(for: candidate, inkStyle: inkStyle)
+              let stroke = regularStroke(for: candidate, inkStyle: inkStyle),
+              pendingShapeSnap == nil,
+              !committedShapeSnapAwaitingTouchEnd
         else { return }
 
         shapeHoldWorkItem?.cancel()
         shapeHoldWorkItem = nil
+        toolInteractionEndWorkItem?.cancel()
+        toolInteractionEndWorkItem = nil
         isCommittingShapeSnap = true
 
-        // Cancelling PencilKit's active recognizer removes the rough in-progress stroke while
-        // the Pencil is still touching the screen. Installing the regular stroke immediately is
-        // what creates the Goodnotes-style visible snap before lift-off.
-        isInstallingDrawing = true
-        canvasView.drawingGestureRecognizer.isEnabled = false
         let snappedDrawing = PKDrawing(strokes: originDrawing.strokes + [stroke])
-        canvasView.drawing = snappedDrawing
-        lastObservedDrawing = snappedDrawing
-        isInstallingDrawing = false
+        pendingShapeSnap = PendingShapeSnap(
+            originDrawing: originDrawing,
+            drawing: snappedDrawing,
+            kind: candidate.kind
+        )
 
-        recordUndoDrawing(originDrawing)
+        // Cancelling PencilKit removes the rough in-progress stroke while the Pencil is still
+        // touching the screen. Hardware may deliver the resulting cancellation callbacks after
+        // this setter returns, so install the straightened stroke on the next main turn instead of
+        // racing those callbacks in the same stack frame.
+        canvasView.drawingGestureRecognizer.isEnabled = false
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finalizePendingShapeSnap()
+        }
+        shapeSnapCommitWorkItem = workItem
+        DispatchQueue.main.async(execute: workItem)
+    }
+
+    private func finalizePendingShapeSnap() {
+        shapeSnapCommitWorkItem = nil
+        guard let pendingShapeSnap else {
+            isCommittingShapeSnap = false
+            return
+        }
+
+        installCanvasDrawing(pendingShapeSnap.drawing)
+        authoritativeSnappedDrawing = pendingShapeSnap.drawing
+        if pendingShapeSnap.originDrawing != pendingShapeSnap.drawing {
+            recordUndoDrawing(pendingShapeSnap.originDrawing)
+        }
         toolInteractionOriginDrawing = nil
         pendingUntrackedOriginDrawing = nil
         pendingUntrackedHistoryWorkItem?.cancel()
         pendingUntrackedHistoryWorkItem = nil
-        isUsingTool = false
-        lastSnappedShapeKind = candidate.kind
-        onDrawingChanged?(snappedDrawing)
+        lastSnappedShapeKind = pendingShapeSnap.kind
+        committedShapeSnapAwaitingTouchEnd = true
+        self.pendingShapeSnap = nil
+        isCommittingShapeSnap = false
         refreshHistoryState()
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
         shapeGestureOriginDrawing = nil
         shapeGesturePoints.removeAll(keepingCapacity: true)
         shapeSnapInkStyle = nil
-        isCommittingShapeSnap = false
 
+        if shapeTouchHasEnded {
+            finishCommittedShapeSnapInteraction()
+        }
+    }
+
+    private func finishCommittedShapeSnapInteraction() {
+        guard committedShapeSnapAwaitingTouchEnd,
+              let snappedDrawing = authoritativeSnappedDrawing else { return }
+        committedShapeSnapAwaitingTouchEnd = false
+        lastObservedDrawing = snappedDrawing
+        onDrawingChanged?(snappedDrawing)
+        isUsingTool = false
+        refreshHistoryState()
     }
 
     private func recognizedShape(from rawPoints: [CGPoint]) -> ShapeSnapCandidate? {
@@ -933,9 +1062,12 @@ final class CanvasController: NSObject, ObservableObject {
                   let origin = self.pendingUntrackedOriginDrawing else { return }
             self.pendingUntrackedOriginDrawing = nil
             self.pendingUntrackedHistoryWorkItem = nil
-            if origin != self.canvasView.drawing {
+            let finalDrawing = self.canvasView.drawing
+            if origin != finalDrawing {
                 self.recordUndoDrawing(origin)
+                self.onDrawingChanged?(finalDrawing)
             }
+            self.lastObservedDrawing = finalDrawing
             self.refreshHistoryState()
         }
         pendingUntrackedHistoryWorkItem = workItem
@@ -953,6 +1085,12 @@ private struct ShapeSnapInkStyle {
 private struct ShapeSnapCandidate {
     let kind: PageShapeKind
     let pathPoints: [CGPoint]
+}
+
+private struct PendingShapeSnap {
+    let originDrawing: PKDrawing
+    let drawing: PKDrawing
+    let kind: PageShapeKind
 }
 
 private struct StrokeTransformSession {
@@ -978,14 +1116,29 @@ extension CanvasController: UIGestureRecognizerDelegate {
 extension CanvasController: PKCanvasViewDelegate {
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         guard !isInstallingDrawing else { return }
+
+        // Disabling PencilKit's recognizer to replace a held rough stroke can produce one last
+        // stale drawing callback on real Pencil hardware. Until the next genuine interaction or a
+        // synchronized install, the snapped drawing is the transaction's authoritative value.
+        if let authoritativeSnappedDrawing {
+            if canvasView.drawing != authoritativeSnappedDrawing {
+                installCanvasDrawing(
+                    authoritativeSnappedDrawing,
+                    preservingShapeAuthority: true
+                )
+            }
+            return
+        }
+        guard pendingShapeSnap == nil, !isCommittingShapeSnap else { return }
+
         let previousDrawing = lastObservedDrawing
         lastObservedDrawing = canvasView.drawing
-        observeUntrackedDrawingChange(
-            from: previousDrawing,
-            to: canvasView.drawing
-        )
-        onDrawingChanged?(canvasView.drawing)
-        refreshHistoryStateSoon()
+        if !isUsingTool {
+            observeUntrackedDrawingChange(
+                from: previousDrawing,
+                to: canvasView.drawing
+            )
+        }
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
@@ -993,6 +1146,6 @@ extension CanvasController: PKCanvasViewDelegate {
     }
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-        finishToolInteraction()
+        requestToolInteractionFinish()
     }
 }

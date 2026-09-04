@@ -318,8 +318,10 @@ actor CloudLibrarySyncCoordinator {
         try await performSyncPass()
     }
 
-    /// Debounces rapid PencilKit/library changes into one synchronization pass.
-    func scheduleSync(after delay: TimeInterval = 0.8) async {
+    /// Debounces rapid PencilKit/library changes into one synchronization pass. Cloud export can
+    /// enumerate a large collaboration journal, so automatic work waits for a sustained quiet
+    /// window; explicit “立即同步” and lifecycle syncs still start immediately.
+    func scheduleSync(after delay: TimeInterval = 5.0) async {
         scheduledTask?.cancel()
         await reportStatus(.scheduled)
         let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)

@@ -1111,6 +1111,7 @@ private struct LibraryContentPage: View {
                 .padding(.vertical, 12)
             }
         }
+        .contentMargins(.horizontal, 0, for: .scrollContent)
         .scrollIndicators(.hidden)
     }
 
@@ -1349,6 +1350,7 @@ private struct LibrarySidebar: View {
             .padding(.horizontal, 12)
             .padding(.top, 2)
         }
+        .contentMargins(.horizontal, 0, for: .scrollContent)
         .scrollIndicators(.hidden)
         .foregroundStyle(TiyiNoteTheme.textPrimary)
     }
@@ -1401,7 +1403,7 @@ private struct LibraryFolderListRow: View {
             }
         }
         .padding(.leading, 0)
-        .padding(.trailing, 10)
+        .padding(.trailing, 0)
         .padding(.vertical, 10)
         .background(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
         .overlay(alignment: .bottom) {
@@ -1483,7 +1485,7 @@ private struct LibraryDocumentListRow: View {
             }
         }
         .padding(.leading, 0)
-        .padding(.trailing, 10)
+        .padding(.trailing, 0)
         .padding(.vertical, 10)
         .background(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
         .overlay(alignment: .bottom) {
@@ -1765,25 +1767,18 @@ private struct DocumentArtwork: View {
     let thumbnail: UIImage?
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(TiyiNoteTheme.surfaceRaised)
+        Group {
             if let thumbnail {
                 Image(uiImage: thumbnail)
                     .resizable()
                     .scaledToFit()
-                    .padding(5)
             } else {
                 Image(systemName: document.kind == .canvas ? "rectangle.and.pencil.and.ellipsis" : "doc.richtext.fill")
                     .font(.system(size: 30))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(TiyiNoteTheme.strongHairline, lineWidth: 1)
-        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -1795,6 +1790,7 @@ private struct SelectionIndicator: View {
             .font(.system(size: 24, weight: .semibold))
             .foregroundStyle(isSelected ? TiyiNoteTheme.selectionBlue : TiyiNoteTheme.textSecondary)
             .background(Circle().fill(TiyiNoteTheme.workspace.opacity(0.75)))
+            .frame(width: 32, height: 32)
     }
 }
 

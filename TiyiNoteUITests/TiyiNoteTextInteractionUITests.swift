@@ -574,7 +574,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         app.buttons["tool-pen"].tap()
         XCTAssertTrue(selectionBox.waitForNonExistence(timeout: 3))
         let persistedGeometry = drawingGeometryValue(of: canvas)
-        RunLoop.current.run(until: Date().addingTimeInterval(2))
+        RunLoop.current.run(until: Date().addingTimeInterval(3))
         app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
         app.terminate()
         app.launch()
@@ -771,8 +771,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         eraseStart.press(forDuration: 0.08, thenDragTo: eraseEnd)
         waitForValue("笔迹 0", of: canvas)
 
-        // The regression happened only after the 650 ms materialized-asset save reloaded the
-        // collaboration log. Waiting well beyond it proves this is not merely a visual erase.
+        // The regression happened only after the materialized-asset save reloaded the
+        // collaboration log. Waiting beyond the idle window proves this is not merely a visual erase.
         RunLoop.current.run(until: Date().addingTimeInterval(5))
         XCTAssertTrue(
             (canvas.value as? String)?.hasPrefix("笔迹 0") == true,
@@ -797,6 +797,142 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         waitForValue("笔迹 0", of: relaunchedCanvas, timeout: 5)
     }
 
+    func testContinuousStrokeSurvivesPauseAutosaveAndRelaunch() throws {
+        let app = launchIsolatedApp(prefix: "continuous-stroke-persistence")
+        let canvas = app.descendants(matching: .any)
+            .matching(identifier: "page-canvas-0")
+            .firstMatch
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+
+        let normalizedPoints = [
+            CGPoint(x: 0.18, y: 0.24),
+            CGPoint(x: 0.28, y: 0.34),
+            CGPoint(x: 0.39, y: 0.25),
+            CGPoint(x: 0.49, y: 0.38),
+            CGPoint(x: 0.60, y: 0.27),
+            CGPoint(x: 0.72, y: 0.41)
+        ]
+        let points = normalizedPoints.map { point in
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * point.x,
+                y: canvas.frame.minY + canvas.frame.height * point.y
+            )
+        }
+        try synthesizeTouchPath(
+            points,
+            on: canvas,
+            in: app,
+            holdBeforeLift: 0.12,
+            pauseAfterPointIndex: 3,
+            pauseDuration: 1.05
+        )
+        waitForValue("笔迹 1", of: canvas, timeout: 5)
+        guard let committedGeometry = drawingGeometryValue(of: canvas) else {
+            return XCTFail("连续笔迹没有发布最终几何范围")
+        }
+
+        // The old implementation emitted every transient PencilKit sample. Crossing the complete
+        // idle-save window could therefore reload a partial snapshot into the live touch.
+        RunLoop.current.run(until: Date().addingTimeInterval(3.0))
+        XCTAssertTrue(
+            (canvas.value as? String)?.hasPrefix("笔迹 1") == true,
+            "连续书写在自动保存刷新后消失：\(String(describing: canvas.value))"
+        )
+        XCTAssertTrue(
+            (canvas.value as? String)?.contains("同步重载 0") == true,
+            "本地自动保存不应重新安装正在显示的 PencilKit 绘图：\(String(describing: canvas.value))"
+        )
+        XCTAssertEqual(drawingGeometryValue(of: canvas), committedGeometry)
+
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.terminate()
+        app.launch()
+        let relaunchedCanvas = app.descendants(matching: .any)
+            .matching(identifier: "page-canvas-0")
+            .firstMatch
+        XCTAssertTrue(relaunchedCanvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 1", of: relaunchedCanvas, timeout: 5)
+        XCTAssertEqual(drawingGeometryValue(of: relaunchedCanvas), committedGeometry)
+    }
+
+    func testPreviousStrokeAutosaveCannotReplaceNextActiveStroke() throws {
+        let app = launchIsolatedApp(prefix: "overlapping-stroke-autosave")
+        let canvas = app.descendants(matching: .any)
+            .matching(identifier: "page-canvas-0")
+            .firstMatch
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+
+        let firstStroke = [
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * 0.18,
+                y: canvas.frame.minY + canvas.frame.height * 0.20
+            ),
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * 0.32,
+                y: canvas.frame.minY + canvas.frame.height * 0.30
+            )
+        ]
+        try synthesizeTouchPath(
+            firstStroke,
+            on: canvas,
+            in: app,
+            holdBeforeLift: 0.08
+        )
+        waitForValue("笔迹 1", of: canvas, timeout: 5)
+
+        let secondStroke = [
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * 0.42,
+                y: canvas.frame.minY + canvas.frame.height * 0.22
+            ),
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * 0.52,
+                y: canvas.frame.minY + canvas.frame.height * 0.34
+            ),
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * 0.62,
+                y: canvas.frame.minY + canvas.frame.height * 0.25
+            ),
+            CGPoint(
+                x: canvas.frame.minX + canvas.frame.width * 0.74,
+                y: canvas.frame.minY + canvas.frame.height * 0.38
+            )
+        ]
+        try synthesizeTouchPath(
+            secondStroke,
+            on: canvas,
+            in: app,
+            holdBeforeLift: 0.10,
+            pauseAfterPointIndex: 2,
+            pauseDuration: 1.05
+        )
+        waitForValue("笔迹 2", of: canvas, timeout: 5)
+        guard let committedGeometry = drawingGeometryValue(of: canvas) else {
+            return XCTFail("跨自动保存的第二笔没有发布最终几何范围")
+        }
+
+        RunLoop.current.run(until: Date().addingTimeInterval(3.0))
+        XCTAssertTrue(
+            (canvas.value as? String)?.hasPrefix("笔迹 2") == true,
+            "上一笔自动保存覆盖了仍在书写的下一笔：\(String(describing: canvas.value))"
+        )
+        XCTAssertTrue(
+            (canvas.value as? String)?.contains("同步重载 0") == true,
+            "相邻笔画完成后不应由本地资产回声重装画布：\(String(describing: canvas.value))"
+        )
+        XCTAssertEqual(drawingGeometryValue(of: canvas), committedGeometry)
+
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.terminate()
+        app.launch()
+        let relaunchedCanvas = app.descendants(matching: .any)
+            .matching(identifier: "page-canvas-0")
+            .firstMatch
+        XCTAssertTrue(relaunchedCanvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 2", of: relaunchedCanvas, timeout: 5)
+        XCTAssertEqual(drawingGeometryValue(of: relaunchedCanvas), committedGeometry)
+    }
+
     func testHoldingRoughShapesSnapsBeforeLiftAndSupportsUndoPersistence() throws {
         let app = launchIsolatedApp(prefix: "shape-hold-snap")
         let canvas = app.descendants(matching: .any)
@@ -818,6 +954,17 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
         waitForValueContaining("吸附 直线", of: canvas, timeout: 5)
         waitForValue("笔迹 1", of: canvas, timeout: 5)
+        let snappedLineGeometry = drawingGeometryValue(of: canvas)
+        RunLoop.current.run(until: Date().addingTimeInterval(3.0))
+        XCTAssertTrue(
+            (canvas.value as? String)?.hasPrefix("笔迹 1") == true,
+            "吸附直线在 PencilKit 结束回调或自动保存后消失"
+        )
+        XCTAssertTrue(
+            (canvas.value as? String)?.contains("同步重载 0") == true,
+            "吸附直线保存后不应由本地资产回声重装画布"
+        )
+        XCTAssertEqual(drawingGeometryValue(of: canvas), snappedLineGeometry)
 
         let rectangleFrame = CGRect(
             x: canvas.frame.minX + canvas.frame.width * 0.30,
@@ -2784,7 +2931,9 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         _ points: [CGPoint],
         on targetElement: XCUIElement,
         in application: XCUIApplication,
-        holdBeforeLift: TimeInterval
+        holdBeforeLift: TimeInterval,
+        pauseAfterPointIndex: Int? = nil,
+        pauseDuration: TimeInterval = 0
     ) throws {
         guard points.count >= 2 else {
             XCTFail("A synthesized touch path needs at least two points")
@@ -2857,19 +3006,26 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             allocatedPath.method(for: initPathSelector),
             to: InitTouch.self
         )(allocatedPath, initPathSelector, points[0], 0)
+        var lastMoveOffset = 0.10
         for (index, point) in points.dropFirst().enumerated() {
+            let pointIndex = index + 1
             unsafeBitCast(path.method(for: moveSelector), to: MoveTouch.self)(
                 path,
                 moveSelector,
                 point,
-                0.10 + Double(index) * 0.06
+                lastMoveOffset
             )
+            if pauseAfterPointIndex == pointIndex {
+                lastMoveOffset += max(pauseDuration, 0)
+            }
+            if pointIndex < points.count - 1 {
+                lastMoveOffset += 0.06
+            }
         }
-        let finalMoveOffset = 0.10 + Double(max(points.count - 2, 0)) * 0.06
         unsafeBitCast(path.method(for: liftSelector), to: TouchOffset.self)(
             path,
             liftSelector,
-            finalMoveOffset + holdBeforeLift
+            lastMoveOffset + holdBeforeLift
         )
 
         let interfaceOrientation: Int64
