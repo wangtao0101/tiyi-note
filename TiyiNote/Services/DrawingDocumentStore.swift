@@ -135,6 +135,50 @@ private struct PendingAssetSave {
     let reference: LibraryAssetReference
 }
 
+struct PreparedDrawingStrokePersistence: Sendable {
+    let data: Data
+    let exactFingerprint: String
+    let stableFingerprint: String
+}
+
+/// Immutable PencilKit serialization prepared away from MainActor after handwriting has been idle.
+/// The append-only path intentionally encodes only new strokes; erase/lasso edits prepare complete
+/// identities because those operations need a real diff.
+struct PreparedDrawingPersistence: Sendable {
+    /// A full-page snapshot is intentionally absent for ordinary appended ink. The immutable
+    /// collaboration journal is enough to recover those strokes, while the compact snapshot is
+    /// refreshed when the page closes or the scene leaves the foreground. This keeps PencilKit's
+    /// non-cancellable whole-page encoder out of a live writing session.
+    let drawingData: Data?
+    let appendedStrokeData: [Data]?
+    let drawingStrokes: [PreparedDrawingStrokePersistence]?
+    let baseStrokes: [PreparedDrawingStrokePersistence]?
+}
+
+private enum PreparedDrawingCollaborationMutation: Sendable {
+    case upsert(id: String, data: Data, zIndex: Int)
+    case delete(strokeID: String)
+}
+
+private enum PreparedDrawingCollaborationPath: Sendable {
+    case appendOnly
+    case fullDiff
+}
+
+/// CPU-only result of comparing a PencilKit snapshot with its collaboration history. The costly
+/// materialization, stroke matching, and fingerprint work is performed on a background task;
+/// MainActor only assigns causal stamps and installs this immutable result.
+private struct PreparedDrawingCollaborationPlan: Sendable {
+    let page: LibraryPage
+    let baseOperations: [CollaborationOperation]
+    let preexistingOperationCount: Int
+    let mutations: [PreparedDrawingCollaborationMutation]
+    let initialContext: CollaborationVersionVector
+    let observedFrontier: CollaborationVersionVector
+    let maximumLamport: UInt64
+    let path: PreparedDrawingCollaborationPath
+}
+
 private struct CollaborationOperationsFileSignature: Equatable {
     let byteCount: UInt64
     let modifiedAt: Date?
@@ -236,9 +280,16 @@ final class DrawingDocumentStore: ObservableObject {
     private var collaborationOperationsCache: [String: CollaborationOperationsCacheEntry] = [:]
     private var pendingCollaborationOperationsSaves: [String: PendingCollaborationOperationsSave] = [:]
     private var pendingCollaborationOperationsTasks: [String: Task<Void, Never>] = [:]
+    /// Invalidates an off-main drawing diff if CloudKit or another editor changes that page while
+    /// the diff is being prepared. The worker simply retries from the latest immutable snapshot.
+    private var collaborationOperationsRevisions: [String: UInt64] = [:]
+    private var collaborationOperationsRevisionSeed: UInt64 = 0
     private var collaborationClock: CollaborationReplicaClock
     private var readOnlySharedDocumentIDs: Set<String> = []
     private var activeDrawingInteractionIDs: Set<UUID> = []
+    /// A page sets this as soon as PencilKit reports a real mutation and clears it only after the
+    /// immutable result has been handed to the durable writers. CloudKit must not race that handoff.
+    private var pendingEditorDrawingPersistenceIDs: Set<UUID> = []
     private(set) var lastDrawingInteractionAt: Date?
 #if DEBUG
     private(set) var debugAppendOnlyDrawingSaveCount = 0
@@ -378,6 +429,20 @@ final class DrawingDocumentStore: ObservableObject {
     private static let replicaActorKeychainService = "com.tiyi.note.collaboration-replica"
     private static let replicaActorKeychainAccount = "actor-id"
     private static let lastCloudSyncAtKey = "cloudSync.lastSucceededAt"
+    private static var drawingPersistenceQuietWindow: TimeInterval {
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if let argumentIndex = arguments.firstIndex(of: "--drawing-persistence-idle-delay"),
+           arguments.indices.contains(argumentIndex + 1),
+           let override = TimeInterval(arguments[argumentIndex + 1]) {
+            return max(0.1, override)
+        }
+#endif
+        // JSON journal encoding and atomic replacement remain outside an active handwriting burst.
+        // The page-level scheduler uses the same window, and every new Pencil contact cancels any
+        // staged writer before it may replace the live file.
+        return 10.0
+    }
 
     private static func replicaActorIDFromKeychain() -> String? {
         let query: [String: Any] = [
@@ -423,18 +488,41 @@ final class DrawingDocumentStore: ObservableObject {
         !activeDrawingInteractionIDs.isEmpty
     }
 
+    /// Automatic CloudKit export is eligible only after every editor snapshot, collaboration
+    /// journal, and asset write from the current local checkpoint has completed.
+    var hasPendingLocalDrawingPersistence: Bool {
+        !pendingEditorDrawingPersistenceIDs.isEmpty
+            || !pendingAssetSaves.isEmpty
+            || !pendingCollaborationOperationsSaves.isEmpty
+    }
+
+    func setEditorDrawingPersistencePending(_ isPending: Bool, id: UUID) {
+        if isPending {
+            pendingEditorDrawingPersistenceIDs.insert(id)
+        } else {
+            pendingEditorDrawingPersistenceIDs.remove(id)
+        }
+    }
+
     func setDrawingInteractionActive(_ isActive: Bool, id: UUID) {
         let wasActive = isDrawingInteractionActive
+        let membershipChanged: Bool
         if isActive {
-            activeDrawingInteractionIDs.insert(id)
+            membershipChanged = activeDrawingInteractionIDs.insert(id).inserted
         } else {
-            activeDrawingInteractionIDs.remove(id)
+            membershipChanged = activeDrawingInteractionIDs.remove(id) != nil
         }
+        guard membershipChanged else { return }
         lastDrawingInteractionAt = Date()
         if isDrawingInteractionActive {
+            // A delayed disk commit must never steal the main thread from a new Pencil contact.
+            // Keep its immutable payload and restart the timer after the next sustained quiet span.
+            pendingSaves.values.forEach { $0.cancel() }
+            pendingSaves.removeAll()
             pendingCollaborationOperationsTasks.values.forEach { $0.cancel() }
             pendingCollaborationOperationsTasks.removeAll()
         } else if wasActive {
+            schedulePendingAssetSaves()
             schedulePendingCollaborationOperationsSaves()
         }
         guard wasActive != isDrawingInteractionActive else { return }
@@ -448,6 +536,12 @@ final class DrawingDocumentStore: ObservableObject {
         guard !isDrawingInteractionActive,
               let lastDrawingInteractionAt else { return isDrawingInteractionActive }
         return Date().timeIntervalSince(lastDrawingInteractionAt) < interval
+    }
+
+    func drawingInteractionQuietTimeRemaining(within interval: TimeInterval) -> TimeInterval {
+        if isDrawingInteractionActive { return max(0, interval) }
+        guard let lastDrawingInteractionAt else { return 0 }
+        return max(0, interval - Date().timeIntervalSince(lastDrawingInteractionAt))
     }
 
     func document(withID documentID: String) -> PDFWorkspaceDocument? {
@@ -1977,19 +2071,19 @@ final class DrawingDocumentStore: ObservableObject {
         let documentPages = pages(in: documentID)
         guard !documentPages.isEmpty else { throw PDFWorkspaceError.invalidPDF(document.title) }
 
-        let firstSize = pageSize(at: 0, in: documentID)
+        let firstSize = exportBounds(forPage: 0, in: documentID).size
         let renderer = UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: firstSize))
         let data = renderer.pdfData { rendererContext in
             for pageIndex in documentPages.indices {
-                let size = pageSize(at: pageIndex, in: documentID)
+                let bounds = exportBounds(forPage: pageIndex, in: documentID)
                 rendererContext.beginPage(
-                    withBounds: CGRect(origin: .zero, size: size),
+                    withBounds: CGRect(origin: .zero, size: bounds.size),
                     pageInfo: [:]
                 )
                 renderFlattenedPage(
                     documentID: documentID,
                     pageIndex: pageIndex,
-                    size: size,
+                    bounds: bounds,
                     context: rendererContext.cgContext
                 )
             }
@@ -2010,16 +2104,16 @@ final class DrawingDocumentStore: ObservableObject {
         guard !documentPages.isEmpty else { throw PDFWorkspaceError.invalidPDF(document.title) }
 
         return try documentPages.indices.map { pageIndex in
-            let size = pageSize(at: pageIndex, in: documentID)
+            let bounds = exportBounds(forPage: pageIndex, in: documentID)
             let format = UIGraphicsImageRendererFormat()
-            format.scale = 2
+            format.scale = document.kind == .canvas ? min(2, 4096 / max(bounds.width, bounds.height)) : 2
             format.opaque = true
-            let renderer = UIGraphicsImageRenderer(size: size, format: format)
+            let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
             let image = renderer.image { rendererContext in
                 renderFlattenedPage(
                     documentID: documentID,
                     pageIndex: pageIndex,
-                    size: size,
+                    bounds: bounds,
                     context: rendererContext.cgContext
                 )
             }
@@ -2721,6 +2815,21 @@ final class DrawingDocumentStore: ObservableObject {
         signalLocalCloudChange()
     }
 
+    func canvasViewport(forPageID pageID: String, in documentID: String, referenceSize: CGSize) -> CanvasViewport {
+        let fallback = CanvasViewport(referenceSize: referenceSize)
+        guard let data = userDefaults.data(forKey: "canvas.viewport.v1.\(documentID).\(pageID)"),
+              var viewport = try? JSONDecoder().decode(CanvasViewport.self, from: data),
+              viewport.center.x.isFinite, viewport.center.y.isFinite,
+              viewport.zoomScale.isFinite else { return fallback }
+        viewport.zoomScale = min(max(viewport.zoomScale, 0.5), 3)
+        return viewport
+    }
+
+    func saveCanvasViewport(_ viewport: CanvasViewport, forPageID pageID: String, in documentID: String) {
+        guard let data = try? JSONEncoder().encode(viewport) else { return }
+        userDefaults.set(data, forKey: "canvas.viewport.v1.\(documentID).\(pageID)")
+    }
+
     func pageSize(at index: Int, in documentID: String) -> CGSize {
         guard let page = page(at: index, in: documentID) else {
             return CGSize(width: 595, height: 842)
@@ -2742,7 +2851,26 @@ final class DrawingDocumentStore: ObservableObject {
             return cachedImage
         }
         guard let page = page(at: index, in: documentID) else { return nil }
-        let image = page.thumbnail(of: size, for: .mediaBox)
+        let image: UIImage
+        if document(withID: documentID)?.kind == .canvas {
+            let bounds = exportBounds(forPage: index, in: documentID)
+            let scale = min(size.width / bounds.width, size.height / bounds.height)
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 2
+            format.opaque = true
+            image = UIGraphicsImageRenderer(
+                size: CGSize(width: bounds.width * scale, height: bounds.height * scale),
+                format: format
+            ).image { rendererContext in
+                rendererContext.cgContext.scaleBy(x: scale, y: scale)
+                renderFlattenedPage(
+                    documentID: documentID, pageIndex: index,
+                    bounds: bounds, context: rendererContext.cgContext
+                )
+            }
+        } else {
+            image = page.thumbnail(of: size, for: .mediaBox)
+        }
         thumbnailCache[cacheKey] = image
         return image
     }
@@ -2779,8 +2907,8 @@ final class DrawingDocumentStore: ObservableObject {
         }
         guard hasDrawingHistory else { return storedDrawing }
 
-        // Collaboration events are written synchronously before the debounced drawing asset.
-        // Replaying them makes a force-quit safe even if the process dies inside that debounce.
+        // Once a deep-idle save has committed its collaboration events, replaying them keeps the
+        // page recoverable even if the process exits before the materialized drawing asset lands.
         return (try? PKDrawing(data: collaborationDrawingData(from: operations)))
             ?? storedDrawing
     }
@@ -2828,12 +2956,174 @@ final class DrawingDocumentStore: ObservableObject {
         return legacy.compactMap(\.annotation).compactMap(\.pageElement)
     }
 
+    nonisolated static func prepareDrawingPersistence(
+        drawing: PKDrawing,
+        baseDrawing: PKDrawing,
+        assumesOnlyAppendedStrokes: Bool
+    ) -> PreparedDrawingPersistence? {
+        guard !Task.isCancelled else { return nil }
+        if assumesOnlyAppendedStrokes,
+           drawing.strokes.count >= baseDrawing.strokes.count {
+            // The hot autosave path serializes only the newly appended strokes. Calling
+            // `drawing.dataRepresentation()` here used to encode every old stroke again and that
+            // monolithic call cannot be cancelled when the Pencil returns to the screen.
+            var appendedStrokeData: [Data] = []
+            appendedStrokeData.reserveCapacity(drawing.strokes.count - baseDrawing.strokes.count)
+            for stroke in drawing.strokes.dropFirst(baseDrawing.strokes.count) {
+                guard !Task.isCancelled else { return nil }
+                appendedStrokeData.append(PKDrawing(strokes: [stroke]).dataRepresentation())
+            }
+            return PreparedDrawingPersistence(
+                drawingData: nil,
+                appendedStrokeData: appendedStrokeData,
+                drawingStrokes: nil,
+                baseStrokes: nil
+            )
+        }
+
+        let drawingData = drawing.dataRepresentation()
+        guard !Task.isCancelled else { return nil }
+        func prepareStroke(_ stroke: PKStroke) -> PreparedDrawingStrokePersistence {
+            let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+            return PreparedDrawingStrokePersistence(
+                data: data,
+                exactFingerprint: Self.collaborationStrokeFingerprint(data),
+                stableFingerprint: Self.collaborationStableStrokeFingerprint(data)
+            )
+        }
+        var drawingStrokes: [PreparedDrawingStrokePersistence] = []
+        drawingStrokes.reserveCapacity(drawing.strokes.count)
+        for stroke in drawing.strokes {
+            guard !Task.isCancelled else { return nil }
+            drawingStrokes.append(prepareStroke(stroke))
+        }
+        var baseStrokes: [PreparedDrawingStrokePersistence] = []
+        baseStrokes.reserveCapacity(baseDrawing.strokes.count)
+        for stroke in baseDrawing.strokes {
+            guard !Task.isCancelled else { return nil }
+            baseStrokes.append(prepareStroke(stroke))
+        }
+        return PreparedDrawingPersistence(
+            drawingData: drawingData,
+            appendedStrokeData: nil,
+            drawingStrokes: drawingStrokes,
+            baseStrokes: baseStrokes
+        )
+    }
+
+    /// Performs the expensive collaboration diff off MainActor. If a remote operation lands while
+    /// the worker is running, the immutable snapshot is discarded and rebuilt. Pencil-down cancels
+    /// the caller before any result is installed, so resuming handwriting never waits for this work.
+    func schedulePreparedDrawingSaveAfterIdle(
+        _ drawing: PKDrawing,
+        replacing baseDrawing: PKDrawing,
+        causalContext: CollaborationVersionVector,
+        assumesOnlyAppendedStrokes: Bool,
+        preparedPersistence: PreparedDrawingPersistence,
+        forPage pageIndex: Int,
+        in documentID: String
+    ) async -> CollaborationVersionVector? {
+        guard !readOnlySharedDocumentIDs.contains(documentID) else {
+            saveState = .failed(LibraryStoreError.readOnlySharedDocument.errorDescription ?? "只读")
+            return causalContext
+        }
+
+        while !Task.isCancelled, !isDrawingInteractionActive {
+            let quietTimeRemaining = drawingPersistenceQuietTimeRemaining()
+            if quietTimeRemaining > 0 {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(quietTimeRemaining * 1_000_000_000)
+                    )
+                } catch {
+                    return nil
+                }
+                continue
+            }
+            guard let page = pageMetadata(at: pageIndex, in: documentID) else {
+                return causalContext
+            }
+            let operationsURL = collaborationOperationsURL(
+                forPageID: page.id,
+                in: documentID
+            )
+            let cacheKey = operationsURL.standardizedFileURL.path
+            let revision = collaborationOperationsRevisions[cacheKey, default: 0]
+            let operations = loadCollaborationOperations(
+                forPageID: page.id,
+                in: documentID
+            )
+            let existingDrawingURL = drawingURL(forPageID: page.id, in: documentID)
+
+            let preparationTask = Task.detached(priority: .background) {
+                Self.prepareDrawingCollaborationPlan(
+                    drawing: drawing,
+                    baseDrawing: baseDrawing,
+                    causalContext: causalContext,
+                    assumesOnlyAppendedStrokes: assumesOnlyAppendedStrokes,
+                    preparedPersistence: preparedPersistence,
+                    page: page,
+                    sourceOperations: operations,
+                    existingDrawingURL: existingDrawingURL
+                )
+            }
+            let plan = await withTaskCancellationHandler {
+                await preparationTask.value
+            } onCancel: {
+                preparationTask.cancel()
+            }
+            guard let plan,
+                  !Task.isCancelled,
+                  !isDrawingInteractionActive else { return nil }
+
+            // CloudKit can merge this page while the detached comparison is running. Never install
+            // a result based on an older operation set; retry without blocking PencilKit.
+            guard collaborationOperationsRevisions[cacheKey, default: 0] == revision else {
+                continue
+            }
+
+            let updatedContext: CollaborationVersionVector
+            do {
+                updatedContext = try commitPreparedDrawingCollaborationPlan(plan)
+            } catch {
+                saveState = .failed("协作操作无法保存：\(error.localizedDescription)")
+                return causalContext
+            }
+
+            let scheduledOperations = plan.preexistingOperationCount < plan.baseOperations.count
+                || !plan.mutations.isEmpty
+            if let drawingData = preparedPersistence.drawingData {
+                let saveKey = drawingKey(documentID: documentID, pageIndex: pageIndex)
+                pendingSaves[saveKey]?.cancel()
+                saveState = .saving
+                let pendingSave = PendingAssetSave(
+                    token: UUID(),
+                    data: drawingData,
+                    targetURL: drawingURL(forPage: pageIndex, in: documentID),
+                    reference: LibraryAssetReference(
+                        documentID: documentID,
+                        kind: .drawing(pageIndex: pageIndex)
+                    )
+                )
+                pendingAssetSaves[saveKey] = pendingSave
+                schedulePendingAssetSave(pendingSave, saveKey: saveKey)
+            } else {
+                // Appended ink is already recoverable from the immutable operation journal. Do
+                // not manufacture a redundant full PKDrawing snapshot while its editor is open.
+                saveState = scheduledOperations ? .saving : .saved(Date())
+            }
+            return updatedContext
+        }
+        return nil
+    }
+
     @discardableResult
     func scheduleSave(
         _ drawing: PKDrawing,
         replacing baseDrawing: PKDrawing? = nil,
         causalContext: CollaborationVersionVector? = nil,
         assumesOnlyAppendedStrokes: Bool = false,
+        preparedPersistence: PreparedDrawingPersistence? = nil,
         forPage pageIndex: Int,
         in documentID: String
     ) -> CollaborationVersionVector {
@@ -2848,6 +3138,7 @@ final class DrawingDocumentStore: ObservableObject {
                 replacing: baseDrawing,
                 causalContext: causalContext,
                 assumesOnlyAppendedStrokes: assumesOnlyAppendedStrokes,
+                preparedPersistence: preparedPersistence,
                 forPage: pageIndex,
                 in: documentID
             )
@@ -2871,7 +3162,7 @@ final class DrawingDocumentStore: ObservableObject {
         } else {
             // The live PencilKit value is already the authoritative local snapshot. Reusing it
             // avoids replaying the entire operation history and decoding every stored stroke.
-            data = drawing.dataRepresentation()
+            data = preparedPersistence?.drawingData ?? drawing.dataRepresentation()
         }
         let targetURL = drawingURL(forPage: pageIndex, in: documentID)
         let pendingSave = PendingAssetSave(
@@ -2884,34 +3175,158 @@ final class DrawingDocumentStore: ObservableObject {
             )
         )
         pendingAssetSaves[saveKey] = pendingSave
-        pendingSaves[saveKey] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 650_000_000)
-            guard !Task.isCancelled,
-                  self?.pendingAssetSaves[saveKey]?.token == pendingSave.token else { return }
+        schedulePendingAssetSave(pendingSave, saveKey: saveKey)
+        return updatedContext
+    }
 
+    /// Refreshes the compact drawing asset from the already-committed operation journal without
+    /// recording another logical edit. Ordinary handwriting uses this only as the page is closing
+    /// or the app is leaving the foreground, never while Pencil input is available.
+    func scheduleDrawingSnapshotCompaction(
+        _ drawing: PKDrawing,
+        causalContext: CollaborationVersionVector,
+        forPage pageIndex: Int,
+        in documentID: String
+    ) {
+        guard !readOnlySharedDocumentIDs.contains(documentID) else { return }
+        let saveKey = drawingKey(documentID: documentID, pageIndex: pageIndex)
+        pendingSaves[saveKey]?.cancel()
+        let data = hasUnseenDrawingCollaborationOperations(
+            outside: causalContext,
+            forPage: pageIndex,
+            in: documentID
+        )
+            ? collaborationDrawingData(forPage: pageIndex, in: documentID)
+            : drawing.dataRepresentation()
+        let pendingSave = PendingAssetSave(
+            token: UUID(),
+            data: data,
+            targetURL: drawingURL(forPage: pageIndex, in: documentID),
+            reference: LibraryAssetReference(
+                documentID: documentID,
+                kind: .drawing(pageIndex: pageIndex)
+            )
+        )
+        saveState = .saving
+        pendingAssetSaves[saveKey] = pendingSave
+        schedulePendingAssetSave(pendingSave, saveKey: saveKey)
+    }
+
+    private func drawingPersistenceQuietTimeRemaining() -> TimeInterval {
+        guard let lastDrawingInteractionAt else { return 0 }
+        return max(
+            0,
+            Self.drawingPersistenceQuietWindow
+                - Date().timeIntervalSince(lastDrawingInteractionAt)
+        )
+    }
+
+    private func schedulePendingAssetSaves() {
+        guard !isDrawingInteractionActive else { return }
+        for (saveKey, pendingSave) in pendingAssetSaves {
+            schedulePendingAssetSave(pendingSave, saveKey: saveKey)
+        }
+    }
+
+    private func schedulePendingAssetSave(
+        _ pendingSave: PendingAssetSave,
+        saveKey: String
+    ) {
+        pendingSaves[saveKey]?.cancel()
+        guard !isDrawingInteractionActive else {
+            pendingSaves[saveKey] = nil
+            return
+        }
+        let delay = drawingPersistenceQuietTimeRemaining()
+        pendingSaves[saveKey] = Task { @MainActor [weak self] in
             do {
-                // Keep the final atomic write on MainActor. This prevents a background flush
-                // from racing an already-detached, stale debounce write.
-                guard let latestSave = self?.pendingAssetSaves[saveKey],
-                      latestSave.token == pendingSave.token else { return }
-                try latestSave.data.write(to: latestSave.targetURL, options: .atomic)
-                guard !Task.isCancelled,
-                      self?.pendingAssetSaves[saveKey]?.token == pendingSave.token else { return }
-                self?.pendingSaves[saveKey] = nil
-                self?.pendingAssetSaves[saveKey] = nil
-                self?.saveState = self?.pendingSaves.isEmpty == true ? .saved(Date()) : .saving
-                if let self, let pageID = self.pageID(at: pageIndex, in: documentID) {
-                    self.bumpPageAssetRevision(forPageID: pageID, in: documentID)
-                }
-                self?.signalLocalCloudChange()
+                try await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
             } catch {
-                if self?.pendingAssetSaves[saveKey]?.token == pendingSave.token {
-                    self?.pendingSaves[saveKey] = nil
-                    self?.saveState = .failed(error.localizedDescription)
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  !self.isDrawingInteractionActive,
+                  let latestSave = self.pendingAssetSaves[saveKey],
+                  latestSave.token == pendingSave.token else { return }
+            if self.drawingPersistenceQuietTimeRemaining() > 0 {
+                self.pendingSaves[saveKey] = nil
+                self.schedulePendingAssetSave(latestSave, saveKey: saveKey)
+                return
+            }
+
+            let stagingURL = latestSave.targetURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    ".\(latestSave.targetURL.lastPathComponent)."
+                        + "\(latestSave.token.uuidString.lowercased()).pending"
+                )
+            let writeTask = Task.detached(priority: .background) {
+                try Task.checkCancellation()
+                try latestSave.data.write(to: stagingURL, options: .atomic)
+            }
+            do {
+                try await withTaskCancellationHandler {
+                    try await writeTask.value
+                } onCancel: {
+                    writeTask.cancel()
+                }
+                guard !Task.isCancelled,
+                      !self.isDrawingInteractionActive,
+                      self.drawingPersistenceQuietTimeRemaining() == 0,
+                      self.pendingAssetSaves[saveKey]?.token == pendingSave.token else {
+                    try? FileManager.default.removeItem(at: stagingURL)
+                    return
+                }
+
+                // Only the tiny same-volume rename remains on MainActor. A cancelled/stale writer
+                // never touches the live asset and therefore cannot overwrite a later flush.
+                try Self.installStagedFile(stagingURL, at: latestSave.targetURL)
+                self.pendingSaves[saveKey] = nil
+                self.pendingAssetSaves[saveKey] = nil
+                self.saveState = self.pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
+                self.bumpPageAssetRevision(for: latestSave.reference)
+                self.signalLocalCloudChange()
+            } catch {
+                try? FileManager.default.removeItem(at: stagingURL)
+                if self.pendingAssetSaves[saveKey]?.token == pendingSave.token {
+                    self.pendingSaves[saveKey] = nil
+                    if !Task.isCancelled {
+                        self.saveState = .failed(error.localizedDescription)
+                    }
                 }
             }
         }
-        return updatedContext
+    }
+
+    nonisolated private static func installStagedFile(
+        _ stagingURL: URL,
+        at targetURL: URL
+    ) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: targetURL.path) {
+            _ = try fileManager.replaceItemAt(
+                targetURL,
+                withItemAt: stagingURL,
+                backupItemName: nil,
+                options: []
+            )
+        } else {
+            try fileManager.moveItem(at: stagingURL, to: targetURL)
+        }
+    }
+
+    private func bumpPageAssetRevision(for reference: LibraryAssetReference) {
+        switch reference.kind {
+        case .pageDrawing(let pageID), .pageElements(let pageID):
+            bumpPageAssetRevision(forPageID: pageID, in: reference.documentID)
+        case .drawing(let pageIndex), .imageAnnotations(let pageIndex):
+            bumpPageAssetRevision(forPage: pageIndex, in: reference.documentID)
+        case .pdf, .pageBackground:
+            break
+        }
     }
 
     func scheduleSave(
@@ -2975,30 +3390,7 @@ final class DrawingDocumentStore: ObservableObject {
             )
         )
         pendingAssetSaves[saveKey] = pendingSave
-        pendingSaves[saveKey] = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 650_000_000)
-            guard !Task.isCancelled,
-                  self?.pendingAssetSaves[saveKey]?.token == pendingSave.token else { return }
-            do {
-                guard let latestSave = self?.pendingAssetSaves[saveKey],
-                      latestSave.token == pendingSave.token else { return }
-                try latestSave.data.write(to: latestSave.targetURL, options: .atomic)
-                guard !Task.isCancelled,
-                      self?.pendingAssetSaves[saveKey]?.token == pendingSave.token else { return }
-                self?.pendingSaves[saveKey] = nil
-                self?.pendingAssetSaves[saveKey] = nil
-                self?.saveState = self?.pendingSaves.isEmpty == true ? .saved(Date()) : .saving
-                if let self, let pageID = self.pageID(at: pageIndex, in: documentID) {
-                    self.bumpPageAssetRevision(forPageID: pageID, in: documentID)
-                }
-                self?.signalLocalCloudChange()
-            } catch {
-                if self?.pendingAssetSaves[saveKey]?.token == pendingSave.token {
-                    self?.pendingSaves[saveKey] = nil
-                    self?.saveState = .failed(error.localizedDescription)
-                }
-            }
-        }
+        schedulePendingAssetSave(pendingSave, saveKey: saveKey)
         return updatedContext
     }
 
@@ -5524,11 +5916,420 @@ final class DrawingDocumentStore: ObservableObject {
         return frontier
     }
 
+    nonisolated private static func prepareDrawingCollaborationPlan(
+        drawing: PKDrawing,
+        baseDrawing: PKDrawing?,
+        causalContext: CollaborationVersionVector?,
+        assumesOnlyAppendedStrokes: Bool,
+        preparedPersistence: PreparedDrawingPersistence?,
+        page: LibraryPage,
+        sourceOperations: [CollaborationOperation],
+        existingDrawingURL: URL
+    ) -> PreparedDrawingCollaborationPlan? {
+        var operations = sourceOperations
+        let preexistingOperationCount = operations.count
+        let hasStrokeHistory = operations.contains { operation in
+            switch operation.payload {
+            case .strokeUpsert, .strokeDelete: true
+            default: false
+            }
+        }
+        if !hasStrokeHistory,
+           let previousData = try? Data(contentsOf: existingDrawingURL),
+           let previousDrawing = try? PKDrawing(data: previousData),
+           !previousDrawing.strokes.isEmpty {
+            operations.append(contentsOf: preparedBootstrapDrawingOperations(
+                from: previousDrawing,
+                page: page
+            ))
+        }
+        guard !Task.isCancelled else { return nil }
+
+        var observedFrontier = CollaborationVersionVector()
+        var maximumLamport: UInt64 = 0
+        for operation in operations {
+            observedFrontier.formUnion(operation.stamp.context)
+            observedFrontier.observe(operation.stamp.dot)
+            maximumLamport = max(maximumLamport, operation.stamp.lamport)
+        }
+        guard !Task.isCancelled else { return nil }
+
+        if let baseDrawing,
+           drawing.strokes.count >= baseDrawing.strokes.count,
+           baseDrawing.strokes.isEmpty || assumesOnlyAppendedStrokes {
+            let baseStrokeCount = baseDrawing.strokes.count
+            let nextZIndex = max(
+                baseStrokeCount,
+                operations.compactMap { operation -> Int? in
+                    guard case .strokeUpsert(let stroke) = operation.payload else { return nil }
+                    return stroke.zIndex + 1
+                }.max() ?? 0
+            )
+            let expectedAppendedStrokeCount = drawing.strokes.count - baseStrokeCount
+            let preparedAppendedStrokeData = preparedPersistence?.appendedStrokeData.flatMap {
+                $0.count == expectedAppendedStrokeCount ? $0 : nil
+            }
+            let mutations = drawing.strokes
+                .dropFirst(baseStrokeCount)
+                .enumerated()
+                .map { offset, stroke in
+                    PreparedDrawingCollaborationMutation.upsert(
+                        id: UUID().uuidString.lowercased(),
+                        data: preparedAppendedStrokeData?[offset]
+                            ?? PKDrawing(strokes: [stroke]).dataRepresentation(),
+                        zIndex: nextZIndex + offset
+                    )
+                }
+            return PreparedDrawingCollaborationPlan(
+                page: page,
+                baseOperations: operations,
+                preexistingOperationCount: preexistingOperationCount,
+                mutations: mutations,
+                initialContext: causalContext ?? observedFrontier,
+                observedFrontier: observedFrontier,
+                maximumLamport: maximumLamport,
+                path: .appendOnly
+            )
+        }
+
+        let currentState = CollaborationMergeEngine.materialize(operations)
+        guard !Task.isCancelled else { return nil }
+        let storedStrokes = currentState.strokes.values.sorted(by: {
+            if $0.zIndex != $1.zIndex { return $0.zIndex < $1.zIndex }
+            return $0.id < $1.id
+        })
+
+        struct BaseStrokeIdentity {
+            let index: Int
+            let stored: CollaborationInkStroke
+            let exactFingerprint: String
+            let stableFingerprint: String
+        }
+        var baseIdentities: [BaseStrokeIdentity] = []
+        var deletableStrokeIDs: Set<String>
+        if let baseDrawing {
+            // Remote strokes absent from the editor's visual base are never eligible for deletion.
+            deletableStrokeIDs = []
+            let preparedBaseStrokes = preparedPersistence?.baseStrokes.flatMap {
+                $0.count == baseDrawing.strokes.count ? $0 : nil
+            }
+            let baseStrokePersistence = baseDrawing.strokes.enumerated().map { index, stroke in
+                if let preparedStroke = preparedBaseStrokes?[index] {
+                    return preparedStroke
+                }
+                let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+                return PreparedDrawingStrokePersistence(
+                    data: data,
+                    exactFingerprint: Self.collaborationStrokeFingerprint(data),
+                    stableFingerprint: Self.collaborationStableStrokeFingerprint(data)
+                )
+            }
+
+            var storedIndicesByData: [Data: [Int]] = [:]
+            for (index, stored) in storedStrokes.enumerated().reversed() {
+                storedIndicesByData[stored.drawingData, default: []].append(index)
+            }
+            var claimedStoredIndices: Set<Int> = []
+            var storedIndexByBaseIndex: [Int: Int] = [:]
+            for (baseIndex, preparedStroke) in baseStrokePersistence.enumerated() {
+                guard var candidates = storedIndicesByData[preparedStroke.data] else { continue }
+                while let candidate = candidates.popLast() {
+                    if !claimedStoredIndices.contains(candidate) {
+                        claimedStoredIndices.insert(candidate)
+                        storedIndexByBaseIndex[baseIndex] = candidate
+                        break
+                    }
+                }
+                storedIndicesByData[preparedStroke.data] = candidates
+            }
+
+            let unresolvedBaseIndices = baseStrokePersistence.indices.filter {
+                storedIndexByBaseIndex[$0] == nil
+            }
+            guard !Task.isCancelled else { return nil }
+            if !unresolvedBaseIndices.isEmpty {
+                var exactCandidates: [String: [Int]] = [:]
+                var stableCandidates: [String: [Int]] = [:]
+                for storedIndex in storedStrokes.indices.reversed()
+                where !claimedStoredIndices.contains(storedIndex) {
+                    let data = storedStrokes[storedIndex].drawingData
+                    exactCandidates[
+                        Self.collaborationStrokeFingerprint(data),
+                        default: []
+                    ].append(storedIndex)
+                    stableCandidates[
+                        Self.collaborationStableStrokeFingerprint(data),
+                        default: []
+                    ].append(storedIndex)
+                }
+
+                func claimStoredIndex(
+                    for fingerprint: String,
+                    candidates: inout [String: [Int]]
+                ) -> Int? {
+                    guard var indices = candidates[fingerprint] else { return nil }
+                    while let candidate = indices.popLast() {
+                        if !claimedStoredIndices.contains(candidate) {
+                            candidates[fingerprint] = indices
+                            claimedStoredIndices.insert(candidate)
+                            return candidate
+                        }
+                    }
+                    candidates[fingerprint] = indices
+                    return nil
+                }
+
+                for baseIndex in unresolvedBaseIndices {
+                    let fingerprint = baseStrokePersistence[baseIndex].exactFingerprint
+                    if let storedIndex = claimStoredIndex(
+                        for: fingerprint,
+                        candidates: &exactCandidates
+                    ) {
+                        storedIndexByBaseIndex[baseIndex] = storedIndex
+                    }
+                }
+                for baseIndex in unresolvedBaseIndices
+                where storedIndexByBaseIndex[baseIndex] == nil {
+                    let fingerprint = baseStrokePersistence[baseIndex].stableFingerprint
+                    if let storedIndex = claimStoredIndex(
+                        for: fingerprint,
+                        candidates: &stableCandidates
+                    ) {
+                        storedIndexByBaseIndex[baseIndex] = storedIndex
+                    }
+                }
+            }
+            guard !Task.isCancelled else { return nil }
+
+            for baseIndex in baseStrokePersistence.indices {
+                guard let storedIndex = storedIndexByBaseIndex[baseIndex] else { continue }
+                let matched = storedStrokes[storedIndex]
+                let preparedStroke = baseStrokePersistence[baseIndex]
+                deletableStrokeIDs.insert(matched.id)
+                baseIdentities.append(
+                    BaseStrokeIdentity(
+                        index: baseIndex,
+                        stored: matched,
+                        exactFingerprint: preparedStroke.exactFingerprint,
+                        stableFingerprint: preparedStroke.stableFingerprint
+                    )
+                )
+            }
+        } else {
+            deletableStrokeIDs = Set(currentState.strokes.keys)
+            baseIdentities = storedStrokes.enumerated().map { index, stroke in
+                BaseStrokeIdentity(
+                    index: index,
+                    stored: stroke,
+                    exactFingerprint: Self.collaborationStrokeFingerprint(stroke.drawingData),
+                    stableFingerprint:
+                        Self.collaborationStableStrokeFingerprint(stroke.drawingData)
+                )
+            }
+        }
+
+        struct DesiredStroke {
+            let index: Int
+            let data: Data
+            let exactFingerprint: String
+            let stableFingerprint: String
+        }
+        let preparedDrawingStrokes = preparedPersistence?.drawingStrokes.flatMap {
+            $0.count == drawing.strokes.count ? $0 : nil
+        }
+        let desiredStrokes = drawing.strokes.enumerated().map { index, stroke in
+            let preparedStroke = preparedDrawingStrokes?[index]
+            let data = preparedStroke?.data
+                ?? PKDrawing(strokes: [stroke]).dataRepresentation()
+            return DesiredStroke(
+                index: index,
+                data: data,
+                exactFingerprint: preparedStroke?.exactFingerprint
+                    ?? Self.collaborationStrokeFingerprint(data),
+                stableFingerprint: preparedStroke?.stableFingerprint
+                    ?? Self.collaborationStableStrokeFingerprint(data)
+            )
+        }
+        guard !Task.isCancelled else { return nil }
+        var exactIdentityByDesiredIndex: [Int: CollaborationInkStroke] = [:]
+        var usedStrokeIDs: Set<String> = []
+        var exactBaseCandidates: [String: [Int]] = [:]
+        var stableBaseCandidates: [String: [Int]] = [:]
+        for baseIdentityIndex in baseIdentities.indices.reversed() {
+            let identity = baseIdentities[baseIdentityIndex]
+            exactBaseCandidates[identity.exactFingerprint, default: []].append(baseIdentityIndex)
+            stableBaseCandidates[identity.stableFingerprint, default: []].append(baseIdentityIndex)
+        }
+
+        func claimBaseIdentityIndex(
+            for fingerprint: String,
+            candidates: inout [String: [Int]]
+        ) -> Int? {
+            guard var indices = candidates[fingerprint] else { return nil }
+            while let candidate = indices.popLast() {
+                if !usedStrokeIDs.contains(baseIdentities[candidate].stored.id) {
+                    candidates[fingerprint] = indices
+                    return candidate
+                }
+            }
+            candidates[fingerprint] = indices
+            return nil
+        }
+
+        for desired in desiredStrokes {
+            guard let matchedIndex = claimBaseIdentityIndex(
+                for: desired.exactFingerprint,
+                candidates: &exactBaseCandidates
+            ) else { continue }
+            let matched = baseIdentities[matchedIndex].stored
+            exactIdentityByDesiredIndex[desired.index] = matched
+            usedStrokeIDs.insert(matched.id)
+            deletableStrokeIDs.remove(matched.id)
+        }
+        for desired in desiredStrokes where exactIdentityByDesiredIndex[desired.index] == nil {
+            guard let matchedIndex = claimBaseIdentityIndex(
+                for: desired.stableFingerprint,
+                candidates: &stableBaseCandidates
+            ) else { continue }
+            let matched = baseIdentities[matchedIndex].stored
+            exactIdentityByDesiredIndex[desired.index] = matched
+            usedStrokeIDs.insert(matched.id)
+            deletableStrokeIDs.remove(matched.id)
+        }
+        guard !Task.isCancelled else { return nil }
+
+        let baseIdentityByDrawingIndex = Dictionary(
+            uniqueKeysWithValues: baseIdentities.map { ($0.index, $0) }
+        )
+        var mutations: [PreparedDrawingCollaborationMutation] = []
+        for desired in desiredStrokes {
+            if exactIdentityByDesiredIndex[desired.index] != nil { continue }
+            if let matched = baseIdentityByDrawingIndex[desired.index]?.stored,
+               !usedStrokeIDs.contains(matched.id) {
+                usedStrokeIDs.insert(matched.id)
+                deletableStrokeIDs.remove(matched.id)
+                mutations.append(
+                    .upsert(id: matched.id, data: desired.data, zIndex: matched.zIndex)
+                )
+            } else {
+                mutations.append(
+                    .upsert(
+                        id: UUID().uuidString.lowercased(),
+                        data: desired.data,
+                        zIndex: desired.index
+                    )
+                )
+            }
+        }
+        for stroke in currentState.strokes.values where deletableStrokeIDs.contains(stroke.id) {
+            mutations.append(.delete(strokeID: stroke.id))
+        }
+
+        return PreparedDrawingCollaborationPlan(
+            page: page,
+            baseOperations: operations,
+            preexistingOperationCount: preexistingOperationCount,
+            mutations: mutations,
+            initialContext: causalContext ?? currentState.frontier,
+            observedFrontier: observedFrontier,
+            maximumLamport: maximumLamport,
+            path: .fullDiff
+        )
+    }
+
+    nonisolated private static func preparedBootstrapDrawingOperations(
+        from drawing: PKDrawing,
+        page: LibraryPage
+    ) -> [CollaborationOperation] {
+        var migrationClock = CollaborationReplicaClock(
+            actorID: "migration:\(page.documentID):\(page.id)"
+        )
+        return drawing.strokes.enumerated().map { zIndex, stroke in
+            let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+            let seed = Data(
+                "\(page.id)|\(zIndex)|\(Self.collaborationStrokeFingerprint(stroke))".utf8
+            )
+            let operationID = "bootstrap-\(Self.collaborationFingerprint(seed))"
+            let strokeID = "stroke-\(Self.collaborationFingerprint(seed))"
+            return CollaborationOperation(
+                workspaceID: "personal-library",
+                documentID: page.documentID,
+                pageID: page.id,
+                stamp: migrationClock.nextStamp(
+                    operationID: operationID,
+                    createdAt: page.createdAt
+                ),
+                payload: .strokeUpsert(
+                    CollaborationInkStroke(id: strokeID, drawingData: data, zIndex: zIndex)
+                )
+            )
+        }
+    }
+
+    private func commitPreparedDrawingCollaborationPlan(
+        _ plan: PreparedDrawingCollaborationPlan
+    ) throws -> CollaborationVersionVector {
+        collaborationClock.observe(
+            frontier: plan.observedFrontier,
+            maximumLamport: plan.maximumLamport
+        )
+        var emissionContext = plan.initialContext
+        var operations = plan.baseOperations
+        for mutation in plan.mutations {
+            let stamp = collaborationClock.nextStamp(observedContext: emissionContext)
+            emissionContext.observe(stamp.dot)
+            let payload: CollaborationOperationPayload
+            switch mutation {
+            case .upsert(let id, let data, let zIndex):
+                payload = .strokeUpsert(
+                    CollaborationInkStroke(id: id, drawingData: data, zIndex: zIndex)
+                )
+            case .delete(let strokeID):
+                payload = .strokeDelete(strokeID: strokeID)
+            }
+            operations.append(
+                CollaborationOperation(
+                    workspaceID: "personal-library",
+                    documentID: plan.page.documentID,
+                    pageID: plan.page.id,
+                    stamp: stamp,
+                    payload: payload
+                )
+            )
+        }
+
+        let didBootstrap = plan.preexistingOperationCount < plan.baseOperations.count
+        guard didBootstrap || !plan.mutations.isEmpty else {
+#if DEBUG
+            if case .fullDiff = plan.path {
+                debugFullDrawingDiffSaveCount += 1
+            }
+#endif
+            return emissionContext
+        }
+#if DEBUG
+        switch plan.path {
+        case .appendOnly:
+            debugAppendOnlyDrawingSaveCount += 1
+        case .fullDiff:
+            debugFullDrawingDiffSaveCount += 1
+        }
+#endif
+        scheduleCollaborationOperationsSave(
+            operations,
+            forPageID: plan.page.id,
+            in: plan.page.documentID
+        )
+        try persistCollaborationClock()
+        return emissionContext
+    }
+
     private func recordDrawingCollaborationOperations(
         _ drawing: PKDrawing,
         replacing baseDrawing: PKDrawing? = nil,
         causalContext: CollaborationVersionVector? = nil,
         assumesOnlyAppendedStrokes: Bool = false,
+        preparedPersistence: PreparedDrawingPersistence? = nil,
         forPage pageIndex: Int,
         in documentID: String
     ) throws -> CollaborationVersionVector {
@@ -5577,6 +6378,10 @@ final class DrawingDocumentStore: ObservableObject {
                     return stroke.zIndex + 1
                 }.max() ?? 0
             )
+            let expectedAppendedStrokeCount = drawing.strokes.count - baseStrokeCount
+            let preparedAppendedStrokeData = preparedPersistence?.appendedStrokeData.flatMap {
+                $0.count == expectedAppendedStrokeCount ? $0 : nil
+            }
             let appendedOperations = drawing.strokes
                 .dropFirst(baseStrokeCount)
                 .enumerated()
@@ -5589,7 +6394,8 @@ final class DrawingDocumentStore: ObservableObject {
                         payload: .strokeUpsert(
                             CollaborationInkStroke(
                                 id: UUID().uuidString.lowercased(),
-                                drawingData: PKDrawing(strokes: [stroke]).dataRepresentation(),
+                                drawingData: preparedAppendedStrokeData?[offset]
+                                    ?? PKDrawing(strokes: [stroke]).dataRepresentation(),
                                 zIndex: nextZIndex + offset
                             )
                         )
@@ -5615,25 +6421,14 @@ final class DrawingDocumentStore: ObservableObject {
         debugFullDrawingDiffSaveCount += 1
 #endif
         let currentState = CollaborationMergeEngine.materialize(operations)
-        struct StoredStrokeIdentity {
-            let stroke: CollaborationInkStroke
-            let exactFingerprint: String
-            let stableFingerprint: String
-        }
-        let storedIdentities = currentState.strokes.values.sorted(by: {
+        let storedStrokes = currentState.strokes.values.sorted(by: {
             if $0.zIndex != $1.zIndex { return $0.zIndex < $1.zIndex }
             return $0.id < $1.id
-        }).map { stroke in
-            StoredStrokeIdentity(
-                stroke: stroke,
-                exactFingerprint: collaborationStrokeFingerprint(stroke.drawingData),
-                stableFingerprint: collaborationStableStrokeFingerprint(stroke.drawingData)
-            )
-        }
+        })
 
         struct BaseStrokeIdentity {
             let index: Int
-            let stored: StoredStrokeIdentity
+            let stored: CollaborationInkStroke
             let exactFingerprint: String
             let stableFingerprint: String
         }
@@ -5644,41 +6439,123 @@ final class DrawingDocumentStore: ObservableObject {
             // strokes downloaded while this canvas stayed dirty are absent from that base and
             // therefore survive the local delta.
             deletableStrokeIDs = []
-            var claimedStoredIDs: Set<String> = []
-            for (index, stroke) in baseDrawing.strokes.enumerated() {
-                // PencilKit can normalize real Apple Pencil samples while encoding them. Compare
-                // every identity on the same serialized representation used by the operation log;
-                // otherwise a previously saved live stroke can look new on each autosave.
-                let data = PKDrawing(strokes: [stroke]).dataRepresentation()
-                let exactFingerprint = collaborationStrokeFingerprint(data)
-                let stableFingerprint = collaborationStableStrokeFingerprint(data)
-                let matched = storedIdentities.first {
-                    !claimedStoredIDs.contains($0.stroke.id)
-                        && $0.exactFingerprint == exactFingerprint
-                } ?? storedIdentities.first {
-                    !claimedStoredIDs.contains($0.stroke.id)
-                        && $0.stableFingerprint == stableFingerprint
+            let preparedBaseStrokes = preparedPersistence?.baseStrokes.flatMap {
+                $0.count == baseDrawing.strokes.count ? $0 : nil
+            }
+            let baseStrokePersistence = baseDrawing.strokes.enumerated().map { index, stroke in
+                if let preparedStroke = preparedBaseStrokes?[index] {
+                    return preparedStroke
                 }
-                guard let matched else { continue }
-                claimedStoredIDs.insert(matched.stroke.id)
-                deletableStrokeIDs.insert(matched.stroke.id)
+                let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+                return PreparedDrawingStrokePersistence(
+                    data: data,
+                    exactFingerprint: Self.collaborationStrokeFingerprint(data),
+                    stableFingerprint: Self.collaborationStableStrokeFingerprint(data)
+                )
+            }
+
+            // Most local strokes preserve the exact serialized bytes. Resolve that overwhelmingly
+            // common case without decoding and formatting every stored Pencil sample again.
+            var storedIndicesByData: [Data: [Int]] = [:]
+            for (index, stored) in storedStrokes.enumerated().reversed() {
+                storedIndicesByData[stored.drawingData, default: []].append(index)
+            }
+            var claimedStoredIndices: Set<Int> = []
+            var storedIndexByBaseIndex: [Int: Int] = [:]
+            for (baseIndex, preparedStroke) in baseStrokePersistence.enumerated() {
+                guard var candidates = storedIndicesByData[preparedStroke.data] else { continue }
+                while let candidate = candidates.popLast() {
+                    if !claimedStoredIndices.contains(candidate) {
+                        claimedStoredIndices.insert(candidate)
+                        storedIndexByBaseIndex[baseIndex] = candidate
+                        break
+                    }
+                }
+                storedIndicesByData[preparedStroke.data] = candidates
+            }
+
+            let unresolvedBaseIndices = baseStrokePersistence.indices.filter {
+                storedIndexByBaseIndex[$0] == nil
+            }
+            if !unresolvedBaseIndices.isEmpty {
+                // PencilKit may normalize timing/pressure bytes during serialization. Only when raw
+                // bytes fail do we pay for the geometry fingerprints, and indexed buckets keep the
+                // matching pass linear even for pages with thousands of strokes.
+                var exactCandidates: [String: [Int]] = [:]
+                var stableCandidates: [String: [Int]] = [:]
+                for storedIndex in storedStrokes.indices.reversed()
+                where !claimedStoredIndices.contains(storedIndex) {
+                    let data = storedStrokes[storedIndex].drawingData
+                    exactCandidates[
+                        Self.collaborationStrokeFingerprint(data),
+                        default: []
+                    ].append(storedIndex)
+                    stableCandidates[
+                        Self.collaborationStableStrokeFingerprint(data),
+                        default: []
+                    ].append(storedIndex)
+                }
+
+                func claimStoredIndex(
+                    for fingerprint: String,
+                    candidates: inout [String: [Int]]
+                ) -> Int? {
+                    guard var indices = candidates[fingerprint] else { return nil }
+                    while let candidate = indices.popLast() {
+                        if !claimedStoredIndices.contains(candidate) {
+                            candidates[fingerprint] = indices
+                            claimedStoredIndices.insert(candidate)
+                            return candidate
+                        }
+                    }
+                    candidates[fingerprint] = indices
+                    return nil
+                }
+
+                for baseIndex in unresolvedBaseIndices {
+                    let fingerprint = baseStrokePersistence[baseIndex].exactFingerprint
+                    if let storedIndex = claimStoredIndex(
+                        for: fingerprint,
+                        candidates: &exactCandidates
+                    ) {
+                        storedIndexByBaseIndex[baseIndex] = storedIndex
+                    }
+                }
+                for baseIndex in unresolvedBaseIndices
+                where storedIndexByBaseIndex[baseIndex] == nil {
+                    let fingerprint = baseStrokePersistence[baseIndex].stableFingerprint
+                    if let storedIndex = claimStoredIndex(
+                        for: fingerprint,
+                        candidates: &stableCandidates
+                    ) {
+                        storedIndexByBaseIndex[baseIndex] = storedIndex
+                    }
+                }
+            }
+
+            for baseIndex in baseStrokePersistence.indices {
+                guard let storedIndex = storedIndexByBaseIndex[baseIndex] else { continue }
+                let matched = storedStrokes[storedIndex]
+                let preparedStroke = baseStrokePersistence[baseIndex]
+                deletableStrokeIDs.insert(matched.id)
                 baseIdentities.append(
                     BaseStrokeIdentity(
-                        index: index,
+                        index: baseIndex,
                         stored: matched,
-                        exactFingerprint: exactFingerprint,
-                        stableFingerprint: stableFingerprint
+                        exactFingerprint: preparedStroke.exactFingerprint,
+                        stableFingerprint: preparedStroke.stableFingerprint
                     )
                 )
             }
         } else {
             deletableStrokeIDs = Set(currentState.strokes.keys)
-            baseIdentities = storedIdentities.enumerated().map { index, identity in
+            baseIdentities = storedStrokes.enumerated().map { index, stroke in
                 BaseStrokeIdentity(
                     index: index,
-                    stored: identity,
-                    exactFingerprint: identity.exactFingerprint,
-                    stableFingerprint: identity.stableFingerprint
+                    stored: stroke,
+                    exactFingerprint: Self.collaborationStrokeFingerprint(stroke.drawingData),
+                    stableFingerprint:
+                        Self.collaborationStableStrokeFingerprint(stroke.drawingData)
                 )
             }
         }
@@ -5696,40 +6573,76 @@ final class DrawingDocumentStore: ObservableObject {
             let exactFingerprint: String
             let stableFingerprint: String
         }
+        let preparedDrawingStrokes = preparedPersistence?.drawingStrokes.flatMap {
+            $0.count == drawing.strokes.count ? $0 : nil
+        }
         let desiredStrokes = drawing.strokes.enumerated().map { index, stroke in
-            let data = PKDrawing(strokes: [stroke]).dataRepresentation()
+            let preparedStroke = preparedDrawingStrokes?[index]
+            let data = preparedStroke?.data
+                ?? PKDrawing(strokes: [stroke]).dataRepresentation()
             return DesiredStroke(
                 index: index,
                 data: data,
-                exactFingerprint: collaborationStrokeFingerprint(data),
-                stableFingerprint: collaborationStableStrokeFingerprint(data)
+                exactFingerprint: preparedStroke?.exactFingerprint
+                    ?? Self.collaborationStrokeFingerprint(data),
+                stableFingerprint: preparedStroke?.stableFingerprint
+                    ?? Self.collaborationStableStrokeFingerprint(data)
             )
         }
         var exactIdentityByDesiredIndex: [Int: CollaborationInkStroke] = [:]
         var usedStrokeIDs: Set<String> = []
+        var exactBaseCandidates: [String: [Int]] = [:]
+        var stableBaseCandidates: [String: [Int]] = [:]
+        for baseIdentityIndex in baseIdentities.indices.reversed() {
+            let identity = baseIdentities[baseIdentityIndex]
+            exactBaseCandidates[identity.exactFingerprint, default: []]
+                .append(baseIdentityIndex)
+            stableBaseCandidates[identity.stableFingerprint, default: []]
+                .append(baseIdentityIndex)
+        }
+
+        func claimBaseIdentityIndex(
+            for fingerprint: String,
+            candidates: inout [String: [Int]]
+        ) -> Int? {
+            guard var indices = candidates[fingerprint] else { return nil }
+            while let candidate = indices.popLast() {
+                if !usedStrokeIDs.contains(baseIdentities[candidate].stored.id) {
+                    candidates[fingerprint] = indices
+                    return candidate
+                }
+            }
+            candidates[fingerprint] = indices
+            return nil
+        }
 
         // Resolve exact matches globally before using the serialization-tolerant signature. This
         // keeps truly identical duplicate strokes deterministic while still preserving identity
         // when PencilKit slightly rewrites pressure, timing, or angle samples on disk.
         for desired in desiredStrokes {
-            guard let matched = baseIdentities.first(where: {
-                !usedStrokeIDs.contains($0.stored.stroke.id)
-                    && $0.exactFingerprint == desired.exactFingerprint
-            }) else { continue }
-            exactIdentityByDesiredIndex[desired.index] = matched.stored.stroke
-            usedStrokeIDs.insert(matched.stored.stroke.id)
-            deletableStrokeIDs.remove(matched.stored.stroke.id)
+            guard let matchedIndex = claimBaseIdentityIndex(
+                for: desired.exactFingerprint,
+                candidates: &exactBaseCandidates
+            ) else { continue }
+            let matched = baseIdentities[matchedIndex].stored
+            exactIdentityByDesiredIndex[desired.index] = matched
+            usedStrokeIDs.insert(matched.id)
+            deletableStrokeIDs.remove(matched.id)
         }
         for desired in desiredStrokes where exactIdentityByDesiredIndex[desired.index] == nil {
-            guard let matched = baseIdentities.first(where: {
-                !usedStrokeIDs.contains($0.stored.stroke.id)
-                    && $0.stableFingerprint == desired.stableFingerprint
-            }) else { continue }
-            exactIdentityByDesiredIndex[desired.index] = matched.stored.stroke
-            usedStrokeIDs.insert(matched.stored.stroke.id)
-            deletableStrokeIDs.remove(matched.stored.stroke.id)
+            guard let matchedIndex = claimBaseIdentityIndex(
+                for: desired.stableFingerprint,
+                candidates: &stableBaseCandidates
+            ) else { continue }
+            let matched = baseIdentities[matchedIndex].stored
+            exactIdentityByDesiredIndex[desired.index] = matched
+            usedStrokeIDs.insert(matched.id)
+            deletableStrokeIDs.remove(matched.id)
         }
 
+        let baseIdentityByDrawingIndex = Dictionary(
+            uniqueKeysWithValues: baseIdentities.map { ($0.index, $0) }
+        )
         var added: [CollaborationOperation] = []
         for desired in desiredStrokes {
             if exactIdentityByDesiredIndex[desired.index] != nil { continue }
@@ -5737,7 +6650,7 @@ final class DrawingDocumentStore: ObservableObject {
             // A lasso transform or bitmap eraser changes PencilKit bytes but normally preserves
             // array position. Exact matches were assigned globally first, so this fallback does
             // not confuse a shifted unchanged stroke with the deleted stroke before it.
-            if let matched = baseIdentities.first(where: { $0.index == desired.index })?.stored.stroke,
+            if let matched = baseIdentityByDrawingIndex[desired.index]?.stored,
                !usedStrokeIDs.contains(matched.id) {
                 usedStrokeIDs.insert(matched.id)
                 deletableStrokeIDs.remove(matched.id)
@@ -5917,9 +6830,9 @@ final class DrawingDocumentStore: ObservableObject {
         )
         return drawing.strokes.enumerated().map { zIndex, stroke in
             let data = PKDrawing(strokes: [stroke]).dataRepresentation()
-            let seed = Data("\(page.id)|\(zIndex)|\(collaborationStrokeFingerprint(stroke))".utf8)
-            let operationID = "bootstrap-\(collaborationFingerprint(seed))"
-            let strokeID = "stroke-\(collaborationFingerprint(seed))"
+            let seed = Data("\(page.id)|\(zIndex)|\(Self.collaborationStrokeFingerprint(stroke))".utf8)
+            let operationID = "bootstrap-\(Self.collaborationFingerprint(seed))"
+            let strokeID = "stroke-\(Self.collaborationFingerprint(seed))"
             return CollaborationOperation(
                 workspaceID: "personal-library",
                 documentID: page.documentID,
@@ -5945,7 +6858,7 @@ final class DrawingDocumentStore: ObservableObject {
         return elements.sorted(by: pageElementSort).compactMap { element in
             guard let encoded = try? collaborationJSONEncoder().encode(element) else { return nil }
             let seed = Data(page.id.utf8) + encoded
-            let operationID = "bootstrap-element-\(collaborationFingerprint(seed))"
+            let operationID = "bootstrap-element-\(Self.collaborationFingerprint(seed))"
             return CollaborationOperation(
                 workspaceID: "personal-library",
                 documentID: page.documentID,
@@ -6010,6 +6923,7 @@ final class DrawingDocumentStore: ObservableObject {
         pendingCollaborationOperationsTasks[cacheKey]?.cancel()
         pendingCollaborationOperationsTasks[cacheKey] = nil
         pendingCollaborationOperationsSaves[cacheKey] = nil
+        markCollaborationOperationsChanged(cacheKey: cacheKey)
         let encoded = try Self.encodedCollaborationOperations(operations)
         try encoded.data.write(to: url, options: .atomic)
         if let signature = collaborationOperationsFileSignature(at: url) {
@@ -6042,12 +6956,18 @@ final class DrawingDocumentStore: ObservableObject {
             documentID: documentID,
             pageID: pageID
         )
+        markCollaborationOperationsChanged(cacheKey: cacheKey)
         pendingCollaborationOperationsSaves[cacheKey] = pendingSave
         guard !isDrawingInteractionActive else {
             pendingCollaborationOperationsTasks[cacheKey] = nil
             return
         }
         schedulePendingCollaborationOperationsSave(pendingSave, cacheKey: cacheKey)
+    }
+
+    private func markCollaborationOperationsChanged(cacheKey: String) {
+        collaborationOperationsRevisionSeed &+= 1
+        collaborationOperationsRevisions[cacheKey] = collaborationOperationsRevisionSeed
     }
 
     private func schedulePendingCollaborationOperationsSaves() {
@@ -6062,17 +6982,39 @@ final class DrawingDocumentStore: ObservableObject {
         cacheKey: String
     ) {
         pendingCollaborationOperationsTasks[cacheKey]?.cancel()
+        let delay = drawingPersistenceQuietTimeRemaining()
         pendingCollaborationOperationsTasks[cacheKey] = Task.detached(priority: .background) {
             [weak self] in
+            let stagingURL = pendingSave.targetURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    ".\(pendingSave.targetURL.lastPathComponent)."
+                        + "\(pendingSave.token.uuidString.lowercased()).pending"
+                )
             do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+                guard !Task.isCancelled else { return }
                 let encoded = try Self.encodedCollaborationOperations(pendingSave.operations)
                 guard !Task.isCancelled else { return }
-                await self?.finishScheduledCollaborationOperationsSave(
+                try encoded.data.write(to: stagingURL, options: .atomic)
+                guard !Task.isCancelled else {
+                    try? FileManager.default.removeItem(at: stagingURL)
+                    return
+                }
+                guard let self else {
+                    try? FileManager.default.removeItem(at: stagingURL)
+                    return
+                }
+                await self.finishScheduledCollaborationOperationsSave(
                     pendingSave,
                     cacheKey: cacheKey,
-                    encoded: encoded
+                    encoded: encoded,
+                    stagingURL: stagingURL
                 )
             } catch {
+                try? FileManager.default.removeItem(at: stagingURL)
                 guard !Task.isCancelled else { return }
                 await self?.failScheduledCollaborationOperationsSave(
                     pendingSave,
@@ -6086,15 +7028,27 @@ final class DrawingDocumentStore: ObservableObject {
     private func finishScheduledCollaborationOperationsSave(
         _ pendingSave: PendingCollaborationOperationsSave,
         cacheKey: String,
-        encoded: (data: Data, operations: [CollaborationOperation])
+        encoded: (data: Data, operations: [CollaborationOperation]),
+        stagingURL: URL
     ) {
         guard pendingCollaborationOperationsSaves[cacheKey]?.token == pendingSave.token else {
+            try? FileManager.default.removeItem(at: stagingURL)
             return
         }
         pendingCollaborationOperationsTasks[cacheKey] = nil
-        guard !isDrawingInteractionActive else { return }
+        guard !isDrawingInteractionActive else {
+            try? FileManager.default.removeItem(at: stagingURL)
+            return
+        }
+        if drawingPersistenceQuietTimeRemaining() > 0 {
+            try? FileManager.default.removeItem(at: stagingURL)
+            schedulePendingCollaborationOperationsSave(pendingSave, cacheKey: cacheKey)
+            return
+        }
         do {
-            try encoded.data.write(to: pendingSave.targetURL, options: .atomic)
+            // Encoding and writing happen off MainActor; only the same-volume rename is installed
+            // here after one final Pencil-idle check.
+            try Self.installStagedFile(stagingURL, at: pendingSave.targetURL)
             pendingCollaborationOperationsSaves[cacheKey] = nil
             if let signature = collaborationOperationsFileSignature(at: pendingSave.targetURL) {
                 collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
@@ -6104,7 +7058,10 @@ final class DrawingDocumentStore: ObservableObject {
             } else {
                 collaborationOperationsCache[cacheKey] = nil
             }
+            saveState = pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
+            signalLocalCloudChange()
         } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
             saveState = .failed("协作操作无法保存：\(error.localizedDescription)")
         }
     }
@@ -6123,6 +7080,7 @@ final class DrawingDocumentStore: ObservableObject {
 
     private func flushPendingCollaborationOperationsSaves(withKeys keys: [String]) -> Bool {
         var firstError: Error?
+        var didPersistOperations = false
         for cacheKey in keys {
             pendingCollaborationOperationsTasks[cacheKey]?.cancel()
             pendingCollaborationOperationsTasks[cacheKey] = nil
@@ -6139,6 +7097,7 @@ final class DrawingDocumentStore: ObservableObject {
                 } else {
                     collaborationOperationsCache[cacheKey] = nil
                 }
+                didPersistOperations = true
             } catch {
                 firstError = firstError ?? error
             }
@@ -6146,6 +7105,10 @@ final class DrawingDocumentStore: ObservableObject {
         if let firstError {
             saveState = .failed("协作操作无法保存：\(firstError.localizedDescription)")
             return false
+        }
+        if didPersistOperations {
+            saveState = pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
+            signalLocalCloudChange()
         }
         return true
     }
@@ -6280,18 +7243,18 @@ final class DrawingDocumentStore: ObservableObject {
         )
     }
 
-    private func collaborationFingerprint(_ data: Data) -> String {
+    nonisolated private static func collaborationFingerprint(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func collaborationStrokeFingerprint(_ drawingData: Data) -> String {
+    nonisolated private static func collaborationStrokeFingerprint(_ drawingData: Data) -> String {
         guard let stroke = try? PKDrawing(data: drawingData).strokes.first else {
-            return collaborationFingerprint(drawingData)
+            return Self.collaborationFingerprint(drawingData)
         }
-        return collaborationStrokeFingerprint(stroke)
+        return Self.collaborationStrokeFingerprint(stroke)
     }
 
-    private func collaborationStrokeFingerprint(_ stroke: PKStroke) -> String {
+    nonisolated private static func collaborationStrokeFingerprint(_ stroke: PKStroke) -> String {
         var red: CGFloat = 0
         var green: CGFloat = 0
         var blue: CGFloat = 0
@@ -6328,7 +7291,7 @@ final class DrawingDocumentStore: ObservableObject {
                 )
             )
         }
-        return collaborationFingerprint(Data(components.joined(separator: "|").utf8))
+        return Self.collaborationFingerprint(Data(components.joined(separator: "|").utf8))
     }
 
     /// PencilKit is allowed to normalize dynamic samples when a drawing is serialized. Those
@@ -6337,14 +7300,18 @@ final class DrawingDocumentStore: ObservableObject {
     /// materialization would visibly resurrect it. This signature keeps the rendered geometry,
     /// ink, color, transform, point order, and point count while deliberately omitting timing,
     /// pressure, opacity, and Pencil angles.
-    private func collaborationStableStrokeFingerprint(_ drawingData: Data) -> String {
+    nonisolated private static func collaborationStableStrokeFingerprint(
+        _ drawingData: Data
+    ) -> String {
         guard let stroke = try? PKDrawing(data: drawingData).strokes.first else {
-            return collaborationFingerprint(drawingData)
+            return Self.collaborationFingerprint(drawingData)
         }
-        return collaborationStableStrokeFingerprint(stroke)
+        return Self.collaborationStableStrokeFingerprint(stroke)
     }
 
-    private func collaborationStableStrokeFingerprint(_ stroke: PKStroke) -> String {
+    nonisolated private static func collaborationStableStrokeFingerprint(
+        _ stroke: PKStroke
+    ) -> String {
         var red: CGFloat = 0
         var green: CGFloat = 0
         var blue: CGFloat = 0
@@ -6377,7 +7344,7 @@ final class DrawingDocumentStore: ObservableObject {
                 )
             )
         }
-        return collaborationFingerprint(Data(components.joined(separator: "|").utf8))
+        return Self.collaborationFingerprint(Data(components.joined(separator: "|").utf8))
     }
 
     private func collaborationOperationsURL(forPageID pageID: String, in documentID: String) -> URL {
@@ -6565,7 +7532,7 @@ final class DrawingDocumentStore: ObservableObject {
             } else {
                 fallbackSize = CGSize(width: 595, height: 842)
             }
-            let fingerprint = collaborationFingerprint(Data("recovery|\(documentID)".utf8))
+            let fingerprint = Self.collaborationFingerprint(Data("recovery|\(documentID)".utf8))
             recovered = LibraryPage(
                 id: "recovery-\(fingerprint)",
                 documentID: documentID,
@@ -6645,17 +7612,47 @@ final class DrawingDocumentStore: ObservableObject {
         }
     }
 
+    /// Export a finite snapshot containing the complete canvas. Camera movement never changes
+    /// this range, and imported PDF documents retain their original paper bounds.
+    func exportBounds(forPage pageIndex: Int, in documentID: String) -> CGRect {
+        let paper = CGRect(origin: .zero, size: pageSize(at: pageIndex, in: documentID))
+        guard document(withID: documentID)?.kind == .canvas else { return paper }
+        var content = loadDrawing(forPage: pageIndex, in: documentID).bounds
+        for element in loadPageElements(forPage: pageIndex, in: documentID) {
+            let rect = element.logicalBounds
+            let transform = CGAffineTransform(translationX: rect.midX, y: rect.midY)
+                .rotated(by: element.rotationRadians)
+                .translatedBy(x: -rect.midX, y: -rect.midY)
+            content = content.union(rect.applying(transform))
+        }
+        guard !content.isNull, !content.isInfinite, !content.isEmpty else { return paper }
+        return paper.contains(content) ? paper : paper.union(content.insetBy(dx: -24, dy: -24)).integral
+    }
+
     private func renderFlattenedPage(
         documentID: String,
         pageIndex: Int,
-        size: CGSize,
+        bounds: CGRect,
         context: CGContext
     ) {
-        let pageRect = CGRect(origin: .zero, size: size)
+        let size = pageSize(at: pageIndex, in: documentID)
+        let isCanvas = document(withID: documentID)?.kind == .canvas
+        let metadata = pageMetadata(at: pageIndex, in: documentID)
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.translateBy(x: -bounds.minX, y: -bounds.minY)
         context.setFillColor(UIColor.white.cgColor)
-        context.fill(pageRect)
+        context.fill(bounds)
+        if isCanvas {
+            CanvasBackgroundRenderer.draw(
+                in: context, bounds: bounds,
+                style: metadata?.backgroundStyle ?? .blank,
+                color: metadata?.backgroundColor ?? .white
+            )
+        }
 
-        if let page = page(at: pageIndex, in: documentID) {
+        if (!isCanvas || metadata?.sourceKind == .pdf),
+           let page = page(at: pageIndex, in: documentID) {
             let pageBounds = page.bounds(for: .mediaBox)
             let scale = min(
                 size.width / max(pageBounds.width, 1),
@@ -6686,7 +7683,10 @@ final class DrawingDocumentStore: ObservableObject {
 
         let drawing = loadDrawing(forPage: pageIndex, in: documentID)
         guard !drawing.strokes.isEmpty else { return }
-        drawing.image(from: pageRect, scale: 2).draw(in: pageRect)
+        let rasterScale = isCanvas
+            ? min(2, hypot(context.ctm.a, context.ctm.b) * 2, 4096 / max(bounds.width, bounds.height))
+            : 2
+        drawing.image(from: bounds, scale: rasterScale).draw(in: bounds)
     }
 
     private func drawExportElement(_ element: CanvasPageElement, in context: CGContext) {
@@ -7002,6 +8002,8 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func signalLocalCloudChange() {
+        // Saved ink and objects are included in canvas previews, including outside the old page.
+        thumbnailCache.removeAll()
         cloudSyncGeneration &+= 1
     }
 }

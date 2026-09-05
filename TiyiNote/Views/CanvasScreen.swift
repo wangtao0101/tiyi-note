@@ -12,12 +12,16 @@ struct CanvasScreen: View {
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
     @State private var selectedTool = CanvasToolKind.pen
+    @AppStorage("canvas.penVariant") private var selectedPenVariant = CanvasToolKind.pen
     @AppStorage("canvas.color") private var selectedColor = InkPaletteColor.graphite
     @AppStorage("canvas.penWidth.v2") private var penWidth = 0.7
     @AppStorage("canvas.markerWidth") private var markerWidth = 16.0
     @AppStorage("canvas.eraserSize") private var eraserSize = CanvasEraserSize.medium
     @AppStorage("canvas.eraserMode") private var eraserMode = CanvasEraserMode.precision
     @AppStorage("pdfWorkspace.showsThumbnails") private var showsThumbnails = false
+    @AppStorage("canvas.toolPaletteDockEdge") private var toolPaletteDockEdge =
+        ToolPaletteDockEdge.leading
+    @AppStorage("canvas.toolPaletteDockProgress") private var toolPaletteDockProgress = 0.24
 
     @State private var activeController: CanvasController?
     @State private var activePageIndex = 0
@@ -50,7 +54,7 @@ struct CanvasScreen: View {
 
     var body: some View {
         ZStack {
-            TiyiNoteTheme.workspace
+            TiyiNoteTheme.documentWorkspace
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
@@ -70,61 +74,88 @@ struct CanvasScreen: View {
 
                 if annotationEditingEnabled {
                     ToolPaletteView(
+                        activeController: activeController,
                         selectedTool: $selectedTool,
-                        selectedColor: $selectedColor,
-                        penWidth: $penWidth,
-                        markerWidth: $markerWidth,
-                        eraserSize: $eraserSize,
+                        selectedPenVariant: $selectedPenVariant,
                         eraserMode: $eraserMode,
                         showsThumbnails: $showsThumbnails,
-                        activeController: activeController,
                         onSearch: { showsPDFSearch = true },
-                        onDocumentAction: handleDocumentOutput,
                         onInsertImage: { showsImageImporter = true },
                         onInsertShape: insertShape,
-                        onClear: requestClearCurrentPage
+                        hasActiveDocument: !activeDocumentID.isEmpty,
+                        canImportPDF: PlatformCapabilities.current.canImportPDF,
+                        canClearPage: activeController != nil,
+                        onImportPDF: { showsPDFImporter = true },
+                        onDocumentAction: handleDocumentOutput,
+                        onClearPage: requestClearCurrentPage
                     )
                 } else {
                     ReadOnlyToolPaletteView(
                         showsThumbnails: $showsThumbnails,
                         onSearch: { showsPDFSearch = true },
+                        hasActiveDocument: !activeDocumentID.isEmpty,
+                        canImportPDF: PlatformCapabilities.current.canImportPDF,
+                        onImportPDF: { showsPDFImporter = true },
                         onDocumentAction: handleDocumentOutput
                     )
                 }
 
-                if let activeDocument = documentStore.document(withID: activeDocumentID) {
-                    PDFDocumentReaderView(
-                        documentStore: documentStore,
-                        documentID: activeDocument.id,
-                        showsThumbnails: $showsThumbnails,
-                        pageElementInsertionRequest: $pageElementInsertionRequest,
-                        externalPageRequest: $requestedReaderPageIndex,
-                        searchHighlight: $pdfSearchHighlight,
-                        selectedTool: selectedTool,
-                        selectedColor: selectedColor,
-                        penWidth: penWidth,
-                        markerWidth: markerWidth,
-                        eraserSize: eraserSize,
-                        eraserMode: eraserMode,
-                        isAnnotationEditingEnabled: annotationEditingEnabled,
-                        initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
-                        onSelectLassoTool: {
-                            selectedTool = .lasso
-                        },
-                        onSelectTextTool: {
-                            selectedTool = .text
-                        },
-                        onActiveCanvasChanged: { controller, pageIndex in
-                            activeController = controller
-                            activePageIndex = pageIndex
+                ZStack {
+                    if let activeDocument = documentStore.document(withID: activeDocumentID) {
+                        PDFDocumentReaderView(
+                            documentStore: documentStore,
+                            documentID: activeDocument.id,
+                            showsThumbnails: $showsThumbnails,
+                            pageElementInsertionRequest: $pageElementInsertionRequest,
+                            externalPageRequest: $requestedReaderPageIndex,
+                            searchHighlight: $pdfSearchHighlight,
+                            selectedTool: selectedTool,
+                            selectedColor: selectedColor,
+                            penWidth: penWidth,
+                            markerWidth: markerWidth,
+                            eraserSize: eraserSize,
+                            eraserMode: eraserMode,
+                            isAnnotationEditingEnabled: annotationEditingEnabled,
+                            initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
+                            onSelectLassoTool: {
+                                selectedTool = .lasso
+                            },
+                            onSelectTextTool: {
+                                selectedTool = .text
+                            },
+                            onActiveCanvasChanged: { controller, pageIndex in
+                                // Pencil-down reaffirms the active canvas. Avoid invalidating the
+                                // complete workspace when it is still the same visible page.
+                                if activeController !== controller {
+                                    activeController = controller
+                                }
+                                if activePageIndex != pageIndex {
+                                    activePageIndex = pageIndex
+                                }
+                            }
+                        )
+                        .id(activeDocument.id)
+
+                        if annotationEditingEnabled {
+                            DockableToolPaletteView(
+                                selectedTool: $selectedTool,
+                                selectedPenVariant: selectedPenVariant,
+                                selectedColor: $selectedColor,
+                                penWidth: $penWidth,
+                                markerWidth: $markerWidth,
+                                eraserSize: $eraserSize,
+                                dockEdge: $toolPaletteDockEdge,
+                                dockProgress: $toolPaletteDockProgress,
+                                leadingContentInset: showsThumbnails ? 293 : 0
+                            )
+                            .zIndex(20)
                         }
-                    )
-                    .id(activeDocument.id)
-                } else {
-                    EmptyPDFWorkspaceView(
-                        canImportPDF: PlatformCapabilities.current.canImportPDF,
-                        onImportPDF: { showsPDFImporter = true }
-                    )
+                    } else {
+                        EmptyPDFWorkspaceView(
+                            canImportPDF: PlatformCapabilities.current.canImportPDF,
+                            onImportPDF: { showsPDFImporter = true }
+                        )
+                    }
                 }
             }
         }
@@ -133,6 +164,9 @@ struct CanvasScreen: View {
             reconcileActiveDocument()
         }
         .onChange(of: selectedTool) { _, tool in
+            if tool.isPenVariant {
+                selectedPenVariant = tool
+            }
             guard tool != .text,
                   let request = pageElementInsertionRequest,
                   case .text = request.payload else { return }
@@ -142,9 +176,12 @@ struct CanvasScreen: View {
             pageElementInsertionRequest = nil
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active {
-                flushPendingAnnotations()
-            }
+            // SwiftUI reports `.inactive` for short-lived system interruptions as well as the
+            // beginning of a real background transition. The page editors deliberately wait for
+            // `.background`; mirroring that rule here prevents a second synchronous journal/file
+            // drain from blocking the first Pencil samples when the interruption disappears.
+            guard phase == .background else { return }
+            flushPendingAnnotations()
         }
         .fileImporter(
             isPresented: $showsPDFImporter,
@@ -236,6 +273,12 @@ struct CanvasScreen: View {
     }
 
     private func prepareWorkspace() {
+        if selectedPenVariant.isPenVariant {
+            selectedTool = selectedPenVariant
+        } else {
+            selectedPenVariant = .pen
+            selectedTool = .pen
+        }
         if !documentStore.openDocumentIDs.contains(activeDocumentID) {
             activeDocumentID = documentStore.openDocuments.first?.id ?? ""
         }

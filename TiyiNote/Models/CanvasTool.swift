@@ -42,6 +42,15 @@ enum CanvasToolKind: String, CaseIterable, Identifiable {
         case .eraser, .lasso, .text: false
         }
     }
+
+    /// These variants share the top-level pen tool. Highlighter uses its own width scale and is
+    /// selected beside the pen-width presets in the floating palette.
+    var isPenVariant: Bool {
+        switch self {
+        case .pen, .fountainPen, .pencil: true
+        case .marker, .eraser, .lasso, .text: false
+        }
+    }
 }
 
 enum CanvasEraserMode: String, CaseIterable, Identifiable {

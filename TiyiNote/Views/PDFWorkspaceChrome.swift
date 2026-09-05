@@ -15,33 +15,33 @@ struct PDFDocumentTabBar: View {
     let onShowLibrary: () -> Void
 
     private var isCompact: Bool { horizontalSizeClass == .compact }
-    private var tabStride: CGFloat { (isCompact ? 210 : 280) - 12 }
+    private var tabStride: CGFloat { (isCompact ? 196 : 248) + 2 }
 
     var body: some View {
         HStack(spacing: 0) {
             Button(action: onShowLibrary) {
                 Image(systemName: "house")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(TiyiNoteTheme.textSecondary)
-                .frame(width: 52, height: 46)
-                .contentShape(Rectangle())
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(TiyiNoteTheme.documentChromeForeground)
+                    .frame(width: 46, height: 42)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("返回文稿")
             .accessibilityIdentifier("home-button")
 
             Rectangle()
-                .fill(TiyiNoteTheme.hairline)
-                .frame(width: 1, height: 26)
+                .fill(Color.white.opacity(0.14))
+                .frame(width: 1, height: 22)
 
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: -12) {
+                    HStack(spacing: 2) {
                         ForEach(openDocuments) { document in
                             reorderableTab(document)
                         }
                     }
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 6)
                 }
                 .accessibilityIdentifier("document-tab-scroll")
                 .onAppear {
@@ -56,17 +56,20 @@ struct PDFDocumentTabBar: View {
                     scrollActiveTab(with: proxy, animated: false)
                 }
             }
-
+            .frame(maxWidth: .infinity)
         }
-        .frame(height: 48)
+        .frame(height: 44)
         .background {
             ZStack(alignment: .bottom) {
-                TiyiNoteTheme.chrome
+                TiyiNoteTheme.documentChrome
+                    .ignoresSafeArea(edges: .top)
                 Rectangle()
-                    .fill(TiyiNoteTheme.hairline)
+                    .fill(Color.white.opacity(0.10))
                     .frame(height: 1)
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("document-tab-bar")
     }
 
     private func scrollActiveTab(with proxy: ScrollViewProxy, animated: Bool) {
@@ -208,6 +211,92 @@ struct PDFDocumentTabBar: View {
     #endif
 }
 
+/// The trailing document commands in Goodnotes' writing-tool row. Only actions that Tiyi already
+/// implements are surfaced here; unfinished placeholders never enter the workspace chrome.
+struct DocumentToolbarActions: View {
+    let hasActiveDocument: Bool
+    let canImportPDF: Bool
+    let canClearPage: Bool
+    let onImportPDF: () -> Void
+    let onDocumentAction: (DocumentOutputAction) -> Void
+    let onClearPage: () -> Void
+
+    var body: some View {
+        HStack(spacing: 1) {
+            if canImportPDF {
+                Button(action: onImportPDF) {
+                    DocumentTopBarIcon(symbol: "doc.badge.plus")
+                }
+                .buttonStyle(DocumentTopBarPressedStyle())
+                .accessibilityLabel("导入 PDF 或可编辑文稿")
+                .accessibilityIdentifier("document-import-button")
+            }
+
+            Menu {
+                Button { onDocumentAction(.flattenedPDF) } label: {
+                    Label("分享扁平 PDF", systemImage: "doc.richtext")
+                }
+                Button { onDocumentAction(.pageImages) } label: {
+                    Label("导出页面图片", systemImage: "photo.on.rectangle.angled")
+                }
+                Button { onDocumentAction(.editablePackage) } label: {
+                    Label("导出可编辑文稿", systemImage: "shippingbox")
+                }
+                Divider()
+                Button { onDocumentAction(.collaboration) } label: {
+                    Label("多人协作", systemImage: "person.2.badge.plus")
+                }
+            } label: {
+                DocumentTopBarIcon(symbol: "square.and.arrow.up")
+            }
+            .disabled(!hasActiveDocument)
+            .accessibilityLabel("导出和分享")
+
+            Menu {
+                Button { onDocumentAction(.conflictVersions) } label: {
+                    Label("冲突版本", systemImage: "arrow.triangle.branch")
+                }
+                Button { onDocumentAction(.printDocument) } label: {
+                    Label("打印", systemImage: "printer")
+                }
+                if canClearPage {
+                    Divider()
+                    Button(role: .destructive, action: onClearPage) {
+                        Label("清空当前页批注", systemImage: "trash")
+                    }
+                }
+            } label: {
+                DocumentTopBarIcon(symbol: "ellipsis.circle")
+            }
+            .disabled(!hasActiveDocument)
+            .accessibilityLabel("更多文稿操作")
+        }
+    }
+}
+
+private struct DocumentTopBarIcon: View {
+    let symbol: String
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(TiyiNoteTheme.documentChromeForeground)
+            .frame(width: 38, height: 38)
+            .contentShape(Rectangle())
+    }
+}
+
+private struct DocumentTopBarPressedStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                Color.white.opacity(configuration.isPressed ? 0.13 : 0),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+    }
+}
+
 private struct PDFDocumentTab: View {
     let document: PDFWorkspaceDocument
     let isActive: Bool
@@ -223,13 +312,17 @@ private struct PDFDocumentTab: View {
                     Image(systemName: "doc.richtext")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(
-                            isActive ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textTertiary
+                            isActive
+                                ? TiyiNoteTheme.documentChromeForeground
+                                : TiyiNoteTheme.documentChromeMuted
                         )
                     Text(document.title)
                         .font(.system(size: 13, weight: isActive ? .semibold : .medium))
                         .lineLimit(1)
                         .foregroundStyle(
-                            isActive ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textSecondary
+                            isActive
+                                ? TiyiNoteTheme.documentChromeForeground
+                                : TiyiNoteTheme.documentChromeMuted
                         )
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -244,87 +337,38 @@ private struct PDFDocumentTab: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(
-                            isActive ? TiyiNoteTheme.textSecondary : TiyiNoteTheme.textTertiary
+                            isActive
+                                ? TiyiNoteTheme.documentChromeForeground.opacity(0.76)
+                                : TiyiNoteTheme.documentChromeMuted.opacity(0.74)
                         )
-                        .frame(width: 26, height: 30)
+                        .frame(width: 24, height: 30)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("关闭 \(document.title)")
             }
         }
-        .padding(.leading, 25)
-        .padding(.trailing, 18)
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
         .frame(
-            width: isCompact ? 210 : 280,
-            height: 48
+            width: isCompact ? 196 : 248,
+            height: 42
         )
         .background {
             if isActive {
-                ChromeDocumentTabShape()
-                    .fill(TiyiNoteTheme.surfaceSelected)
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(TiyiNoteTheme.documentToolbar)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if isActive {
+                Capsule()
+                    .fill(Color.white.opacity(0.88))
+                    .frame(height: 2)
+                    .padding(.horizontal, 14)
             }
         }
         .contentShape(Rectangle())
-    }
-}
-
-/// Chrome-style selected tab: the body rises from the tab strip, while two outward curves merge
-/// its lower corners into the strip instead of ending as an isolated rounded rectangle.
-private struct ChromeDocumentTabShape: Shape {
-    func path(in rect: CGRect) -> Path {
-        let top = rect.minY + 4
-        let bottom = rect.maxY
-        let connectorWidth = min(18, rect.width * 0.12)
-        let connectorRise = min(14, rect.height * 0.32)
-        let topRadius = min(14, (rect.width - connectorWidth * 2) / 4)
-
-        var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: bottom))
-        path.addCurve(
-            to: CGPoint(
-                x: rect.minX + connectorWidth,
-                y: bottom - connectorRise
-            ),
-            control1: CGPoint(x: rect.minX + connectorWidth * 0.48, y: bottom),
-            control2: CGPoint(
-                x: rect.minX + connectorWidth,
-                y: bottom - connectorRise * 0.42
-            )
-        )
-        path.addLine(to: CGPoint(
-            x: rect.minX + connectorWidth,
-            y: top + topRadius
-        ))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.minX + connectorWidth + topRadius, y: top),
-            control: CGPoint(x: rect.minX + connectorWidth, y: top)
-        )
-        path.addLine(to: CGPoint(
-            x: rect.maxX - connectorWidth - topRadius,
-            y: top
-        ))
-        path.addQuadCurve(
-            to: CGPoint(
-                x: rect.maxX - connectorWidth,
-                y: top + topRadius
-            ),
-            control: CGPoint(x: rect.maxX - connectorWidth, y: top)
-        )
-        path.addLine(to: CGPoint(
-            x: rect.maxX - connectorWidth,
-            y: bottom - connectorRise
-        ))
-        path.addCurve(
-            to: CGPoint(x: rect.maxX, y: bottom),
-            control1: CGPoint(
-                x: rect.maxX - connectorWidth,
-                y: bottom - connectorRise * 0.42
-            ),
-            control2: CGPoint(x: rect.maxX - connectorWidth * 0.48, y: bottom)
-        )
-        path.closeSubpath()
-        return path
     }
 }
 

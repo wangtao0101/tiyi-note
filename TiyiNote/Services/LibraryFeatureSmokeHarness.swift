@@ -85,6 +85,7 @@ private enum LibraryFeatureSmokeHarness {
             try validateCanvasToolsAndLasso()
             try validateScanPDFRenderer()
             try validateAdvancedObjectsAndExports(token: token)
+            try validateUnboundedCanvasAndExports(token: token)
             let store = DrawingDocumentStore(
                 userDefaults: defaults,
                 workspaceDirectoryOverride: workspace
@@ -751,6 +752,85 @@ private enum LibraryFeatureSmokeHarness {
         ])
     }
 
+    private static func validateUnboundedCanvasAndExports(token: String) throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TiyiNoteUnboundedSmoke/\(token)", isDirectory: true)
+        let defaultsName = "com.tiyi.note.unbounded-smoke.\(token)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defaults.removePersistentDomain(forName: defaultsName)
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            defaults.removePersistentDomain(forName: defaultsName)
+        }
+        let store = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: workspace)
+        let document = try store.createCanvas(
+            named: "Unbounded export", in: nil, backgroundStyle: .blank, backgroundColor: .white
+        )
+        let outsideDrawing = makeSmokeDrawing(offset: 0, color: .systemBlue)
+            .transformed(using: CGAffineTransform(translationX: -6200, y: -4800).scaledBy(x: 3, y: 3))
+        let controller = CanvasController()
+        controller.installInitialDrawing(outsideDrawing)
+        _ = controller.prepareUnboundedViewport(CGRect(x: -7000, y: -5500, width: 2200, height: 2800))
+        _ = controller.prepareUnboundedViewport(CGRect(x: -22000, y: -19000, width: 2200, height: 2800))
+        guard controller.drawing.bounds == outsideDrawing.bounds,
+              controller.canvasView.drawing.bounds.minX > 0,
+              controller.canvasView.drawing.bounds.minY > 0 else {
+            throw SmokeError.validationFailed("画板跨区移动改变了文稿笔迹坐标")
+        }
+        _ = controller.duplicateStrokes(at: [0], offset: CGSize(width: 32, height: 32), within: nil)
+        controller.undo()
+        guard controller.drawing.bounds == outsideDrawing.bounds, controller.strokeCount == 1 else {
+            throw SmokeError.validationFailed("无界笔迹坐标转换破坏了撤销")
+        }
+        controller.redo()
+        guard controller.strokeCount == 2 else {
+            throw SmokeError.validationFailed("无界笔迹坐标转换破坏了重做")
+        }
+        let shape = CanvasPageElement(
+            logicalBounds: CGRect(x: 2600, y: 1700, width: 240, height: 180),
+            rotationRadians: .pi / 4,
+            zIndex: 1,
+            payload: .shape(PageShapePayload(
+                kind: .rectangle, strokeColorHex: "#E65A50", fillColorHex: "#E65A50", lineWidth: 8
+            ))
+        )
+        let text = CanvasPageElement(
+            logicalBounds: CGRect(x: -1000, y: -900, width: 650, height: 170),
+            zIndex: 2,
+            payload: .text(PageTextPayload(text: "Outside canvas", fontSize: 90, colorHex: "#E65A50"))
+        )
+        store.flush(outsideDrawing, forPage: 0, in: document.id)
+        store.flush([shape, text], forPage: 0, in: document.id)
+        let reloaded = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: workspace)
+        let bounds = reloaded.exportBounds(forPage: 0, in: document.id)
+        guard bounds.minX < -6000, bounds.minY < -4400,
+              bounds.maxX > 2850, bounds.maxY > 1900,
+              reloaded.loadDrawing(forPage: 0, in: document.id).bounds == outsideDrawing.bounds else {
+            throw SmokeError.validationFailed("无界画板保存或导出范围裁掉了原纸张外的内容")
+        }
+        let pdfURL = try reloaded.exportFlattenedPDF(documentID: document.id)
+        let pngURLs = try reloaded.exportPageImages(documentID: document.id)
+        guard let pdf = PDFDocument(url: pdfURL)?.page(at: 0),
+              let pngURL = pngURLs.first,
+              let png = UIImage(contentsOfFile: pngURL.path),
+              pdf.bounds(for: .mediaBox).size == bounds.size,
+              max(png.cgImage?.width ?? 0, png.cgImage?.height ?? 0) <= 4096 else {
+            throw SmokeError.validationFailed("无界画板 PDF 或有像素上限的 PNG 无法生成")
+        }
+        let preview = pdf.thumbnail(of: CGSize(width: bounds.width * 0.3, height: bounds.height * 0.3), for: .mediaBox)
+        for worldProbe in [outsideDrawing.bounds, shape.logicalBounds, text.logicalBounds] {
+            let probe = worldProbe.offsetBy(dx: -bounds.minX, dy: -bounds.minY)
+            for image in [preview, png] {
+                guard containsExportPixels(
+                    image, logicalRect: probe, logicalPageSize: bounds.size,
+                    probe: .saturated, minimumPixelCount: 25
+                ) else {
+                    throw SmokeError.validationFailed("无界画板 PDF/PNG 未真实绘出远处笔迹、旋转图形或文字")
+                }
+            }
+        }
+    }
+
     private static func validateSequentialDrawingIdentity(token: String) throws {
         let fileManager = FileManager.default
         let workspace = fileManager.temporaryDirectory
@@ -939,6 +1019,17 @@ private enum LibraryFeatureSmokeHarness {
             ).strokes
         }
         let desiredDrawing = PKDrawing(strokes: baseDrawing.strokes + appendedStrokes)
+        guard let preparedPersistence = DrawingDocumentStore.prepareDrawingPersistence(
+            drawing: desiredDrawing,
+            baseDrawing: baseDrawing,
+            assumesOnlyAppendedStrokes: true
+        ) else {
+            throw SmokeError.validationFailed("大日志增量准备被意外取消")
+        }
+        guard preparedPersistence.drawingData == nil,
+              preparedPersistence.appendedStrokeData?.count == appendedStrokeCount else {
+            throw SmokeError.validationFailed("普通新增笔迹仍触发了整页序列化")
+        }
         let interactionID = UUID()
         reloaded.setDrawingInteractionActive(true, id: interactionID)
         _ = reloaded.scheduleSave(
@@ -946,6 +1037,7 @@ private enum LibraryFeatureSmokeHarness {
             replacing: baseDrawing,
             causalContext: reloaded.collaborationFrontier(forPage: 0, in: document.id),
             assumesOnlyAppendedStrokes: true,
+            preparedPersistence: preparedPersistence,
             forPage: 0,
             in: document.id
         )

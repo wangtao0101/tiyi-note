@@ -1,12 +1,31 @@
 import SwiftUI
+import Observation
 import UniformTypeIdentifiers
 #if !targetEnvironment(macCatalyst)
 import AVFoundation
 import VisionKit
 #endif
 
+/// Keep browsing context outside the mounted library, so entering the full-screen editor can
+/// remove its complete view tree while returning to the same folder, filter, and scroll target.
+@Observable
+final class LibraryBrowserState {
+    var scope = LibraryScope.documents
+    var selectedFolderID: String? {
+        didSet { if selectedFolderID != oldValue { scrollOffset = 0 } }
+    }
+    var searchText = "" {
+        didSet { if searchText != oldValue { scrollOffset = 0 } }
+    }
+    var kindFilter = LibraryKindFilter.all {
+        didSet { if kindFilter != oldValue { scrollOffset = 0 } }
+    }
+    @ObservationIgnored var scrollOffset: CGFloat = 0
+}
+
 struct LibraryBrowserView: View {
     @ObservedObject var documentStore: DrawingDocumentStore
+    @Bindable var browsingState: LibraryBrowserState
     let onExit: (() -> Void)?
     let onSyncNow: () async -> Void
     let onOpenDocument: (String) -> Void
@@ -15,11 +34,6 @@ struct LibraryBrowserView: View {
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
-    @State private var scope = LibraryScope.documents
-    @State private var selectedFolderID: String?
-    @State private var compactPath: [String] = []
-    @State private var searchText = ""
-    @State private var kindFilter = LibraryKindFilter.all
     @State private var isSelecting = false
     @State private var selectedFolderIDs = Set<String>()
     @State private var selectedDocumentIDs = Set<String>()
@@ -35,19 +49,14 @@ struct LibraryBrowserView: View {
     @State private var scanDestinationFolderID: String?
     @State private var errorMessage: String?
     @State private var showsCloudSyncStatus = false
-    @State private var splitVisibility = NavigationSplitViewVisibility.all
 
     @AppStorage("library.layoutMode") private var layoutRawValue = LibraryLayoutMode.list.rawValue
     @AppStorage("library.sortOrder") private var sortRawValue = LibrarySortOrder.modifiedNewest.rawValue
 
     var body: some View {
-        Group {
-            if isCompact {
-                compactBrowser
-            } else {
-                regularBrowser
-            }
-        }
+        libraryPage(folderID: scope == .documents ? browsingState.selectedFolderID : nil)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("document-library")
         .fileImporter(
             isPresented: $showsPDFImporter,
             allowedContentTypes: [.pdf, .tiyiNoteDocument],
@@ -132,64 +141,29 @@ struct LibraryBrowserView: View {
         }
         .onChange(of: scope) { _, _ in
             finishSelecting()
-            searchText = ""
-            selectedFolderID = nil
-            compactPath.removeAll()
+            browsingState.searchText = ""
+            browsingState.selectedFolderID = nil
+            browsingState.scrollOffset = 0
         }
     }
 
-    private var regularBrowser: some View {
-        NavigationSplitView(columnVisibility: $splitVisibility) {
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    if onExit != nil {
-                        embeddedSidebarExitButton
-                    }
-                    Spacer(minLength: 0)
-                    embeddedSidebarToggleButton
-                }
-                .padding(.horizontal, 12)
-                .frame(height: 44)
-
-                LibrarySidebar(
-                    documentStore: documentStore,
-                    scope: scope,
-                    selectedFolderID: selectedFolderID,
-                    onSelectScope: { scope = $0 }
-                )
-            }
-            .navigationSplitViewColumnWidth(min: 210, ideal: 238, max: 280)
-            .toolbarVisibility(.hidden, for: .navigationBar)
-        } detail: {
-            libraryPage(folderID: scope == .documents ? selectedFolderID : nil)
-        }
-        .navigationSplitViewStyle(.balanced)
-        .toolbar(removing: .title)
-    }
-
-    private var compactBrowser: some View {
-        NavigationStack(path: $compactPath) {
-            libraryPage(folderID: nil)
-                .navigationDestination(for: String.self) { folderID in
-                    libraryPage(folderID: folderID)
-                }
-        }
-    }
+    private var scope: LibraryScope { browsingState.scope }
 
     private func libraryPage(folderID: String?) -> some View {
         LibraryContentPage(
             documentStore: documentStore,
             scope: scope,
             folderID: folderID,
-            searchText: searchText,
-            kindFilter: kindFilter,
+            searchText: browsingState.searchText,
+            kindFilter: browsingState.kindFilter,
+            scrollState: browsingState,
             layoutMode: layoutMode,
             sortOrder: sortOrder,
             isSelecting: $isSelecting,
             selectedFolderIDs: $selectedFolderIDs,
             selectedDocumentIDs: $selectedDocumentIDs,
-            onSetScope: { scope = $0 },
-            onSetFilter: { kindFilter = $0 },
+            onSetScope: { browsingState.scope = $0 },
+            onSetFilter: { browsingState.kindFilter = $0 },
             onSetLayout: { layoutRawValue = $0.rawValue },
             onSetSort: { sortRawValue = $0.rawValue },
             onNavigate: navigate(to:),
@@ -246,8 +220,6 @@ struct LibraryBrowserView: View {
                     },
                     onCancel: finishSelecting
                 )
-            } else if isCompact {
-                LibraryScopeBar(scope: scope, onSelect: { scope = $0 })
             }
         }
     }
@@ -256,62 +228,9 @@ struct LibraryBrowserView: View {
         horizontalSizeClass == .compact
     }
 
-    private var embeddedSidebarToggleButton: some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                splitVisibility = .detailOnly
-            }
-        } label: {
-            LibraryToolbarIcon(symbol: "sidebar.left", fontSize: 15, frameSize: 30)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("隐藏侧栏")
-    }
-
-    private var embeddedSidebarExitButton: some View {
-        Button {
-            onExit?()
-        } label: {
-            LibraryToolbarIcon(symbol: "chevron.left", fontSize: 15, frameSize: 30)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("返回首页")
-    }
-
-    private var floatingSidebarToggleButton: some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                splitVisibility = splitVisibility == .detailOnly ? .all : .detailOnly
-            }
-        } label: {
-            LibraryToolbarIcon(symbol: "sidebar.left", fontSize: 14, frameSize: 30)
-        }
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
-        .controlSize(.small)
-        .accessibilityLabel(splitVisibility == .detailOnly ? "显示侧栏" : "隐藏侧栏")
-    }
-
-    private var floatingSidebarExitButton: some View {
-        Button {
-            onExit?()
-        } label: {
-            LibraryToolbarIcon(symbol: "chevron.left", fontSize: 14, frameSize: 30)
-        }
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
-        .controlSize(.small)
-        .accessibilityLabel("返回首页")
-    }
-
     private var libraryNavigationBar: some View {
         HStack(spacing: 10) {
-            if !isCompact, splitVisibility == .detailOnly {
-                if onExit != nil {
-                    floatingSidebarExitButton
-                }
-                floatingSidebarToggleButton
-            } else if isCompact, let onExit {
+            if let onExit {
                 Button(action: onExit) {
                     LibraryToolbarIcon(symbol: "chevron.left", fontSize: 14, frameSize: 30)
                 }
@@ -321,7 +240,11 @@ struct LibraryBrowserView: View {
                 .accessibilityLabel("返回首页")
             }
 
-            LibraryInlineSearchField(text: $searchText)
+            Text("文稿")
+                .font(.system(size: 18, weight: .semibold))
+                .accessibilityIdentifier("document-library-title")
+
+            LibraryInlineSearchField(text: $browsingState.searchText)
 
             Spacer(minLength: 0)
 
@@ -373,16 +296,13 @@ struct LibraryBrowserView: View {
 
     private func navigate(to folderID: String?) {
         guard scope == .documents else {
-            scope = .documents
+            browsingState.scope = .documents
             DispatchQueue.main.async { navigate(to: folderID) }
             return
         }
         finishSelecting()
-        if isCompact {
-            compactPath = LibraryPath.pathIDs(to: folderID, folders: documentStore.folders)
-        } else {
-            selectedFolderID = folderID
-        }
+        browsingState.selectedFolderID = folderID
+        browsingState.scrollOffset = 0
     }
 
     private func handleCommand(_ command: LibraryItemCommand) {
@@ -751,6 +671,7 @@ private struct LibraryContentPage: View {
     let folderID: String?
     let searchText: String
     let kindFilter: LibraryKindFilter
+    let scrollState: LibraryBrowserState
     let layoutMode: LibraryLayoutMode
     let sortOrder: LibrarySortOrder
     @Binding var isSelecting: Bool
@@ -783,7 +704,7 @@ private struct LibraryContentPage: View {
                     folders: documentStore.folders,
                     onNavigate: onNavigate
                 )
-                .padding(.horizontal, 24)
+                .padding(.horizontal, isCompactLayout ? 16 : 20)
                 .padding(.bottom, 8)
             }
 
@@ -911,18 +832,40 @@ private struct LibraryContentPage: View {
 
     private var filterControl: some View {
         Menu {
-            ForEach(LibraryKindFilter.allCases) { filter in
-                Button {
-                    onSetFilter(filter)
-                } label: {
-                    Label(
-                        filter.title,
-                        systemImage: filter == kindFilter ? "checkmark" : filter.symbol
-                    )
+            Section("位置") {
+                ForEach(LibraryScope.allCases) { item in
+                    Button {
+                        onSetScope(item)
+                    } label: {
+                        Label(
+                            item == .documents ? "全部文稿" : item.title,
+                            systemImage: item == scope ? "checkmark" : item.symbol
+                        )
+                    }
+                    .accessibilityIdentifier("library-scope-\(item.rawValue)")
+                }
+            }
+            Section("类型") {
+                ForEach(LibraryKindFilter.allCases) { filter in
+                    Button {
+                        onSetFilter(filter)
+                    } label: {
+                        Label(
+                            filter.title,
+                            systemImage: filter == kindFilter ? "checkmark" : filter.symbol
+                        )
+                    }
+                    .accessibilityIdentifier("library-kind-\(filter.rawValue)")
                 }
             }
         } label: {
-            Label(kindFilter.title, systemImage: "line.3.horizontal.decrease")
+            HStack(spacing: 6) {
+                Text(scope == .documents ? "全部" : scope.title)
+                if kindFilter != .all {
+                    Text(kindFilter.title).foregroundStyle(TiyiNoteTheme.textSecondary)
+                }
+                Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+            }
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(TiyiNoteTheme.textPrimary)
                 .padding(.horizontal, 2)
@@ -930,7 +873,8 @@ private struct LibraryContentPage: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.glass)
-        .accessibilityLabel("筛选：\(kindFilter.title)")
+        .accessibilityLabel("筛选：\(scope == .documents ? "全部" : scope.title)，\(kindFilter.title)")
+        .accessibilityIdentifier("library-filter-menu")
     }
 
     @ViewBuilder
@@ -1036,7 +980,7 @@ private struct LibraryContentPage: View {
 
     @ViewBuilder
     private var content: some View {
-        ScrollView {
+        LibraryItemsScrollView(browsingState: scrollState) {
             if layoutMode == .list {
                 LazyVStack(spacing: 0) {
                     ForEach(folders) { folder in
@@ -1050,6 +994,7 @@ private struct LibraryContentPage: View {
                             onTap: { tapFolder(folder) },
                             onCommand: onCommand
                         )
+                        .id(folder.id)
                     }
                     ForEach(documents) { document in
                         LibraryDocumentListRow(
@@ -1067,6 +1012,7 @@ private struct LibraryContentPage: View {
                             onTap: { tapDocument(document) },
                             onCommand: onCommand
                         )
+                        .id(document.id)
                     }
                 }
                 .padding(.horizontal, isCompactLayout ? 16 : 20)
@@ -1088,6 +1034,7 @@ private struct LibraryContentPage: View {
                             onTap: { tapFolder(folder) },
                             onCommand: onCommand
                         )
+                        .id(folder.id)
                     }
                     ForEach(documents) { document in
                         LibraryDocumentGridCard(
@@ -1105,14 +1052,14 @@ private struct LibraryContentPage: View {
                             onTap: { tapDocument(document) },
                             onCommand: onCommand
                         )
+                        .id(document.id)
                     }
                 }
-                .padding(.horizontal, isCompactLayout ? 12 : 20)
+                .padding(.horizontal, isCompactLayout ? 16 : 20)
                 .padding(.vertical, 12)
             }
         }
-        .contentMargins(.horizontal, 0, for: .scrollContent)
-        .scrollIndicators(.hidden)
+        .id([scope.rawValue, folderID ?? "", searchText, kindFilter.rawValue])
     }
 
     private var emptyState: some View {
@@ -1302,61 +1249,41 @@ private struct LibraryContentPage: View {
     }
 }
 
-private struct LibrarySidebar: View {
-    @ObservedObject var documentStore: DrawingDocumentStore
-    let scope: LibraryScope
-    let selectedFolderID: String?
-    let onSelectScope: (LibraryScope) -> Void
+/// User-driven offsets are saved independently of SwiftUI's transient scroll target binding.
+/// Mounting/unmounting the library must not replace the saved position with its initial zero.
+private struct LibraryItemsScrollView<Content: View>: View {
+    let browsingState: LibraryBrowserState
+    let content: Content
+    @State private var position: ScrollPosition
+    @State private var isUserScrolling = false
 
-    var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 4) {
-                ForEach(LibraryScope.allCases) { item in
-                    Button {
-                        onSelectScope(item)
-                    } label: {
-                        HStack(spacing: 9) {
-                            Label(item.title, systemImage: item.symbol)
-                            Spacer()
-                            if item == .trash, trashCount > 0 {
-                                Text("\(trashCount)")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(TiyiNoteTheme.textSecondary)
-                                    .padding(.horizontal, 6)
-                                    .frame(height: 20)
-                                    .background(TiyiNoteTheme.surfaceRaised, in: Capsule())
-                            }
-                        }
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(
-                            scope == item && selectedFolderID == nil
-                                ? TiyiNoteTheme.selectionBlue
-                                : TiyiNoteTheme.textPrimary
-                        )
-                        .padding(.horizontal, 10)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 38)
-                        .background(
-                            scope == item && selectedFolderID == nil
-                                ? TiyiNoteTheme.selectionBackground
-                                : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 2)
-        }
-        .contentMargins(.horizontal, 0, for: .scrollContent)
-        .scrollIndicators(.hidden)
-        .foregroundStyle(TiyiNoteTheme.textPrimary)
+    init(browsingState: LibraryBrowserState, @ViewBuilder content: () -> Content) {
+        self.browsingState = browsingState
+        self.content = content()
+        var restoredPosition = ScrollPosition(edge: .top)
+        // Restore a viewport offset, not a row anchor. Registering the padded lazy rows as scroll
+        // targets lets SwiftUI align their unpadded bounds and consume the page's leading gutter.
+        restoredPosition.scrollTo(point: CGPoint(x: 0, y: browsingState.scrollOffset))
+        _position = State(initialValue: restoredPosition)
     }
 
-    private var trashCount: Int {
-        documentStore.trashedFolders.count + documentStore.trashedDocuments.count
+    var body: some View {
+        ScrollView { content }
+            .contentMargins(.horizontal, 0, for: .scrollContent)
+            .scrollIndicators(.hidden)
+            .scrollDismissesKeyboard(.immediately)
+            .scrollPosition($position)
+            .onScrollPhaseChange { _, phase in
+                isUserScrolling = phase == .interacting || phase == .decelerating
+            }
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentOffset.y + geometry.contentInsets.top
+            } action: { _, offset in
+                if isUserScrolling {
+                    browsingState.scrollOffset = max(0, offset)
+                }
+            }
+            .accessibilityIdentifier("library-items")
     }
 }
 
@@ -1702,17 +1629,40 @@ private struct LibraryDocumentGridCard: View {
     }
 }
 
+/// Use one visible preview size as well as one column size. Fitting each page to a differently
+/// proportioned image box makes portrait PDFs narrower than canvases and folder icons.
+private struct LibraryListArtwork<Content: View>: View {
+    var isDocument = false
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .frame(width: 40, height: 40)
+            .background(isDocument ? Color.white : Color.clear)
+            .clipped()
+            .overlay {
+                if isDocument {
+                    Rectangle()
+                        .strokeBorder(TiyiNoteTheme.hairline, lineWidth: 0.5)
+                }
+            }
+            .frame(width: 48, height: 48, alignment: .leading)
+    }
+}
+
 private struct FolderListArtwork: View {
     let folder: LibraryFolder
 
     var body: some View {
-        Image(systemName: folder.icon.systemImageName)
-            .font(.system(size: 34, weight: .semibold))
-            .foregroundStyle(folder.color.swiftUIColor.gradient)
-            .frame(width: 48, height: 48, alignment: .leading)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("\(folder.title)文件夹外观")
-            .accessibilityValue("颜色 \(folder.color.title)；图标 \(folder.icon.title)")
+        LibraryListArtwork {
+            Image(systemName: folder.icon.systemImageName)
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(folder.color.swiftUIColor.gradient)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(folder.title)文件夹外观")
+        .accessibilityValue("颜色 \(folder.color.title)；图标 \(folder.icon.title)")
     }
 }
 
@@ -1721,22 +1671,21 @@ private struct DocumentListArtwork: View {
     let thumbnail: UIImage?
 
     var body: some View {
-        Group {
+        LibraryListArtwork(isDocument: true) {
             if let thumbnail {
                 Image(uiImage: thumbnail)
                     .resizable()
-                    .scaledToFit()
-                    .frame(width: 40, height: 48, alignment: .leading)
+                    .scaledToFill()
             } else {
                 Image(systemName: document.kind == .canvas
                     ? "rectangle.and.pencil.and.ellipsis"
                     : "doc.richtext.fill")
-                    .font(.system(size: 30, weight: .medium))
+                    .font(.system(size: 24, weight: .medium))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
-                    .frame(width: 40, height: 48, alignment: .leading)
             }
         }
-        .frame(width: 48, height: 48, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(document.title)缩略图")
     }
 }
 
@@ -1815,43 +1764,6 @@ private struct LibraryBreadcrumbs: View {
             .font(.system(size: 13, weight: .medium))
         }
         .frame(height: 26)
-    }
-}
-
-private struct LibraryScopeBar: View {
-    let scope: LibraryScope
-    let onSelect: (LibraryScope) -> Void
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(LibraryScope.allCases) { item in
-                Button {
-                    onSelect(item)
-                } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: item.symbol)
-                            .font(.system(size: 19, weight: .semibold))
-                        Text(item.title)
-                            .font(.caption2.weight(.semibold))
-                    }
-                    .foregroundStyle(scope == item ? TiyiNoteTheme.selectionBlue : TiyiNoteTheme.textSecondary)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 54)
-                    .background(
-                        scope == item ? TiyiNoteTheme.selectionBackground : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(5)
-        .glassEffect(
-            .regular,
-            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
-        )
-        .padding(.horizontal, 18)
-        .padding(.vertical, 8)
     }
 }
 
@@ -2384,7 +2296,7 @@ private struct CloudSyncStatusSheet: View {
     }
 }
 
-private enum LibraryScope: String, CaseIterable, Identifiable {
+enum LibraryScope: String, CaseIterable, Identifiable {
     case documents
     case favorites
     case trash
@@ -2413,7 +2325,7 @@ private enum LibraryLayoutMode: String {
     case grid
 }
 
-private enum LibraryKindFilter: String, CaseIterable, Identifiable {
+enum LibraryKindFilter: String, CaseIterable, Identifiable {
     case all
     case pdf
     case canvas

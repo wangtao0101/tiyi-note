@@ -261,6 +261,11 @@ actor CloudLibrarySyncCoordinator {
     private var isSynchronizing = false
     private var needsAnotherPass = false
     private var scheduledTask: Task<Void, Never>?
+    private var scheduledTaskToken: UUID?
+    /// Automatic maintenance is suspended during an active Pencil interaction and while entering
+    /// the editor. RootWorkspaceView starts it only after the ten-second local checkpoint is fully
+    /// durable. Manual "现在同步" and collaboration setup use explicit entry points.
+    private var automaticSyncSuspended = false
     private var excludedDocumentIDs: Set<String> = []
     private var currentParticipantID: String?
     private var activeParticipantIDs: Set<String> = []
@@ -313,69 +318,105 @@ actor CloudLibrarySyncCoordinator {
     }
 
     func syncNowOrThrow() async throws {
-        scheduledTask?.cancel()
-        scheduledTask = nil
-        try await performSyncPass()
+        _ = await cancelAutomaticTaskAndWait()
+        try await performSyncPass(isAutomatic: false)
     }
 
     /// Debounces rapid PencilKit/library changes into one synchronization pass. Cloud export can
     /// enumerate a large collaboration journal, so automatic work waits for a sustained quiet
-    /// window; explicit “立即同步” and lifecycle syncs still start immediately.
+    /// window; only an explicit user-requested sync starts immediately.
     func scheduleSync(after delay: TimeInterval = 5.0) async {
-        scheduledTask?.cancel()
+        guard !automaticSyncSuspended else { return }
+        cancelAutomaticTask()
         await reportStatus(.scheduled)
-        let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
-        scheduledTask = Task { [weak self] in
-            if nanoseconds > 0 {
-                try? await Task.sleep(nanoseconds: nanoseconds)
-            }
-            guard !Task.isCancelled else { return }
-            await self?.synchronizeReportingErrors()
-        }
+        scheduleAutomaticTask(after: delay)
     }
 
     /// Starts immediately. Errors become status updates; local files are never discarded on failure.
     func syncNow() async {
-        scheduledTask?.cancel()
-        scheduledTask = nil
-        await synchronizeReportingErrors()
+        _ = await cancelAutomaticTaskAndWait()
+        await synchronizeReportingErrors(isAutomatic: false)
     }
 
-    func cancelScheduledSync() async {
-        scheduledTask?.cancel()
-        scheduledTask = nil
+    /// An immediate maintenance pass used by foreground polling. Unlike the user-requested entry
+    /// point, it observes editor suspension and the caller's cancellation state at every phase.
+    func syncAutomaticallyNow() async {
+        guard !automaticSyncSuspended else { return }
+        // Route even an immediate polling pass through the retained automatic-task handle. That
+        // lets entering the editor cancel *and drain* the pass before PencilKit becomes visible.
+        await scheduleSync(after: 0)
+    }
+
+    /// Returns whether an automatic pass was waiting or already running. Retaining the task handle
+    /// for the complete pass is important: clearing it when the timer fires made Pencil-down unable
+    /// to cancel an in-flight retry, which allowed remote PDF rebuilding to block handwriting.
+    @discardableResult
+    func cancelScheduledSync() async -> Bool {
+        guard await cancelAutomaticTaskAndWait() else { return false }
         if !isSynchronizing {
             await reportStatus(.idle)
         }
+        return true
+    }
+
+    /// Unlike a debounce, suspension also prevents transient-error retries from waking up behind
+    /// the editor and cancels an automatic pass that has already left its timer.
+    @discardableResult
+    func suspendAutomaticSync() async -> Bool {
+        automaticSyncSuspended = true
+        needsAnotherPass = false
+        // Cancellation is cooperative. Wait for the tracked pass to leave its final MainActor
+        // merge before returning so the caller can safely reveal an editable canvas afterwards.
+        let cancelled = await cancelAutomaticTaskAndWait()
+        await reportStatus(.idle)
+        return cancelled
+    }
+
+    func resumeAutomaticSync() {
+        automaticSyncSuspended = false
     }
 
     /// Call after CKAccountChanged. A fresh account must never reuse the previous zone token/manifest.
     func resetForAccountChange() async {
-        scheduledTask?.cancel()
-        scheduledTask = nil
+        cancelAutomaticTask()
         zoneIsReady = false
         clearChangeToken()
         clearUploadManifest()
-        await scheduleSync(after: 0)
+        if !automaticSyncSuspended {
+            await scheduleSync(after: 0)
+        }
     }
 
-    private func synchronizeReportingErrors() async {
+    private func synchronizeReportingErrors(isAutomatic: Bool) async {
+        if isAutomatic {
+            do {
+                try requireAutomaticSyncMayContinue()
+            } catch {
+                await reportStatus(.idle)
+                return
+            }
+        }
         if isSynchronizing {
-            needsAnotherPass = true
+            if !isAutomatic || !automaticSyncSuspended {
+                needsAnotherPass = true
+            }
             return
         }
 
         isSynchronizing = true
-        scheduledTask = nil
         await reportStatus(.syncing)
         var retryDelay: TimeInterval?
 
         do {
             repeat {
                 needsAnotherPass = false
-                try await performSyncPass()
+                try await performSyncPass(isAutomatic: isAutomatic)
             } while needsAnotherPass
             await reportStatus(.succeeded(Date()))
+        } catch is CancellationError {
+            // Pencil input and the editor transition intentionally cancel automatic maintenance.
+            // Cancellation is neither an error nor a reason to create another retry.
+            await reportStatus(.idle)
         } catch {
             let cocoaError = error as NSError
             logger.error(
@@ -397,15 +438,17 @@ actor CloudLibrarySyncCoordinator {
         }
 
         isSynchronizing = false
-        if let retryDelay {
+        if let retryDelay, !automaticSyncSuspended, !Task.isCancelled {
             scheduleRetry(after: retryDelay)
         }
     }
 
-    private func performSyncPass() async throws {
+    private func performSyncPass(isAutomatic: Bool) async throws {
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         await CloudLibrarySyncTransactionGate.shared.acquire()
         do {
-            try await performUnlockedSyncPass()
+            if isAutomatic { try requireAutomaticSyncMayContinue() }
+            try await performUnlockedSyncPass(isAutomatic: isAutomatic)
             await CloudLibrarySyncTransactionGate.shared.release()
         } catch {
             await CloudLibrarySyncTransactionGate.shared.release()
@@ -413,15 +456,21 @@ actor CloudLibrarySyncCoordinator {
         }
     }
 
-    private func performUnlockedSyncPass() async throws {
+    private func performUnlockedSyncPass(isAutomatic: Bool) async throws {
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         guard dataSource != nil else { throw SyncError.noDataSource }
         let accountStatus = try await container.accountStatus()
         guard accountStatus == .available else { throw SyncError.accountUnavailable }
 
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         try await ensureZone()
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         await refreshShareParticipants()
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         await ensurePushSubscription()
-        try await downloadAndApplyChanges()
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
+        try await downloadAndApplyChanges(isAutomatic: isAutomatic)
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         if allowsUploads {
             try await uploadPendingChanges()
         }
@@ -519,20 +568,26 @@ actor CloudLibrarySyncCoordinator {
         return recordName
     }
 
-    private func downloadAndApplyChanges() async throws {
+    private func downloadAndApplyChanges(isAutomatic: Bool) async throws {
         var token = loadChangeToken()
         var retriedExpiredToken = false
         var retriedMissingZone = false
 
         while true {
+            if isAutomatic { try requireAutomaticSyncMayContinue() }
             let stagingDirectory = try makeDownloadStagingDirectory()
             do {
                 let download = try await fetchCompleteChangeSet(
                     since: token,
                     stagingDirectory: stagingDirectory
                 )
+                if isAutomatic { try requireAutomaticSyncMayContinue() }
                 if !download.changes.isEmpty {
-                    try await applyDownloadedChanges(download.changes)
+                    try await applyDownloadedChanges(
+                        download.changes,
+                        isAutomatic: isAutomatic
+                    )
+                    if isAutomatic { try requireAutomaticSyncMayContinue() }
                     try await updateManifestForDownloadedChanges(download.changes)
                 }
                 // Commit only the final page token, after the complete cross-page graph and all
@@ -1456,7 +1511,11 @@ actor CloudLibrarySyncCoordinator {
         _ = try result.get()
     }
 
-    private func applyDownloadedChanges(_ changes: [DownloadedChange]) async throws {
+    private func applyDownloadedChanges(
+        _ changes: [DownloadedChange],
+        isAutomatic: Bool = false
+    ) async throws {
+        if isAutomatic { try requireAutomaticSyncMayContinue() }
         guard let dataSource else { throw SyncError.noDataSource }
         var snapshot = await dataSource.exportLibrarySnapshot()
         let changes = topologicallySorted(changes, baseSnapshot: snapshot)
@@ -1739,9 +1798,11 @@ actor CloudLibrarySyncCoordinator {
             return operation
         }
         if !collaborationOperations.isEmpty {
+            if isAutomatic { try requireAutomaticSyncMayContinue() }
             try await dataSource.applyRemoteCollaborationOperations(collaborationOperations)
         }
         if !pageChangedDocumentIDs.isEmpty {
+            if isAutomatic { try requireAutomaticSyncMayContinue() }
             try await dataSource.finalizeRemotePageChanges(for: pageChangedDocumentIDs)
         }
     }
@@ -2573,12 +2634,68 @@ actor CloudLibrarySyncCoordinator {
     }
 
     private func scheduleRetry(after delay: TimeInterval) {
-        scheduledTask?.cancel()
-        let nanoseconds = UInt64(max(delay, 2) * 1_000_000_000)
+        guard !automaticSyncSuspended, !Task.isCancelled else { return }
+        cancelAutomaticTask()
+        scheduleAutomaticTask(after: max(delay, 2))
+    }
+
+    private func scheduleAutomaticTask(after delay: TimeInterval) {
+        let token = UUID()
+        let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+        scheduledTaskToken = token
         scheduledTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
-            await self?.synchronizeReportingErrors()
+            do {
+                if nanoseconds > 0 {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                }
+                try Task.checkCancellation()
+            } catch {
+                await self?.finishAutomaticTask(token: token)
+                return
+            }
+            await self?.runAutomaticTask(token: token)
+        }
+    }
+
+    private func runAutomaticTask(token: UUID) async {
+        guard scheduledTaskToken == token, !automaticSyncSuspended else {
+            finishAutomaticTask(token: token)
+            return
+        }
+        await synchronizeReportingErrors(isAutomatic: true)
+        finishAutomaticTask(token: token)
+    }
+
+    private func finishAutomaticTask(token: UUID) {
+        guard scheduledTaskToken == token else { return }
+        scheduledTask = nil
+        scheduledTaskToken = nil
+    }
+
+    @discardableResult
+    private func cancelAutomaticTask() -> Bool {
+        guard scheduledTask != nil else { return false }
+        scheduledTask?.cancel()
+        scheduledTask = nil
+        scheduledTaskToken = nil
+        return true
+    }
+
+    /// Cancels the retained automatic pass and provides a real quiescence barrier. Merely clearing
+    /// the handle is insufficient because a CloudKit callback may already be applying a downloaded
+    /// page on MainActor when the user opens the editor.
+    @discardableResult
+    private func cancelAutomaticTaskAndWait() async -> Bool {
+        let task = scheduledTask
+        let cancelled = cancelAutomaticTask()
+        await task?.value
+        return cancelled
+    }
+
+    private func requireAutomaticSyncMayContinue() throws {
+        try Task.checkCancellation()
+        if automaticSyncSuspended {
+            throw CancellationError()
         }
     }
 }

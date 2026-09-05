@@ -2,9 +2,18 @@ import PencilKit
 import SwiftUI
 
 struct PencilCanvasView: UIViewRepresentable {
-    @ObservedObject var controller: CanvasController
+    /// The page owns this reference and the toolbar history controls observe its published
+    /// state. The representable itself only embeds the stable PKCanvasView; subscribing here would
+    /// make SwiftUI revisit the UIKit bridge when Undo first becomes available during handwriting.
+    let controller: CanvasController
     let logicalPageSize: CGSize
+    let logicalViewport: CGRect?
+    let isCurrentPage: Bool
     let onFingerLongPress: (CGPoint) -> Void
+    let onFingerPinchChanged: (CGFloat) -> Void
+    let onFingerPinchEnded: (CGFloat) -> Void
+    let onFingerPinchCancelled: () -> Void
+    let onCanvasNavigation: (CanvasNavigationChange) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -12,10 +21,19 @@ struct PencilCanvasView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PageCanvasContainerView {
         let view = PageCanvasContainerView(
-            canvasView: controller.canvasView,
-            logicalPageSize: logicalPageSize
+            controller: controller,
+            logicalPageSize: logicalPageSize,
+            logicalViewport: logicalViewport
         )
+        let coordinator = context.coordinator
+        view.onNavigationAncestorFound = { [weak coordinator, weak view] pager in
+            guard let view else { return }
+            coordinator?.configureCanvasNavigation(on: pager, container: view)
+        }
         context.coordinator.installLongPressGesture(on: view)
+        if logicalViewport == nil {
+            context.coordinator.installFingerPinchGesture(on: view)
+        }
         return view
     }
 
@@ -24,14 +42,96 @@ struct PencilCanvasView: UIViewRepresentable {
         if uiView.logicalPageSize != logicalPageSize {
             uiView.logicalPageSize = logicalPageSize
         }
+        uiView.logicalViewport = logicalViewport
+        uiView.configureAncestorNavigation()
+    }
+
+    static func dismantleUIView(_ uiView: PageCanvasContainerView, coordinator: Coordinator) {
+        coordinator.removeCanvasNavigation()
+        uiView.onNavigationAncestorFound = nil
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: PencilCanvasView
+        private weak var navigationHost: UIView?
+        private weak var canvasContainer: UIView?
+        private var canvasPan: UIPanGestureRecognizer?
+        private var canvasPinch: UIPinchGestureRecognizer?
 
         init(parent: PencilCanvasView) {
             self.parent = parent
         }
+
+        func configureCanvasNavigation(on host: UIView, container: UIView) {
+            guard parent.logicalViewport != nil, parent.isCurrentPage else {
+                removeCanvasNavigation()
+                return
+            }
+            canvasContainer = container
+            guard navigationHost !== host else { return }
+            removeCanvasNavigation()
+            canvasContainer = container
+            navigationHost = host
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleCanvasPan(_:)))
+            pan.minimumNumberOfTouches = 2
+            pan.maximumNumberOfTouches = 2
+            pan.allowedScrollTypesMask = .all
+            let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handleCanvasPinch(_:)))
+            for gesture in [pan, pinch] as [UIGestureRecognizer] {
+                gesture.allowedTouchTypes = [
+                    NSNumber(value: UITouch.TouchType.direct.rawValue),
+                    NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+                ]
+                gesture.cancelsTouchesInView = false
+                gesture.delaysTouchesBegan = false
+                gesture.delaysTouchesEnded = false
+                gesture.delegate = self
+                host.addGestureRecognizer(gesture)
+            }
+            canvasPan = pan
+            canvasPinch = pinch
+        }
+
+        func removeCanvasNavigation() {
+            if let canvasPan { navigationHost?.removeGestureRecognizer(canvasPan) }
+            if let canvasPinch { navigationHost?.removeGestureRecognizer(canvasPinch) }
+            canvasPan = nil
+            canvasPinch = nil
+            navigationHost = nil
+            canvasContainer = nil
+        }
+
+        @objc private func handleCanvasPan(_ gesture: UIPanGestureRecognizer) {
+            guard let canvasContainer else { return }
+            if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
+                let translation = gesture.translation(in: canvasContainer)
+                gesture.setTranslation(.zero, in: canvasContainer)
+                if translation != .zero { parent.onCanvasNavigation(.pan(translation)) }
+            }
+            if gesture.state == .ended || gesture.state == .cancelled {
+                parent.onCanvasNavigation(.finished)
+            }
+        }
+
+        @objc private func handleCanvasPinch(_ gesture: UIPinchGestureRecognizer) {
+            guard let canvasContainer else { return }
+            if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
+                let magnification = gesture.scale
+                gesture.scale = 1
+                parent.onCanvasNavigation(.zoom(magnification, anchor: gesture.location(in: canvasContainer)))
+            }
+            if gesture.state == .ended || gesture.state == .cancelled {
+                parent.onCanvasNavigation(.finished)
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            if gestureRecognizer === canvasPan || gestureRecognizer === canvasPinch {
+                return !parent.controller.isUsingTool || CanvasController.allowsFingerDrawing
+            }
+            return true
+        }
+
 
         func installLongPressGesture(on view: UIView) {
             let gesture = UILongPressGestureRecognizer(
@@ -55,9 +155,41 @@ struct PencilCanvasView: UIViewRepresentable {
             view.addGestureRecognizer(gesture)
         }
 
+        /// SwiftUI's `MagnificationGesture` participates in gesture arbitration for Apple Pencil
+        /// contacts even though zoom needs two fingers. Installing a UIKit recognizer directly on
+        /// the canvas lets us explicitly accept `.direct` touches only, keeping it completely out
+        /// of PencilKit's low-latency event path.
+        func installFingerPinchGesture(on view: UIView) {
+            let gesture = UIPinchGestureRecognizer(
+                target: self,
+                action: #selector(handleFingerPinch(_:))
+            )
+            gesture.allowedTouchTypes = [
+                NSNumber(value: UITouch.TouchType.direct.rawValue)
+            ]
+            gesture.cancelsTouchesInView = false
+            gesture.delaysTouchesBegan = false
+            gesture.delaysTouchesEnded = false
+            gesture.delegate = self
+            view.addGestureRecognizer(gesture)
+        }
+
         @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
             guard gesture.state == .began, let view = gesture.view else { return }
             parent.onFingerLongPress(gesture.location(in: view))
+        }
+
+        @objc private func handleFingerPinch(_ gesture: UIPinchGestureRecognizer) {
+            switch gesture.state {
+            case .began, .changed:
+                parent.onFingerPinchChanged(gesture.scale)
+            case .ended:
+                parent.onFingerPinchEnded(gesture.scale)
+            case .cancelled, .failed:
+                parent.onFingerPinchCancelled()
+            default:
+                break
+            }
         }
 
         func gestureRecognizer(
@@ -70,17 +202,35 @@ struct PencilCanvasView: UIViewRepresentable {
 }
 
 final class PageCanvasContainerView: UIView {
-    let canvasView: PKCanvasView
+    private struct LayoutConfiguration: Equatable {
+        let boundsSize: CGSize
+        let logicalPageSize: CGSize
+        let logicalViewport: CGRect?
+    }
+
+    let controller: CanvasController
+    var canvasView: PKCanvasView { controller.canvasView }
+    private var appliedLayoutConfiguration: LayoutConfiguration?
     var logicalPageSize: CGSize {
         didSet {
             guard logicalPageSize != oldValue else { return }
+            appliedLayoutConfiguration = nil
             setNeedsLayout()
         }
     }
+    var logicalViewport: CGRect? {
+        didSet {
+            guard logicalViewport != oldValue else { return }
+            appliedLayoutConfiguration = nil
+            setNeedsLayout()
+        }
+    }
+    var onNavigationAncestorFound: ((UIView) -> Void)?
 
-    init(canvasView: PKCanvasView, logicalPageSize: CGSize) {
-        self.canvasView = canvasView
+    init(controller: CanvasController, logicalPageSize: CGSize, logicalViewport: CGRect?) {
+        self.controller = controller
         self.logicalPageSize = logicalPageSize
+        self.logicalViewport = logicalViewport
         super.init(frame: .zero)
         backgroundColor = .clear
         isOpaque = false
@@ -94,24 +244,183 @@ final class PageCanvasContainerView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        guard logicalPageSize.width > 0, logicalPageSize.height > 0 else { return }
+        guard bounds.width > 0,
+              bounds.height > 0,
+              logicalPageSize.width > 0,
+              logicalPageSize.height > 0 else { return }
 
-        let scaleX = bounds.width / logicalPageSize.width
-        let scaleY = bounds.height / logicalPageSize.height
-        let targetBounds = CGRect(origin: .zero, size: logicalPageSize)
-        let targetCenter = CGPoint(x: bounds.midX, y: bounds.midY)
-        let targetTransform = CGAffineTransform(scaleX: scaleX, y: scaleY)
-        guard canvasView.bounds != targetBounds
-                || canvasView.center != targetCenter
-                || canvasView.contentSize != logicalPageSize
-                || canvasView.contentOffset != .zero
-                || canvasView.transform != targetTransform else { return }
+        let visibleSize = logicalViewport?.size ?? logicalPageSize
+        let scaleX = bounds.width / visibleSize.width
+        let scaleY = bounds.height / visibleSize.height
+        let targetScale = min(scaleX, scaleY)
+        let configuration = LayoutConfiguration(
+            boundsSize: bounds.size,
+            logicalPageSize: logicalPageSize,
+            logicalViewport: logicalViewport
+        )
+        guard appliedLayoutConfiguration != configuration else { return }
+        appliedLayoutConfiguration = configuration
 
+        // PKCanvasView is itself a UIScrollView and has a native tiled zoom path. Scaling its
+        // complete layer with CGAffineTransform forces Core Animation to composite the transparent
+        // live-ink surface as one transformed layer on every Pencil sample. Keep the view at its
+        // displayed size and express the logical-page mapping through PencilKit's own zoom scale.
+        // Do not compare/reset live UIScrollView properties on every layout pass: PencilKit may
+        // adjust those internally while rendering a stroke, and writing zoomScale back at that
+        // moment causes an expensive tile/layout transaction under the Pencil.
         canvasView.transform = .identity
-        canvasView.bounds = targetBounds
-        canvasView.center = targetCenter
-        canvasView.contentSize = logicalPageSize
-        canvasView.contentOffset = .zero
-        canvasView.transform = targetTransform
+        canvasView.frame = bounds
+        canvasView.minimumZoomScale = min(0.05, targetScale)
+        canvasView.maximumZoomScale = max(10, targetScale)
+        let localViewport = logicalViewport.map { controller.prepareUnboundedViewport($0) }
+        if let viewport = localViewport {
+            // PencilKit's writable tile space must be positive. The controller translates this
+            // local origin at editing/persistence boundaries; the camera stays in world space.
+            canvasView.contentInsetAdjustmentBehavior = .never
+            canvasView.contentSize = CGSize(
+                width: max(logicalPageSize.width - controller.canvasWorldOrigin.x, viewport.maxX + viewport.width),
+                height: max(logicalPageSize.height - controller.canvasWorldOrigin.y, viewport.maxY + viewport.height)
+            )
+            canvasView.contentInset = .zero
+        } else {
+            canvasView.contentSize = logicalPageSize
+        }
+        canvasView.zoomScale = targetScale
+        canvasView.showsHorizontalScrollIndicator = false
+        canvasView.showsVerticalScrollIndicator = false
+        canvasView.contentOffset = localViewport.map {
+            CGPoint(x: $0.minX * targetScale, y: $0.minY * targetScale)
+        } ?? .zero
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil else { return }
+
+        // SwiftUI may finish installing its private scroll view one run-loop turn after this page
+        // enters the window. Coordinate both now and once more after that installation completes.
+        configureAncestorNavigation()
+        DispatchQueue.main.async { [weak self] in
+            self?.configureAncestorNavigation()
+        }
+    }
+
+    func configureAncestorNavigation() {
+        let allowedNavigationTouches = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        ]
+        var ancestor = superview
+        var contentHost: UIView = self
+        var hasConfiguredPagePan = false
+        while let view = ancestor {
+            if let scrollView = view as? UIScrollView, scrollView !== canvasView {
+                // The nearest scroll view pans the zoomed paper with two fingers. Its parent is
+                // the fixed-height pager: one finger turns pages, never zooms or shifts the paper.
+                // Simulator mouse drawing still uses one contact, so that development input mode
+                // reserves it for ink. Pencil-only tests exercise the shipping navigation policy.
+                let isPagePan = logicalViewport == nil && !hasConfiguredPagePan
+                let touchCount = isPagePan || canvasView.drawingPolicy == .anyInput ? 2 : 1
+                scrollView.panGestureRecognizer.allowedTouchTypes = allowedNavigationTouches
+                scrollView.panGestureRecognizer.minimumNumberOfTouches = touchCount
+                scrollView.panGestureRecognizer.maximumNumberOfTouches = touchCount
+                if !isPagePan {
+                    scrollView.isDirectionalLockEnabled = true
+                    if (touchCount == 1 || logicalViewport != nil),
+                       scrollView.gestureRecognizers?.contains(where: {
+                           $0 is PageMultiTouchPagingGuard
+                       }) != true {
+                        scrollView.addGestureRecognizer(PageMultiTouchPagingGuard(pager: scrollView))
+                    }
+                    // Keep camera gestures inside the scroll content. HostingScrollView owns
+                    // and arbitrates its own recognizers; the content host also covers objects
+                    // and text overlays without joining that private recognizer lifecycle.
+                    onNavigationAncestorFound?(contentHost)
+                    break
+                }
+                hasConfiguredPagePan = true
+            }
+            contentHost = view
+            ancestor = view.superview
+        }
+    }
+}
+
+/// `maximumNumberOfTouches = 1` only controls whether a pan can begin. Once a finger has
+/// started paging, adding a second finger does not stop that pan. Observe the entire contact
+/// sequence on the pager (including the margins) and suspend only its pan until every finger
+/// lifts. A pinch recognizer ends as soon as either finger lifts, which is too early to unlock.
+private final class PageMultiTouchPagingGuard: UIGestureRecognizer {
+    private weak var pager: UIScrollView?
+    private var activeTouches: Set<UITouch> = []
+    private var initialContentOffset: CGPoint?
+    private var isPagingLocked = false
+    private var shouldRestorePan = false
+
+    init(pager: UIScrollView) {
+        self.pager = pager
+        super.init(target: nil, action: nil)
+        allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    // This observer never competes with PencilKit, page-object gestures, pinching, or page panning.
+    // It must also survive an already-recognized single-finger pan to see the second contact.
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        if activeTouches.isEmpty {
+            initialContentOffset = pager?.contentOffset
+        }
+        activeTouches.formUnion(touches)
+        guard activeTouches.count > 1, !isPagingLocked, let pager else { return }
+
+        isPagingLocked = true
+        shouldRestorePan = pager.panGestureRecognizer.isEnabled
+        pager.panGestureRecognizer.isEnabled = false
+        if let initialContentOffset {
+            // Cancel any tentative page drag that began before the second finger arrived.
+            pager.setContentOffset(initialContentOffset, animated: false)
+        }
+        state = .began
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        if isPagingLocked {
+            state = .changed
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        finishTouches(touches)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        finishTouches(touches)
+    }
+
+    override func reset() {
+        restorePaging()
+        activeTouches.removeAll()
+        initialContentOffset = nil
+        isPagingLocked = false
+        super.reset()
+    }
+
+    private func finishTouches(_ touches: Set<UITouch>) {
+        activeTouches.subtract(touches)
+        guard activeTouches.isEmpty else { return }
+        restorePaging()
+        state = isPagingLocked ? .ended : .failed
+    }
+
+    private func restorePaging() {
+        if shouldRestorePan {
+            pager?.panGestureRecognizer.isEnabled = true
+            shouldRestorePan = false
+        }
     }
 }

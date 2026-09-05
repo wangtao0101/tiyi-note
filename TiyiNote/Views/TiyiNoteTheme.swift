@@ -14,6 +14,17 @@ enum TiyiNoteTheme {
         light: rgb(1.000, 1.000, 1.000),
         dark: rgb(0.075, 0.078, 0.087)
     )
+    /// The document workspace deliberately keeps one deep-blue chrome in both appearances,
+    /// matching the two-level Goodnotes document and tool bars instead of the white library UI.
+    static let documentChrome = Color(red: 0.035, green: 0.112, blue: 0.245)
+    static let documentToolbar = Color(red: 0.045, green: 0.151, blue: 0.318)
+    /// Goodnotes uses a very light neutral desk around white paper. Keeping this distinct from the
+    /// sheet makes its restrained left-edge shadow legible without returning to a dark canvas.
+    static let documentWorkspace = Color(uiColor: .systemGray6)
+    static let documentChromeForeground = Color.white.opacity(0.92)
+    static let documentChromeMuted = Color.white.opacity(0.62)
+    static let documentToolSelection = Color(red: 0.800, green: 0.906, blue: 0.988)
+    static let documentChromeDanger = Color(red: 1.000, green: 0.500, blue: 0.455)
     static let sidebar = adaptive(
         light: rgb(0.949, 0.961, 0.976),
         dark: rgb(0.037, 0.037, 0.041)

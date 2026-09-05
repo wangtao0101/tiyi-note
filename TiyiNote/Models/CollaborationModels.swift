@@ -190,6 +190,16 @@ struct CollaborationReplicaClock: Codable, Hashable, Sendable {
         version.observe(stamp.dot)
         lamport = max(lamport, stamp.lamport)
     }
+
+    /// Incorporates a precomputed operation-log summary. Drawing diffs build this summary away
+    /// from MainActor so installing a large page history does not delay Pencil input.
+    mutating func observe(
+        frontier: CollaborationVersionVector,
+        maximumLamport: UInt64
+    ) {
+        version.formUnion(frontier)
+        lamport = max(lamport, maximumLamport)
+    }
 }
 
 struct CollaborationInkStroke: Codable, Hashable, Sendable {

@@ -5,16 +5,31 @@ import SwiftUI
 public struct TiyiDocumentsView: View {
     @StateObject private var documentStore: DrawingDocumentStore
     private let onExit: () -> Void
+    private let librarySidebar: AnyView?
 
     public init(onExit: @escaping () -> Void) {
         _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
         self.onExit = onExit
+        librarySidebar = nil
+    }
+
+    /// The host app's navigation is mounted only beside the library. Opening a document removes
+    /// that sidebar and presents the existing editor directly, without a drawer or compositing
+    /// effects around PencilKit's live surface.
+    public init<Sidebar: View>(
+        onExit: @escaping () -> Void,
+        @ViewBuilder librarySidebar: () -> Sidebar
+    ) {
+        _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
+        self.onExit = onExit
+        self.librarySidebar = AnyView(librarySidebar())
     }
 
     public var body: some View {
         RootWorkspaceView(
             documentStore: documentStore,
-            onExit: onExit
+            onExit: onExit,
+            librarySidebar: librarySidebar
         )
 #if targetEnvironment(macCatalyst)
         .background {

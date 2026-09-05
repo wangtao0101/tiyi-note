@@ -106,6 +106,7 @@ private struct TextInteractionUITestConfiguration {
 @MainActor
 private struct TextInteractionUITestHost: View {
     @StateObject private var documentStore: DrawingDocumentStore
+    @State private var libraryBrowsingState = LibraryBrowserState()
     @State private var showsWorkspace: Bool
     private let configurationToken: String
 
@@ -126,6 +127,8 @@ private struct TextInteractionUITestHost: View {
                 "canvas.markerWidth",
                 "canvas.eraserSize",
                 "canvas.eraserMode",
+                "canvas.toolPaletteDockEdge",
+                "canvas.toolPaletteDockProgress",
                 "pdfWorkspace.showsThumbnails"
             ] {
                 UserDefaults.standard.removeObject(forKey: key)
@@ -191,6 +194,17 @@ private struct TextInteractionUITestHost: View {
             try? fileManager.removeItem(at: pdfURL)
         }
         let activeDocumentID = workspacePDFDocument?.id ?? firstDocument.id
+        if configuration.token.hasPrefix("library-return-context") {
+            let folder = try! store.createFolder(named: "返回目录", in: nil)
+            for index in 0..<24 {
+                _ = try! store.createCanvas(
+                    named: String(format: "返回画板 %02d", index),
+                    in: folder.id,
+                    backgroundStyle: .blank,
+                    backgroundColor: .white
+                )
+            }
+        }
         let retainedOpenDocumentIDs = Set(
             [firstDocument.id, secondDocument.id, workspacePDFDocument?.id]
                 .compactMap { $0 }
@@ -220,6 +234,7 @@ private struct TextInteractionUITestHost: View {
             } else {
                 LibraryBrowserView(
                     documentStore: documentStore,
+                    browsingState: libraryBrowsingState,
                     onExit: nil,
                     onSyncNow: {
                         documentStore.cloudSyncDidUpdateStatus(.syncing)

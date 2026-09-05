@@ -24,13 +24,17 @@ struct PDFDocumentReaderView: View {
     let onActiveCanvasChanged: (CanvasController, Int) -> Void
 
     @State private var currentPageIndex: Int
-    @State private var requestedPageIndex: Int?
+    @State private var visiblePageID: String?
     @State private var pendingProgrammaticPageIndex: Int?
     @State private var visibleControllers: [Int: CanvasController] = [:]
     @State private var zoomScale: CGFloat = 1
-    @GestureState private var pinchMagnification: CGFloat = 1
+    @State private var liveFingerPinchMagnification: CGFloat = 1
+    @State private var canvasViewports: [String: CanvasViewport]
 
-    private let minimumZoomScale: CGFloat = 0.65
+    private var isUnboundedCanvas: Bool {
+        documentStore.document(withID: documentID)?.kind == .canvas
+    }
+    private let minimumZoomScale: CGFloat = 1
     private let maximumZoomScale: CGFloat = 3
 
     init(
@@ -69,6 +73,18 @@ struct PDFDocumentReaderView: View {
         self.onSelectTextTool = onSelectTextTool
         self.onActiveCanvasChanged = onActiveCanvasChanged
         _currentPageIndex = State(initialValue: initialPageIndex)
+        _visiblePageID = State(initialValue: documentStore.pageID(at: initialPageIndex, in: documentID))
+        var viewports: [String: CanvasViewport] = [:]
+        if documentStore.document(withID: documentID)?.kind == .canvas {
+            for page in documentStore.pages(in: documentID) {
+                viewports[page.id] = documentStore.canvasViewport(
+                    forPageID: page.id,
+                    in: documentID,
+                    referenceSize: documentStore.pageSize(at: page.orderIndex, in: documentID)
+                )
+            }
+        }
+        _canvasViewports = State(initialValue: viewports)
     }
 
     var body: some View {
@@ -94,90 +110,34 @@ struct PDFDocumentReaderView: View {
 
             pagesScrollView
         }
-        .background(TiyiNoteTheme.workspace)
+        .background(TiyiNoteTheme.documentWorkspace)
     }
 
     private var pagesScrollView: some View {
         GeometryReader { geometry in
-            let basePageWidth = min(max(geometry.size.width - 40, 280), 900)
-            let effectiveZoomScale = clampedZoomScale(zoomScale * pinchMagnification)
-            let pageWidth = basePageWidth * effectiveZoomScale
-            let contentWidth = max(pageWidth + 40, geometry.size.width)
+            let effectiveZoomScale = isUnboundedCanvas
+                ? canvasViewports[documentStore.pageID(at: currentPageIndex, in: documentID) ?? ""]?.zoomScale ?? 1
+                : displayedZoomScale(zoomScale * liveFingerPinchMagnification)
 
-            ScrollViewReader { scrollProxy in
-                ScrollView([.horizontal, .vertical], showsIndicators: true) {
-                    LazyVStack(spacing: 14) {
+            Group {
+                ScrollView(.vertical, showsIndicators: false) {
+                    LazyVStack(spacing: 0) {
                         ForEach(documentStore.pages(in: documentID)) { pageMetadata in
-                            let pageIndex = documentStore.pageIndex(
-                                for: pageMetadata.id,
-                                in: documentID
-                            ) ?? pageMetadata.orderIndex
-                            let logicalSize = documentStore.pageSize(at: pageIndex, in: documentID)
-                            let pageHeight = pageWidth * logicalSize.height / max(logicalSize.width, 1)
-
-                            PDFPageAnnotationView(
-                                documentStore: documentStore,
-                                documentID: documentID,
-                                pageID: pageMetadata.id,
-                                pageIndex: pageIndex,
-                                pageElementInsertionRequest: $pageElementInsertionRequest,
-                                searchHighlight: searchHighlight?.documentID == documentID
-                                    && searchHighlight?.pageIndex == pageIndex
-                                    ? searchHighlight
-                                    : nil,
-                                logicalPageSize: logicalSize,
-                                selectedTool: selectedTool,
-                                selectedColor: selectedColor,
-                                penWidth: penWidth,
-                                markerWidth: markerWidth,
-                                eraserSize: eraserSize,
-                                eraserMode: eraserMode,
-                                isAnnotationEditingEnabled: isAnnotationEditingEnabled,
-                                onSelectLassoTool: onSelectLassoTool,
-                                onSelectTextTool: onSelectTextTool,
-                                onReady: registerController,
-                                onRelease: unregisterController
+                            pageViewport(
+                                for: pageMetadata,
+                                size: geometry.size,
+                                scale: effectiveZoomScale
                             )
-                            .frame(width: pageWidth, height: pageHeight)
-                            .background {
-                                GeometryReader { pageGeometry in
-                                    Color.clear.preference(
-                                        key: PageOffsetPreferenceKey.self,
-                                        value: [
-                                            pageIndex: pageGeometry.frame(in: .named("pdfVerticalScroll")).minY
-                                        ]
-                                    )
-                                }
-                            }
+                            .id(pageMetadata.id)
                         }
                     }
-                    .frame(width: contentWidth)
-                    .padding(.vertical, 16)
+                    .scrollTargetLayout()
                 }
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
+                .scrollPosition(id: $visiblePageID, anchor: .top)
+                .accessibilityIdentifier("document-page-pager")
                 .coordinateSpace(name: "pdfVerticalScroll")
-                .simultaneousGesture(pinchToZoomGesture)
                 .onPreferenceChange(PageOffsetPreferenceKey.self, perform: updateCurrentPage)
-                .onAppear {
-                    let initialPage = currentPageIndex
-                    DispatchQueue.main.async {
-                        guard let pageID = documentStore.pageID(
-                            at: initialPage,
-                            in: documentID
-                        ) else { return }
-                        scrollProxy.scrollTo(pageID, anchor: .top)
-                    }
-                }
-                .onChange(of: requestedPageIndex) { _, pageIndex in
-                    guard let pageIndex,
-                          let pageID = documentStore.pageID(at: pageIndex, in: documentID)
-                    else { return }
-                    withAnimation(.easeInOut(duration: 0.28)) {
-                        scrollProxy.scrollTo(pageID, anchor: .top)
-                    }
-                    DispatchQueue.main.async {
-                        requestedPageIndex = nil
-                    }
-                }
                 .onChange(of: externalPageRequest) { _, pageIndex in
                     guard let pageIndex,
                           (0..<documentStore.pageCount(for: documentID)).contains(pageIndex)
@@ -218,7 +178,7 @@ struct PDFDocumentReaderView: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("当前缩放 \(Int((effectiveZoomScale * 100).rounded()))%，点击恢复适页")
+                        .accessibilityLabel("当前缩放 \(Int((effectiveZoomScale * 100).rounded()))%，\(isUnboundedCanvas ? "点击重置缩放" : "点击恢复适页")")
                         .accessibilityIdentifier("zoom-reset")
 
                         HStack(spacing: 6) {
@@ -228,6 +188,7 @@ struct PDFDocumentReaderView: View {
                             Text("\(currentPageIndex + 1) / \(documentStore.pageCount(for: documentID))")
                                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                                 .monospacedDigit()
+                                .accessibilityIdentifier("document-page-counter")
                         }
                         .foregroundStyle(TiyiNoteTheme.textSecondary)
                         .padding(.horizontal, 11)
@@ -239,36 +200,189 @@ struct PDFDocumentReaderView: View {
                         .allowsHitTesting(false)
                     }
                     .padding(14)
+                    .padding(.bottom, geometry.safeAreaInsets.bottom)
                 }
+            }
+        }
+        // The scroll view extends under the home-indicator safe area. Measure that same viewport
+        // for every page target, while keeping the floating controls above the safe-area inset.
+        .ignoresSafeArea(.container, edges: .bottom)
+        .clipped()
+    }
+
+    private func pageViewport(for pageMetadata: LibraryPage, size: CGSize, scale: CGFloat) -> some View {
+        let pageIndex = documentStore.pageIndex(for: pageMetadata.id, in: documentID)
+            ?? pageMetadata.orderIndex
+        let logicalSize = documentStore.pageSize(at: pageIndex, in: documentID)
+        let fittedScale = min(
+            max(size.width - 64, 1) / max(logicalSize.width, 1),
+            max(size.height - 32, 1) / max(logicalSize.height, 1)
+        )
+        let paperSize = CGSize(
+            width: logicalSize.width * fittedScale * scale,
+            height: logicalSize.height * fittedScale * scale
+        )
+        let viewport = isUnboundedCanvas
+            ? canvasViewport(for: pageMetadata, referenceSize: logicalSize)
+                .logicalBounds(in: size, referenceSize: logicalSize)
+            : nil
+        let pageView = PDFPageAnnotationView(
+            documentStore: documentStore,
+            documentID: documentID,
+            pageID: pageMetadata.id,
+            pageIndex: pageIndex,
+            pageElementInsertionRequest: $pageElementInsertionRequest,
+            searchHighlight: searchHighlight?.documentID == documentID
+                && searchHighlight?.pageIndex == pageIndex ? searchHighlight : nil,
+            allowsInitialPDFRenderDuringHandwriting: pageIndex == currentPageIndex,
+            logicalPageSize: logicalSize,
+            logicalViewport: viewport,
+            canvasBackground: isUnboundedCanvas ? pageMetadata : nil,
+            selectedTool: selectedTool,
+            selectedColor: selectedColor,
+            penWidth: penWidth,
+            markerWidth: markerWidth,
+            eraserSize: eraserSize,
+            eraserMode: eraserMode,
+            isAnnotationEditingEnabled: isAnnotationEditingEnabled,
+            onSelectLassoTool: onSelectLassoTool,
+            onSelectTextTool: onSelectTextTool,
+            onFingerPinchChanged: updateFingerPinch,
+            onFingerPinchEnded: finishFingerPinch,
+            onFingerPinchCancelled: cancelFingerPinch,
+            onCanvasNavigation: { change in
+                updateCanvasViewport(change, for: pageMetadata, size: size, referenceSize: logicalSize)
+            },
+            onReady: registerController,
+            onRelease: unregisterController
+        )
+
+        // Each paging target occupies exactly one viewport, including the space around the paper.
+        // Zoom changes only this page's inner content, so adjacent pages cannot peek into a resting
+        // viewport or move the paging boundary when their dimensions or orientations differ.
+        return Group {
+            if isUnboundedCanvas {
+                pageView
+            } else {
+                ScrollView([.horizontal, .vertical], showsIndicators: false) {
+                    pageView
+                        .frame(width: paperSize.width, height: paperSize.height)
+                        .background {
+                            ZStack(alignment: .leading) {
+                                Color.white
+                                Rectangle()
+                                    .fill(Color.black.opacity(0.11))
+                                    .frame(width: 1)
+                                    .blur(radius: 1.8)
+                                    .offset(x: -1.5)
+                            }
+                        }
+                        .overlay {
+                            Rectangle()
+                                .stroke(Color.black.opacity(0.055), lineWidth: 0.5)
+                                .allowsHitTesting(false)
+                        }
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 16)
+                        .frame(minWidth: size.width, minHeight: size.height)
+                }
+                .defaultScrollAnchor(.center)
+                .scrollDisabled(scale <= 1)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .clipped()
+        .background {
+            GeometryReader { pageGeometry in
+                Color.clear.preference(
+                    key: PageOffsetPreferenceKey.self,
+                    value: [
+                        pageIndex: pageGeometry.frame(in: .named("pdfVerticalScroll")).minY
+                    ]
+                )
             }
         }
     }
 
-    private var pinchToZoomGesture: some Gesture {
-        MagnificationGesture(minimumScaleDelta: 0.01)
-            .updating($pinchMagnification) { value, state, _ in
-                state = value
-            }
-            .onEnded { value in
-                zoomScale = clampedZoomScale(zoomScale * value)
-            }
+    private func canvasViewport(for page: LibraryPage, referenceSize: CGSize) -> CanvasViewport {
+        canvasViewports[page.id] ?? documentStore.canvasViewport(
+            forPageID: page.id, in: documentID, referenceSize: referenceSize
+        )
+    }
+
+    private func updateCanvasViewport(_ change: CanvasNavigationChange, for page: LibraryPage, size: CGSize, referenceSize: CGSize) {
+        var viewport = canvasViewport(for: page, referenceSize: referenceSize)
+        switch change {
+        case .pan(let translation):
+            viewport.pan(by: translation, in: size, referenceSize: referenceSize)
+        case .zoom(let magnification, let anchor):
+            viewport.zoom(by: magnification, around: anchor, in: size, referenceSize: referenceSize)
+        case .finished:
+            documentStore.saveCanvasViewport(viewport, forPageID: page.id, in: documentID)
+        }
+        canvasViewports[page.id] = viewport
+    }
+
+    private func updateFingerPinch(_ magnification: CGFloat) {
+        liveFingerPinchMagnification = max(magnification, 0.01)
+    }
+
+    private func finishFingerPinch(_ magnification: CGFloat) {
+        let restingScale = clampedZoomScale(zoomScale * max(magnification, 0.01))
+        withAnimation(.snappy(duration: 0.28, extraBounce: 0.08)) {
+            zoomScale = restingScale
+            liveFingerPinchMagnification = 1
+        }
+    }
+
+    private func cancelFingerPinch() {
+        withAnimation(.snappy(duration: 0.24, extraBounce: 0.06)) {
+            liveFingerPinchMagnification = 1
+        }
     }
 
     private func clampedZoomScale(_ scale: CGFloat) -> CGFloat {
         min(max(scale, minimumZoomScale), maximumZoomScale)
     }
 
+    /// Let the sheet follow a pinch beyond its limit with resistance, then return to that limit
+    /// on release. Scale the overscroll floor with the document's minimum zoom.
+    private func displayedZoomScale(_ proposedScale: CGFloat) -> CGFloat {
+        if proposedScale < minimumZoomScale {
+            let undershoot = minimumZoomScale - max(proposedScale, 0.01)
+            return max(minimumZoomScale * 0.84, minimumZoomScale - undershoot * 0.22)
+        }
+        if proposedScale > maximumZoomScale {
+            let overshoot = proposedScale - maximumZoomScale
+            return min(3.18, maximumZoomScale + overshoot * 0.12)
+        }
+        return proposedScale
+    }
+
     private func resetZoom() {
+        if isUnboundedCanvas,
+           let page = documentStore.pages(in: documentID).first(where: { $0.orderIndex == currentPageIndex }) {
+            var viewport = canvasViewport(
+                for: page, referenceSize: documentStore.pageSize(at: currentPageIndex, in: documentID)
+            )
+            viewport.zoomScale = 1
+            canvasViewports[page.id] = viewport
+            documentStore.saveCanvasViewport(viewport, forPageID: page.id, in: documentID)
+            return
+        }
         withAnimation(.easeInOut(duration: 0.22)) {
             zoomScale = 1
         }
     }
 
     private func requestPage(_ pageIndex: Int) {
+        guard let pageID = documentStore.pageID(at: pageIndex, in: documentID) else { return }
         currentPageIndex = pageIndex
         pendingProgrammaticPageIndex = pageIndex
         documentStore.setLastViewedPage(pageIndex, for: documentID)
-        requestedPageIndex = pageIndex
+        withAnimation(.easeInOut(duration: 0.28)) {
+            visiblePageID = pageID
+        }
         if let controller = visibleControllers[pageIndex] {
             onActiveCanvasChanged(controller, pageIndex)
         }
@@ -276,7 +390,7 @@ struct PDFDocumentReaderView: View {
 
     private func updateCurrentPage(_ offsets: [Int: CGFloat]) {
         guard let closestPage = offsets.min(by: {
-            abs($0.value - 16) < abs($1.value - 16)
+            abs($0.value) < abs($1.value)
         })?.key else { return }
 
         // Geometry reports the old visible page while an animated scroll is starting. Letting
@@ -298,7 +412,9 @@ struct PDFDocumentReaderView: View {
     }
 
     private func registerController(_ controller: CanvasController, for pageIndex: Int) {
-        visibleControllers[pageIndex] = controller
+        if visibleControllers[pageIndex] !== controller {
+            visibleControllers[pageIndex] = controller
+        }
         if pageIndex == currentPageIndex {
             onActiveCanvasChanged(controller, pageIndex)
         }
@@ -311,15 +427,102 @@ struct PDFDocumentReaderView: View {
     }
 }
 
-private struct PendingDrawingPersistence {
-    var drawing: PKDrawing
+private struct PendingDrawingPersistence: Sendable {
     let baseDrawing: PKDrawing
     let causalContext: CollaborationVersionVector
     var containsOnlyAppendedStrokes: Bool
+    var generation: UInt64
+}
+
+/// Mutable persistence bookkeeping is deliberately kept outside SwiftUI observation. Updating an
+/// `@State` with the latest whole drawing after every completed stroke used to invalidate the PDF,
+/// object overlays, and canvas representable even though none of their visible state had changed.
+@MainActor
+private final class PageDrawingPersistenceState {
+    var hasLoadedDrawing = false
+    var loadedPageAssetRevision: UInt64 = 0
+    var deferredPageAssetRevision: UInt64?
+    var isDrawingDirty = false
+    var needsSnapshotCompaction = false
+    var submittedDrawing = PKDrawing()
+    var collaborationContext = CollaborationVersionVector()
+    var pendingDrawing: PendingDrawingPersistence?
+    var persistenceTask: Task<Void, Never>?
+    var persistenceScheduleID: UUID?
+    var interactionReleaseTask: Task<Void, Never>?
+    var lastToolInteractionEndedAt: TimeInterval?
+    var globalInteractionObserverTask: Task<Void, Never>?
+    var isInteractionSessionActive = false
+    var drawingGeneration: UInt64 = 0
+    let interactionID = UUID()
+}
+
+/// Owns a page's controller without forwarding the controller's history publications into the
+/// complete PDF/page/object hierarchy. The toolbar history controls observe CanvasController
+/// directly, so Undo and Redo still update immediately without rebuilding the page under the pen.
+@MainActor
+private final class PageCanvasControllerHolder: ObservableObject {
+    let controller = CanvasController()
 }
 
 private struct PDFPageAnnotationView: View {
-    private static let drawingPersistenceIdleDelay: TimeInterval = 2.0
+    /// Keeping a document open must not disable durability for the whole editing session. The page
+    /// records only lightweight dirty state on Pencil-up, then captures and persists one immutable
+    /// snapshot after a sustained editor-wide idle window. A new Pencil contact cancels every
+    /// pending stage before it can install a result.
+    private static let allowsInEditorDrawingPersistence = true
+
+    /// No page is allowed to snapshot or diff PencilKit state until *all* visible canvases have
+    /// been quiet for this long. A page-local timer is insufficient: a lazy neighbouring page can
+    /// otherwise wake up and serialize its journal while the user is writing on the current page.
+    private static var drawingHeavyWorkQuietWindow: TimeInterval {
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if let argumentIndex = arguments.firstIndex(of: "--drawing-persistence-idle-delay"),
+           arguments.indices.contains(argumentIndex + 1),
+           let override = TimeInterval(arguments[argumentIndex + 1]) {
+            return max(0.1, override)
+        }
+#endif
+        // Ten continuous seconds without a Pencil contact is the local durability boundary.
+        return 10.0
+    }
+
+    private static func drawingPersistenceIdleDelay(
+        containsOnlyAppendedStrokes: Bool
+    ) -> TimeInterval {
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if let argumentIndex = arguments.firstIndex(of: "--drawing-persistence-idle-delay"),
+           arguments.indices.contains(argumentIndex + 1),
+           let override = TimeInterval(arguments[argumentIndex + 1]) {
+            return max(0.1, override)
+        }
+#endif
+        // Both incremental ink and whole-page mutations share the same user-visible durability
+        // contract. Structural edits may take longer to prepare, but they begin only after the same
+        // ten-second continuous-idle boundary.
+        return drawingHeavyWorkQuietWindow
+    }
+    /// This short grace period groups nearby Pencil contacts into one interaction session. It does
+    /// not start heavy work; the separate ten-second idle timer below does that. Keeping the gate
+    /// active briefly also absorbs PencilKit's occasionally late end callbacks on real hardware.
+    private static var drawingInteractionReleaseDelay: TimeInterval {
+#if DEBUG
+        // Persistence UI tests explicitly shorten the deep-idle window; keep their complete
+        // release + save cycle deterministic without weakening production scheduling.
+        if ProcessInfo.processInfo.arguments.contains("--drawing-persistence-idle-delay") {
+            return 0.25
+        }
+#endif
+        return 0.8
+    }
+#if DEBUG
+    /// UI tests inspect the live stroke count through accessibility. A normal debug session must
+    /// not invalidate the whole page hierarchy after every stroke just to refresh that test value.
+    private static let updatesDrawingAccessibilityForUITesting = ProcessInfo.processInfo.arguments
+        .contains("--text-interaction-ui-test")
+#endif
 
     @Environment(\.scenePhase) private var scenePhase
 
@@ -329,7 +532,10 @@ private struct PDFPageAnnotationView: View {
     let pageIndex: Int
     @Binding var pageElementInsertionRequest: PageElementInsertionRequest?
     let searchHighlight: PDFSearchHighlight?
+    let allowsInitialPDFRenderDuringHandwriting: Bool
     let logicalPageSize: CGSize
+    let logicalViewport: CGRect?
+    let canvasBackground: LibraryPage?
     let selectedTool: CanvasToolKind
     let selectedColor: InkPaletteColor
     let penWidth: Double
@@ -339,23 +545,19 @@ private struct PDFPageAnnotationView: View {
     let isAnnotationEditingEnabled: Bool
     let onSelectLassoTool: () -> Void
     let onSelectTextTool: () -> Void
+    let onFingerPinchChanged: (CGFloat) -> Void
+    let onFingerPinchEnded: (CGFloat) -> Void
+    let onFingerPinchCancelled: () -> Void
+    let onCanvasNavigation: (CanvasNavigationChange) -> Void
     let onReady: (CanvasController, Int) -> Void
     let onRelease: (CanvasController, Int) -> Void
 
-    @StateObject private var controller = CanvasController()
-    @State private var hasLoadedDrawing = false
-    @State private var loadedPageAssetRevision: UInt64 = 0
-    @State private var deferredPageAssetRevision: UInt64?
-    @State private var isDrawingDirty = false
+    @StateObject private var controllerHolder = PageCanvasControllerHolder()
+    @State private var drawingPersistence = PageDrawingPersistenceState()
     @State private var arePageElementsDirty = false
     @State private var pageElements: [CanvasPageElement] = []
-    @State private var submittedDrawing = PKDrawing()
-    @State private var pendingDrawingPersistence: PendingDrawingPersistence?
-    @State private var drawingPersistenceWorkItem: DispatchWorkItem?
-    @State private var drawingPersistenceScheduleID: UUID?
-    @State private var drawingInteractionID = UUID()
+    @State private var drawingAccessibilityGeneration: UInt64 = 0
     @State private var submittedPageElements: [CanvasPageElement] = []
-    @State private var drawingCollaborationContext = CollaborationVersionVector()
     @State private var elementCollaborationContext = CollaborationVersionVector()
     @State private var requestedSelection: LassoSelectionRequest?
     @State private var editingTextElementID: UUID?
@@ -386,6 +588,14 @@ private struct PDFPageAnnotationView: View {
     @State private var pasteMenuLocation: CGPoint?
     @State private var pasteFeedback: String?
 
+    private var controller: CanvasController {
+        controllerHolder.controller
+    }
+
+    private var projection: PageProjection {
+        PageProjection(pageSize: logicalPageSize, viewport: logicalViewport)
+    }
+
     /// The visible index can change after a page reorder. Every persistence operation resolves
     /// the current index from the stable page ID so a disappearing editor cannot save its state
     /// into the page that has just taken over its former index.
@@ -396,7 +606,25 @@ private struct PDFPageAnnotationView: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                PDFPageView(page: documentStore.page(at: resolvedPageIndex, in: documentID))
+                if let logicalViewport, let canvasBackground {
+                    CanvasBackgroundView(viewport: logicalViewport, page: canvasBackground)
+                    if canvasBackground.sourceKind == .pdf {
+                        let bounds = displayRect(for: CGRect(origin: .zero, size: logicalPageSize), in: geometry.size)
+                        PDFPageView(
+                            page: documentStore.page(at: resolvedPageIndex, in: documentID),
+                            drawingActivitySource: documentStore,
+                            allowsInitialRenderDuringHandwriting: allowsInitialPDFRenderDuringHandwriting
+                        )
+                        .frame(width: bounds.width, height: bounds.height)
+                        .position(x: bounds.midX, y: bounds.midY)
+                    }
+                } else {
+                    PDFPageView(
+                        page: documentStore.page(at: resolvedPageIndex, in: documentID),
+                        drawingActivitySource: documentStore,
+                        allowsInitialRenderDuringHandwriting: allowsInitialPDFRenderDuringHandwriting
+                    )
+                }
 
                 if let searchHighlight,
                    let page = documentStore.page(at: resolvedPageIndex, in: documentID) {
@@ -423,7 +651,7 @@ private struct PDFPageAnnotationView: View {
                     let bounds = displayRect(for: element.logicalBounds, in: geometry.size)
                     PageElementView(
                         element: element,
-                        displayScale: geometry.size.width / max(logicalPageSize.width, 1)
+                        displayScale: geometry.size.width / max(projection.logicalBounds.width, 1)
                     )
                         .accessibilityIdentifier(element.accessibilityIdentifier)
                         .accessibilityValue(element.accessibilityValue)
@@ -437,9 +665,15 @@ private struct PDFPageAnnotationView: View {
                 PencilCanvasView(
                     controller: controller,
                     logicalPageSize: logicalPageSize,
+                    logicalViewport: logicalViewport,
+                    isCurrentPage: allowsInitialPDFRenderDuringHandwriting,
                     onFingerLongPress: { point in
                         presentPasteMenu(at: point)
-                    }
+                    },
+                    onFingerPinchChanged: onFingerPinchChanged,
+                    onFingerPinchEnded: onFingerPinchEnded,
+                    onFingerPinchCancelled: onFingerPinchCancelled,
+                    onCanvasNavigation: onCanvasNavigation
                 )
                 .accessibilityLabel("第 \(pageIndex + 1) 页批注画布")
                 .accessibilityIdentifier("page-canvas-\(pageIndex)")
@@ -450,6 +684,8 @@ private struct PDFPageAnnotationView: View {
                     controller: controller,
                     page: documentStore.page(at: resolvedPageIndex, in: documentID),
                     logicalPageSize: logicalPageSize,
+                    logicalViewport: logicalViewport,
+                    canvasBackground: canvasBackground,
                     isActive: isAnnotationEditingEnabled
                         && (selectedTool == .lasso || selectedTool == .text),
                     allowsLassoCreation: selectedTool == .lasso,
@@ -516,13 +752,6 @@ private struct PDFPageAnnotationView: View {
             }
         }
         .background(Color.white)
-        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 3, style: .continuous)
-                .stroke(TiyiNoteTheme.strongHairline, lineWidth: 1)
-                .allowsHitTesting(false)
-        }
-        .shadow(color: Color.black.opacity(0.58), radius: 16, y: 7)
         .onAppear(perform: preparePageCanvas)
         .onDisappear(perform: releasePageCanvas)
         .onChange(of: selectedTool) { _, tool in
@@ -548,35 +777,23 @@ private struct PDFPageAnnotationView: View {
             consumePageElementInsertionRequest()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active {
-                if editingTextElementID != nil {
-                    commitTextEdit()
-                }
-                persistPendingPageChanges()
+            // `.inactive` is a transient interruption, not a durable idle point. It is entered by
+            // system overlays and app/window transitions while the user can return to the Pencil
+            // within the next frame. Flushing here used to run collaboration materialization,
+            // PKDrawing serialization, JSON encoding, and file replacement on MainActor; a real
+            // device trace measured a 187 ms burst followed by a 461 ms microhang. Keep all of that
+            // work out of the resumable writing path and reserve the synchronous durability flush
+            // for an actual background transition (page/workspace dismissal has its own flush).
+            guard phase == .background else { return }
+            if editingTextElementID != nil {
+                commitTextEdit()
             }
+            persistPendingPageChanges()
         }
         .onChange(
             of: documentStore.pageAssetRevision(forPage: resolvedPageIndex, in: documentID)
         ) { _, revision in
             reloadRemotePageAssetsIfPossible(revision: revision)
-        }
-        .onChange(of: controller.isUsingTool) { _, isUsingTool in
-            if isUsingTool {
-                documentStore.setDrawingInteractionActive(true, id: drawingInteractionID)
-                cancelScheduledDrawingPersistence()
-                return
-            }
-            documentStore.setDrawingInteractionActive(false, id: drawingInteractionID)
-            if pendingDrawingPersistence != nil, drawingPersistenceWorkItem == nil {
-                scheduleDrawingPersistence(
-                    after: Self.drawingPersistenceIdleDelay,
-                    documentStore: documentStore
-                )
-            }
-            if let revision = deferredPageAssetRevision {
-                deferredPageAssetRevision = nil
-                reloadRemotePageAssetsIfPossible(revision: revision)
-            }
         }
         .sheet(
             isPresented: Binding(
@@ -612,7 +829,7 @@ private struct PDFPageAnnotationView: View {
     }
 
     private func preparePageCanvas() {
-        if !hasLoadedDrawing {
+        if !drawingPersistence.hasLoadedDrawing {
             let initialDrawing = documentStore.loadDrawing(
                 forPage: resolvedPageIndex,
                 in: documentID
@@ -623,32 +840,69 @@ private struct PDFPageAnnotationView: View {
             )
             controller.installInitialDrawing(initialDrawing)
             pageElements = initialElements
-            submittedDrawing = initialDrawing
+            drawingPersistence.submittedDrawing = initialDrawing
             submittedPageElements = initialElements
             let frontier = documentStore.collaborationFrontier(
                 forPage: resolvedPageIndex,
                 in: documentID
             )
-            drawingCollaborationContext = frontier
+            drawingPersistence.collaborationContext = frontier
             elementCollaborationContext = frontier
-            loadedPageAssetRevision = documentStore.pageAssetRevision(
+            drawingPersistence.loadedPageAssetRevision = documentStore.pageAssetRevision(
                 forPage: resolvedPageIndex,
                 in: documentID
             )
-            isDrawingDirty = false
+            drawingPersistence.isDrawingDirty = false
+            drawingPersistence.needsSnapshotCompaction = false
             arePageElementsDirty = false
-            hasLoadedDrawing = true
+            drawingPersistence.hasLoadedDrawing = true
         }
 
-        controller.onDrawingChanged = { [weak documentStore] drawing in
+        controller.onDrawingChanged = { [weak documentStore] containsOnlyAppendedStrokes in
             guard isAnnotationEditingEnabled, let documentStore else { return }
-            queueDrawingPersistence(drawing, documentStore: documentStore)
+#if DEBUG
+            if Self.updatesDrawingAccessibilityForUITesting {
+                drawingAccessibilityGeneration &+= 1
+            }
+#endif
+            queueDrawingPersistence(
+                containsOnlyAppendedStrokes: containsOnlyAppendedStrokes,
+                documentStore: documentStore
+            )
         }
-        controller.onBecameActive = { [weak controller, weak documentStore] in
-            guard let controller, let documentStore else { return }
-            documentStore.setDrawingInteractionActive(true, id: drawingInteractionID)
-            cancelScheduledDrawingPersistence()
+        controller.onToolInteractionChanged = { [weak documentStore] isUsingTool in
+            guard let documentStore else { return }
+            if isUsingTool {
+                drawingPersistence.lastToolInteractionEndedAt = nil
+                if !drawingPersistence.isInteractionSessionActive {
+                    drawingPersistence.isInteractionSessionActive = true
+                    documentStore.setDrawingInteractionActive(
+                        true,
+                        id: drawingPersistence.interactionID
+                    )
+                }
+                cancelScheduledDrawingPersistence()
+                return
+            }
+            scheduleDrawingInteractionRelease(documentStore: documentStore)
+        }
+        controller.onBecameActive = { [weak controller] in
+            guard let controller else { return }
             onReady(controller, pageIndex)
+        }
+        drawingPersistence.globalInteractionObserverTask?.cancel()
+        drawingPersistence.globalInteractionObserverTask = nil
+        if Self.allowsInEditorDrawingPersistence {
+            drawingPersistence.globalInteractionObserverTask = Task { @MainActor in
+                for await notification in NotificationCenter.default.notifications(
+                    named: .tiyiDrawingInteractionActivityChanged
+                ) {
+                    guard !Task.isCancelled,
+                          let source = notification.object as? DrawingDocumentStore,
+                          source === documentStore else { continue }
+                    handleGlobalDrawingInteractionChange()
+                }
+            }
         }
         controller.configureAnnotationInput(isEditable: isAnnotationEditingEnabled)
         applySelectedTool()
@@ -657,12 +911,23 @@ private struct PDFPageAnnotationView: View {
     }
 
     private var canvasAccessibilityValue: String {
-        let value = "笔迹 \(controller.drawing.strokes.count)；"
+        _ = drawingAccessibilityGeneration
+        let value = "笔迹 \(controller.strokeCount)；"
             + "可撤销 \(controller.canUndo ? "是" : "否")；"
-            + "吸附 \(controller.lastSnappedShapeKind?.title ?? "无")；"
-            + drawingGeometryAccessibilityValue
+            + "吸附 \(controller.lastSnappedShapeKind?.title ?? "无")"
 #if DEBUG
-        return value + "；同步重载 \(controller.synchronizedDrawingInstallCount)"
+        // Geometry is test instrumentation, not user-facing accessibility. Reading PKDrawing here
+        // in production made every unrelated SwiftUI refresh materialize the full page on MainActor.
+        if Self.updatesDrawingAccessibilityForUITesting {
+            return value
+                + (logicalViewport.map {
+                    String(format: "；视口 %.2f %.2f %.2f %.2f", $0.minX, $0.minY, $0.width, $0.height)
+                } ?? "")
+                + "；"
+                + drawingGeometryAccessibilityValue
+                + "；同步重载 \(controller.synchronizedDrawingInstallCount)"
+        }
+        return value
 #else
         return value
 #endif
@@ -686,8 +951,19 @@ private struct PDFPageAnnotationView: View {
         }
         persistPendingPageChanges()
         cancelScheduledDrawingPersistence()
-        documentStore.setDrawingInteractionActive(false, id: drawingInteractionID)
+        drawingPersistence.interactionReleaseTask?.cancel()
+        drawingPersistence.interactionReleaseTask = nil
+        drawingPersistence.lastToolInteractionEndedAt = nil
+        drawingPersistence.globalInteractionObserverTask?.cancel()
+        drawingPersistence.globalInteractionObserverTask = nil
+        drawingPersistence.isInteractionSessionActive = false
+        documentStore.setEditorDrawingPersistencePending(
+            false,
+            id: drawingPersistence.interactionID
+        )
+        documentStore.setDrawingInteractionActive(false, id: drawingPersistence.interactionID)
         controller.onDrawingChanged = nil
+        controller.onToolInteractionChanged = nil
         controller.onBecameActive = nil
         onRelease(controller, pageIndex)
     }
@@ -722,35 +998,117 @@ private struct PDFPageAnnotationView: View {
         submittedPageElements = pageElements
     }
 
-    /// PencilKit delivers the completed stroke on the main thread. Building collaboration
-    /// fingerprints and rewriting the operation journal in that same callback can delay the next
-    /// Pencil contact on a page with many strokes. Coalesce a burst of handwriting and persist it
-    /// only after a short idle window; page/scene transitions still flush it synchronously.
+    /// A completed Pencil contact only marks the page dirty. In particular, it does not read or
+    /// retain the complete `PKDrawing`; the immutable snapshot is captured once after deep idle.
+    /// Page and scene transitions still flush synchronously so pending work is never abandoned.
     private func queueDrawingPersistence(
-        _ drawing: PKDrawing,
+        containsOnlyAppendedStrokes: Bool,
         documentStore: DrawingDocumentStore
     ) {
-        isDrawingDirty = true
-        let previousDrawing = pendingDrawingPersistence?.drawing ?? submittedDrawing
-        let appendsStrokes = selectedTool.usesInkSettings
-            && drawing.strokes.count > previousDrawing.strokes.count
-        if var pendingDrawingPersistence {
-            pendingDrawingPersistence.drawing = drawing
-            pendingDrawingPersistence.containsOnlyAppendedStrokes =
-                pendingDrawingPersistence.containsOnlyAppendedStrokes && appendsStrokes
-            self.pendingDrawingPersistence = pendingDrawingPersistence
+        drawingPersistence.isDrawingDirty = true
+        drawingPersistence.needsSnapshotCompaction = true
+        drawingPersistence.drawingGeneration &+= 1
+        documentStore.setEditorDrawingPersistencePending(
+            true,
+            id: drawingPersistence.interactionID
+        )
+        if var pendingDrawing = drawingPersistence.pendingDrawing {
+            pendingDrawing.containsOnlyAppendedStrokes =
+                pendingDrawing.containsOnlyAppendedStrokes && containsOnlyAppendedStrokes
+            pendingDrawing.generation = drawingPersistence.drawingGeneration
+            drawingPersistence.pendingDrawing = pendingDrawing
         } else {
-            pendingDrawingPersistence = PendingDrawingPersistence(
-                drawing: drawing,
-                baseDrawing: submittedDrawing,
-                causalContext: drawingCollaborationContext,
-                containsOnlyAppendedStrokes: appendsStrokes
+            drawingPersistence.pendingDrawing = PendingDrawingPersistence(
+                baseDrawing: drawingPersistence.submittedDrawing,
+                causalContext: drawingPersistence.collaborationContext,
+                containsOnlyAppendedStrokes: containsOnlyAppendedStrokes,
+                generation: drawingPersistence.drawingGeneration
             )
         }
+
+        // A normal Pencil callback ends here after marking a few scalar fields dirty. The complete
+        // persistence pipeline is eligible only after the interaction gate has closed and the
+        // editor-wide quiet window has elapsed. Page close, workspace exit, and scene backgrounding
+        // remain immediate durable flush points.
+        guard Self.allowsInEditorDrawingPersistence else {
+            cancelScheduledDrawingPersistence()
+            return
+        }
+
+        // Persistence regression tests use the same transaction boundaries with an explicitly
+        // shortened idle window.
+        guard !drawingPersistence.isInteractionSessionActive,
+              !controller.isUsingTool else { return }
         scheduleDrawingPersistence(
-            after: Self.drawingPersistenceIdleDelay,
+            after: Self.drawingPersistenceIdleDelay(
+                containsOnlyAppendedStrokes:
+                    drawingPersistence.pendingDrawing?.containsOnlyAppendedStrokes == true
+            ),
             documentStore: documentStore
         )
+    }
+
+    private func scheduleDrawingInteractionRelease(
+        documentStore: DrawingDocumentStore
+    ) {
+        guard Self.allowsInEditorDrawingPersistence else {
+            // Defensive fallback for a future build that explicitly disables in-editor checkpoints.
+            drawingPersistence.lastToolInteractionEndedAt = nil
+            drawingPersistence.interactionReleaseTask?.cancel()
+            drawingPersistence.interactionReleaseTask = nil
+            return
+        }
+        drawingPersistence.lastToolInteractionEndedAt = ProcessInfo.processInfo.systemUptime
+        guard drawingPersistence.interactionReleaseTask == nil else { return }
+        drawingPersistence.interactionReleaseTask = Task { @MainActor [weak documentStore] in
+            while !Task.isCancelled {
+                guard let interactionEndedAt = drawingPersistence.lastToolInteractionEndedAt else {
+                    drawingPersistence.interactionReleaseTask = nil
+                    return
+                }
+                let remaining = Self.drawingInteractionReleaseDelay
+                    - (ProcessInfo.processInfo.systemUptime - interactionEndedAt)
+                if remaining > 0 {
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: UInt64(remaining * 1_000_000_000)
+                        )
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+                guard drawingPersistence.lastToolInteractionEndedAt == interactionEndedAt,
+                      !controller.isUsingTool,
+                      drawingPersistence.isInteractionSessionActive,
+                      let documentStore else { continue }
+
+                drawingPersistence.interactionReleaseTask = nil
+                drawingPersistence.lastToolInteractionEndedAt = nil
+                drawingPersistence.isInteractionSessionActive = false
+                documentStore.setDrawingInteractionActive(
+                    false,
+                    id: drawingPersistence.interactionID
+                )
+                if Self.allowsInEditorDrawingPersistence,
+                   drawingPersistence.pendingDrawing != nil,
+                   drawingPersistence.persistenceTask == nil {
+                    scheduleDrawingPersistence(
+                        after: Self.drawingPersistenceIdleDelay(
+                            containsOnlyAppendedStrokes:
+                                drawingPersistence.pendingDrawing?.containsOnlyAppendedStrokes
+                                    == true
+                        ),
+                        documentStore: documentStore
+                    )
+                }
+                if let revision = drawingPersistence.deferredPageAssetRevision {
+                    drawingPersistence.deferredPageAssetRevision = nil
+                    reloadRemotePageAssetsIfPossible(revision: revision)
+                }
+                return
+            }
+        }
     }
 
     private func scheduleDrawingPersistence(
@@ -759,40 +1117,149 @@ private struct PDFPageAnnotationView: View {
     ) {
         cancelScheduledDrawingPersistence()
         let scheduleID = UUID()
-        drawingPersistenceScheduleID = scheduleID
-        let workItem = DispatchWorkItem { [weak documentStore] in
-            guard drawingPersistenceScheduleID == scheduleID,
-                  let documentStore else { return }
-            drawingPersistenceWorkItem = nil
-            drawingPersistenceScheduleID = nil
-            if controller.isUsingTool {
+        drawingPersistence.persistenceScheduleID = scheduleID
+        drawingPersistence.persistenceTask = Task { @MainActor [weak documentStore] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(max(0, delay) * 1_000_000_000)
+                )
+            } catch {
                 return
             }
-            persistQueuedDrawingChange(documentStore: documentStore)
+            guard !Task.isCancelled,
+                  drawingPersistence.persistenceScheduleID == scheduleID,
+                  !controller.isUsingTool,
+                  !drawingPersistence.isInteractionSessionActive,
+                  let pendingState = drawingPersistence.pendingDrawing,
+                  let documentStore else { return }
+
+            // The lazy page stack may keep several page editors alive. A timer belonging to an
+            // off-screen page must not begin a full drawing read while another page is receiving
+            // Pencil input. Restart the complete quiet window after any page's latest contact.
+            let globalQuietTimeRemaining = documentStore.drawingInteractionQuietTimeRemaining(
+                within: Self.drawingHeavyWorkQuietWindow
+            )
+            guard !documentStore.isDrawingInteractionActive,
+                  globalQuietTimeRemaining <= 0 else {
+                drawingPersistence.persistenceTask = nil
+                drawingPersistence.persistenceScheduleID = nil
+                scheduleDrawingPersistence(
+                    after: max(
+                        Self.drawingPersistenceIdleDelay(
+                            containsOnlyAppendedStrokes:
+                                pendingState.containsOnlyAppendedStrokes
+                        ),
+                        globalQuietTimeRemaining
+                    ),
+                    documentStore: documentStore
+                )
+                return
+            }
+
+            // This is the first complete drawing read since the previous deep-idle save. Capturing
+            // it on MainActor is required by PencilKit; every serialization and diff step below is
+            // performed by a cancellable background task.
+            let drawing = controller.drawing
+            let capturedGeneration = pendingState.generation
+
+            // `PKDrawing.dataRepresentation()` and per-stroke identity preparation both scale with
+            // page complexity. They are safe on an immutable drawing value and must not occupy the
+            // UI actor, even after the quiet timer has elapsed.
+            let preparationTask = Task.detached(priority: .background) {
+                DrawingDocumentStore.prepareDrawingPersistence(
+                    drawing: drawing,
+                    baseDrawing: pendingState.baseDrawing,
+                    assumesOnlyAppendedStrokes:
+                        pendingState.containsOnlyAppendedStrokes
+                )
+            }
+            let preparedPersistenceResult = await withTaskCancellationHandler(
+                operation: { await preparationTask.value },
+                onCancel: { preparationTask.cancel() }
+            )
+            guard let preparedPersistence = preparedPersistenceResult else { return }
+            guard let updatedContext = await documentStore.schedulePreparedDrawingSaveAfterIdle(
+                drawing,
+                replacing: pendingState.baseDrawing,
+                causalContext: pendingState.causalContext,
+                assumesOnlyAppendedStrokes:
+                    pendingState.containsOnlyAppendedStrokes,
+                preparedPersistence: preparedPersistence,
+                forPage: resolvedPageIndex,
+                in: documentID
+            ),
+            !Task.isCancelled,
+            drawingPersistence.persistenceScheduleID == scheduleID,
+            drawingPersistence.pendingDrawing?.generation == capturedGeneration,
+            !controller.isUsingTool,
+            !drawingPersistence.isInteractionSessionActive else { return }
+
+            drawingPersistence.pendingDrawing = nil
+            drawingPersistence.collaborationContext = updatedContext
+            drawingPersistence.submittedDrawing = drawing
+            documentStore.setEditorDrawingPersistencePending(
+                false,
+                id: drawingPersistence.interactionID
+            )
+            if !pendingState.containsOnlyAppendedStrokes {
+                // Structural edits prepared a complete asset. Appended ink deliberately leaves
+                // compaction for page close/background so it cannot race a later Pencil contact.
+                drawingPersistence.needsSnapshotCompaction = false
+            }
+            drawingPersistence.persistenceTask = nil
+            drawingPersistence.persistenceScheduleID = nil
         }
-        drawingPersistenceWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func cancelScheduledDrawingPersistence() {
-        drawingPersistenceWorkItem?.cancel()
-        drawingPersistenceWorkItem = nil
-        drawingPersistenceScheduleID = nil
+        drawingPersistence.persistenceTask?.cancel()
+        drawingPersistence.persistenceTask = nil
+        drawingPersistence.persistenceScheduleID = nil
     }
 
-    private func persistQueuedDrawingChange(documentStore: DrawingDocumentStore) {
+    private func handleGlobalDrawingInteractionChange() {
+        guard Self.allowsInEditorDrawingPersistence else { return }
+        guard drawingPersistence.pendingDrawing != nil else { return }
+        if documentStore.isDrawingInteractionActive {
+            // Cancelling the parent also cancels its detached preparation worker through the task's
+            // cancellation handler. This is what keeps an old/off-screen page from stealing CPU
+            // from the first few strokes on the active page.
+            cancelScheduledDrawingPersistence()
+            return
+        }
+        guard drawingPersistence.persistenceTask == nil else { return }
+        scheduleDrawingPersistence(
+            after: Self.drawingPersistenceIdleDelay(
+                containsOnlyAppendedStrokes:
+                    drawingPersistence.pendingDrawing?.containsOnlyAppendedStrokes == true
+            ),
+            documentStore: documentStore
+        )
+    }
+
+    private func persistQueuedDrawingChange(
+        preparedPersistence: PreparedDrawingPersistence? = nil,
+        documentStore: DrawingDocumentStore
+    ) {
         cancelScheduledDrawingPersistence()
-        guard let pendingDrawingPersistence else { return }
-        self.pendingDrawingPersistence = nil
-        drawingCollaborationContext = documentStore.scheduleSave(
-            pendingDrawingPersistence.drawing,
-            replacing: pendingDrawingPersistence.baseDrawing,
-            causalContext: pendingDrawingPersistence.causalContext,
-            assumesOnlyAppendedStrokes: pendingDrawingPersistence.containsOnlyAppendedStrokes,
+        guard let pendingDrawing = drawingPersistence.pendingDrawing else { return }
+        let drawing = controller.drawing
+        drawingPersistence.pendingDrawing = nil
+        drawingPersistence.collaborationContext = documentStore.scheduleSave(
+            drawing,
+            replacing: pendingDrawing.baseDrawing,
+            causalContext: pendingDrawing.causalContext,
+            assumesOnlyAppendedStrokes: pendingDrawing.containsOnlyAppendedStrokes,
+            preparedPersistence: preparedPersistence,
             forPage: resolvedPageIndex,
             in: documentID
         )
-        submittedDrawing = pendingDrawingPersistence.drawing
+        drawingPersistence.submittedDrawing = drawing
+        drawingPersistence.needsSnapshotCompaction = false
+        documentStore.setEditorDrawingPersistencePending(
+            false,
+            id: drawingPersistence.interactionID
+        )
     }
 
     private func consumePageElementInsertionRequest() {
@@ -831,8 +1298,8 @@ private struct PDFPageAnnotationView: View {
                 1
             )
             bounds = CGRect(
-                x: logicalPageSize.width / 2 - imageSize.width * scale / 2,
-                y: logicalPageSize.height / 2 - imageSize.height * scale / 2,
+                x: projection.logicalBounds.midX - imageSize.width * scale / 2,
+                y: projection.logicalBounds.midY - imageSize.height * scale / 2,
                 width: imageSize.width * scale,
                 height: imageSize.height * scale
             )
@@ -880,8 +1347,8 @@ private struct PDFPageAnnotationView: View {
             height: max(36, logicalPageSize.height * heightFraction)
         )
         return CGRect(
-            x: logicalPageSize.width / 2 - size.width / 2,
-            y: logicalPageSize.height / 2 - size.height / 2,
+            x: projection.logicalBounds.midX - size.width / 2,
+            y: projection.logicalBounds.midY - size.height / 2,
             width: size.width,
             height: size.height
         )
@@ -891,8 +1358,8 @@ private struct PDFPageAnnotationView: View {
         defaultTextElementBounds(
             for: payload,
             centeredAt: CGPoint(
-                x: logicalPageSize.width / 2,
-                y: logicalPageSize.height / 2
+                x: projection.logicalBounds.midX,
+                y: projection.logicalBounds.midY
             )
         )
     }
@@ -907,12 +1374,12 @@ private struct PDFPageAnnotationView: View {
             width: min(logicalPageSize.width * 0.34, max(132, estimatedTextWidth)),
             height: min(logicalPageSize.height * 0.08, max(48, fontSize * 2))
         )
-        return CGRect(
-            x: min(max(center.x - size.width / 2, 0), logicalPageSize.width - size.width),
-            y: min(max(center.y - size.height / 2, 0), logicalPageSize.height - size.height),
+        return projection.constrain(CGRect(
+            x: center.x - size.width / 2,
+            y: center.y - size.height / 2,
             width: size.width,
             height: size.height
-        )
+        ))
     }
 
     private func insertTextElement(at logicalPoint: CGPoint) {
@@ -943,7 +1410,7 @@ private struct PDFPageAnnotationView: View {
            let element = pageElements.first(where: { $0.id == elementID })
                 ?? textEditorBaseElement {
             let bounds = displayRect(for: element.logicalBounds, in: displaySize)
-            let displayScale = displaySize.width / max(logicalPageSize.width, 1)
+            let displayScale = displaySize.width / max(projection.logicalBounds.width, 1)
 
             InlinePageTextEditor(
                 text: $textDraft,
@@ -1017,23 +1484,12 @@ private struct PDFPageAnnotationView: View {
         let origin = textMoveOriginBounds ?? pageElements[index].logicalBounds
         if textMoveOriginBounds == nil { textMoveOriginBounds = origin }
 
-        let logicalTranslation = CGSize(
-            width: translation.width / max(displaySize.width, 1) * logicalPageSize.width,
-            height: translation.height / max(displaySize.height, 1) * logicalPageSize.height
-        )
-        var movedBounds = origin.offsetBy(
+        let logicalTranslation = projection.logicalTranslation(translation, displaySize: displaySize)
+        let movedBounds = origin.offsetBy(
             dx: logicalTranslation.width,
             dy: logicalTranslation.height
         )
-        movedBounds.origin.x = min(
-            max(movedBounds.minX, 0),
-            max(0, logicalPageSize.width - movedBounds.width)
-        )
-        movedBounds.origin.y = min(
-            max(movedBounds.minY, 0),
-            max(0, logicalPageSize.height - movedBounds.height)
-        )
-        pageElements[index].logicalBounds = movedBounds
+        pageElements[index].logicalBounds = projection.constrain(movedBounds)
     }
 
     private func finishEditingTextMove() {
@@ -1051,18 +1507,15 @@ private struct PDFPageAnnotationView: View {
         let origin = textResizeOriginBounds ?? pageElements[index].logicalBounds
         if textResizeOriginBounds == nil { textResizeOriginBounds = origin }
 
-        let logicalTranslation = CGSize(
-            width: translation.width / max(displaySize.width, 1) * logicalPageSize.width,
-            height: translation.height / max(displaySize.height, 1) * logicalPageSize.height
-        )
+        let logicalTranslation = projection.logicalTranslation(translation, displaySize: displaySize)
         var resizedBounds = origin
         resizedBounds.size.width = min(
             max(48, origin.width + logicalTranslation.width),
-            logicalPageSize.width - origin.minX
+            projection.isUnbounded ? .greatestFiniteMagnitude : logicalPageSize.width - origin.minX
         )
         resizedBounds.size.height = min(
             max(36, origin.height + logicalTranslation.height),
-            logicalPageSize.height - origin.minY
+            projection.isUnbounded ? .greatestFiniteMagnitude : logicalPageSize.height - origin.minY
         )
         pageElements[index].logicalBounds = resizedBounds
     }
@@ -1211,17 +1664,32 @@ private struct PDFPageAnnotationView: View {
     /// Flushes only payloads produced by a real edit. Read-only pages and pages that were merely
     /// viewed never create empty annotation assets or alter CloudKit conflict timestamps.
     private func persistPendingPageChanges() {
-        if pendingDrawingPersistence != nil {
+        var scheduledSnapshotCompaction = false
+        if drawingPersistence.pendingDrawing != nil {
             persistQueuedDrawingChange(documentStore: documentStore)
+        } else if drawingPersistence.needsSnapshotCompaction {
+            // A cheap append-only autosave may already have committed every logical stroke while
+            // intentionally leaving the compact PKDrawing asset stale. Closing/backgrounding is
+            // the safe point to refresh that asset without affecting live ink latency.
+            documentStore.scheduleDrawingSnapshotCompaction(
+                controller.drawing,
+                causalContext: drawingPersistence.collaborationContext,
+                forPage: resolvedPageIndex,
+                in: documentID
+            )
+            drawingPersistence.needsSnapshotCompaction = false
+            scheduledSnapshotCompaction = true
         }
         guard
             isAnnotationEditingEnabled,
             documentStore.document(withID: documentID) != nil,
-            isDrawingDirty || arePageElementsDirty
+            drawingPersistence.isDrawingDirty
+                || arePageElementsDirty
+                || scheduledSnapshotCompaction
         else { return }
 
         if documentStore.flushPendingSaves(forPage: resolvedPageIndex, in: documentID) {
-            isDrawingDirty = false
+            drawingPersistence.isDrawingDirty = false
             arePageElementsDirty = false
         }
     }
@@ -1230,23 +1698,29 @@ private struct PDFPageAnnotationView: View {
     /// dirty channels retain the editor's visual base and later emit a delta against its original
     /// causal frontier. Operation replay then merges that delta with the downloaded edits.
     private func reloadRemotePageAssetsIfPossible(revision: UInt64) {
-        guard hasLoadedDrawing, revision != loadedPageAssetRevision else { return }
-        guard !controller.isUsingTool else {
-            deferredPageAssetRevision = max(deferredPageAssetRevision ?? 0, revision)
+        guard drawingPersistence.hasLoadedDrawing,
+              revision != drawingPersistence.loadedPageAssetRevision else { return }
+        guard !controller.isUsingTool,
+              !drawingPersistence.isInteractionSessionActive else {
+            drawingPersistence.deferredPageAssetRevision = max(
+                drawingPersistence.deferredPageAssetRevision ?? 0,
+                revision
+            )
             return
         }
-        if let deferredPageAssetRevision, revision >= deferredPageAssetRevision {
-            self.deferredPageAssetRevision = nil
+        if let deferredRevision = drawingPersistence.deferredPageAssetRevision,
+           revision >= deferredRevision {
+            drawingPersistence.deferredPageAssetRevision = nil
         }
 
-        let drawingHasPendingSave = pendingDrawingPersistence != nil
+        let drawingHasPendingSave = drawingPersistence.pendingDrawing != nil
             || documentStore.hasPendingDrawingSave(
                 forPage: resolvedPageIndex,
                 in: documentID
             )
         let hasUnseenDrawingOperations = documentStore
             .hasUnseenDrawingCollaborationOperations(
-                outside: drawingCollaborationContext,
+                outside: drawingPersistence.collaborationContext,
                 forPage: resolvedPageIndex,
                 in: documentID
             )
@@ -1256,9 +1730,9 @@ private struct PDFPageAnnotationView: View {
             // semantically identical `canvasView.drawing = ...` can clear PencilKit's active
             // render tiles on hardware, so acknowledge the save without touching the canvas.
             if !drawingHasPendingSave {
-                isDrawingDirty = false
+                drawingPersistence.isDrawingDirty = false
             }
-        } else if !isDrawingDirty || !drawingHasPendingSave {
+        } else if !drawingPersistence.isDrawingDirty || !drawingHasPendingSave {
             let mergedDrawing = documentStore.loadDrawing(
                 forPage: resolvedPageIndex,
                 in: documentID
@@ -1269,15 +1743,15 @@ private struct PDFPageAnnotationView: View {
             if mergedDrawing != controller.drawing {
                 controller.installSynchronizedDrawing(
                     mergedDrawing,
-                    preservingHistory: isDrawingDirty && !drawingHasPendingSave
+                    preservingHistory: drawingPersistence.isDrawingDirty && !drawingHasPendingSave
                 )
             }
-            submittedDrawing = mergedDrawing
-            drawingCollaborationContext = documentStore.collaborationFrontier(
+            drawingPersistence.submittedDrawing = mergedDrawing
+            drawingPersistence.collaborationContext = documentStore.collaborationFrontier(
                 forPage: resolvedPageIndex,
                 in: documentID
             )
-            isDrawingDirty = false
+            drawingPersistence.isDrawingDirty = false
         }
 
         let elementsHavePendingSave = documentStore.hasPendingImageAnnotationsSave(
@@ -1298,7 +1772,7 @@ private struct PDFPageAnnotationView: View {
             arePageElementsDirty = false
         }
 
-        loadedPageAssetRevision = revision
+        drawingPersistence.loadedPageAssetRevision = revision
     }
 
     private func presentPasteMenu(at point: CGPoint) {
@@ -1315,17 +1789,14 @@ private struct PDFPageAnnotationView: View {
     private func pasteCopiedContent(at displayPoint: CGPoint, in displaySize: CGSize) {
         guard isAnnotationEditingEnabled,
               let copiedContent = TiyiAnnotationPasteboard.copiedContent else { return }
-        let logicalPoint = CGPoint(
-            x: displayPoint.x / max(displaySize.width, 1) * logicalPageSize.width,
-            y: displayPoint.y / max(displaySize.height, 1) * logicalPageSize.height
-        )
+        let logicalPoint = projection.logicalPoint(displayPoint, displaySize: displaySize)
         pasteMenuLocation = nil
         switch copiedContent {
         case .drawing(let drawing):
             let insertedIndices = controller.pasteDrawing(
                 drawing,
                 centeredAt: logicalPoint,
-                within: logicalPageSize
+                within: projection.isUnbounded ? nil : logicalPageSize
             )
             guard
                 !insertedIndices.isEmpty,
@@ -1347,14 +1818,16 @@ private struct PDFPageAnnotationView: View {
                 width: copiedSize.width * scale,
                 height: copiedSize.height * scale
             )
-            let origin = CGPoint(
-                x: min(max(logicalPoint.x - size.width / 2, 0), max(0, logicalPageSize.width - size.width)),
-                y: min(max(logicalPoint.y - size.height / 2, 0), max(0, logicalPageSize.height - size.height))
-            )
+            let bounds = projection.constrain(CGRect(
+                x: logicalPoint.x - size.width / 2,
+                y: logicalPoint.y - size.height / 2,
+                width: size.width,
+                height: size.height
+            ))
             guard let pngData = image.pngData() else { return }
             let element = CanvasPageElement(
                 id: UUID(),
-                logicalBounds: CGRect(origin: origin, size: size),
+                logicalBounds: bounds,
                 payload: .image(PageImagePayload(pngData: pngData))
             )
             pageElements.append(element)
@@ -1386,12 +1859,7 @@ private struct PDFPageAnnotationView: View {
     }
 
     private func displayRect(for logicalRect: CGRect, in displaySize: CGSize) -> CGRect {
-        CGRect(
-            x: logicalRect.minX / max(logicalPageSize.width, 1) * displaySize.width,
-            y: logicalRect.minY / max(logicalPageSize.height, 1) * displaySize.height,
-            width: logicalRect.width / max(logicalPageSize.width, 1) * displaySize.width,
-            height: logicalRect.height / max(logicalPageSize.height, 1) * displaySize.height
-        )
+        projection.displayRect(logicalRect, displaySize: displaySize)
     }
 
     private func searchHighlightRect(
@@ -1400,24 +1868,26 @@ private struct PDFPageAnnotationView: View {
         in displaySize: CGSize
     ) -> CGRect {
         let pageBounds = page.bounds(for: .mediaBox)
+        let surfaceSize = projection.isUnbounded ? logicalPageSize : displaySize
         let scale = min(
-            displaySize.width / max(pageBounds.width, 1),
-            displaySize.height / max(pageBounds.height, 1)
+            surfaceSize.width / max(pageBounds.width, 1),
+            surfaceSize.height / max(pageBounds.height, 1)
         )
         let renderedSize = CGSize(
             width: pageBounds.width * scale,
             height: pageBounds.height * scale
         )
         let origin = CGPoint(
-            x: (displaySize.width - renderedSize.width) / 2,
-            y: (displaySize.height - renderedSize.height) / 2
+            x: (surfaceSize.width - renderedSize.width) / 2,
+            y: (surfaceSize.height - renderedSize.height) / 2
         )
-        return CGRect(
+        let bounds = CGRect(
             x: origin.x + (matchBounds.minX - pageBounds.minX) * scale,
             y: origin.y + (pageBounds.maxY - matchBounds.maxY) * scale,
             width: matchBounds.width * scale,
             height: matchBounds.height * scale
         )
+        return projection.isUnbounded ? displayRect(for: bounds, in: displaySize) : bounds
     }
 
     private func pageElementSort(_ lhs: CanvasPageElement, _ rhs: CanvasPageElement) -> Bool {
@@ -2225,9 +2695,13 @@ private struct LassoSelectionRequest: Identifiable {
 }
 
 private struct LassoSelectionOverlay: View {
-    @ObservedObject var controller: CanvasController
+    /// Selection mutations drive this overlay through its own state and bindings. Controller
+    /// history publications are consumed by the toolbar's history controls, not by this layer.
+    let controller: CanvasController
     let page: PDFPage?
     let logicalPageSize: CGSize
+    let logicalViewport: CGRect?
+    let canvasBackground: LibraryPage?
     let isActive: Bool
     let allowsLassoCreation: Bool
     let isEditingText: Bool
@@ -2249,6 +2723,10 @@ private struct LassoSelectionOverlay: View {
     @State private var inputDragMode: LassoInputDragMode?
     @State private var inputDragStart: CGPoint?
     @State private var feedbackText: String?
+
+    private var projection: PageProjection {
+        PageProjection(pageSize: logicalPageSize, viewport: logicalViewport)
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -2413,16 +2891,10 @@ private struct LassoSelectionOverlay: View {
         if selectionContains(displayPoint, displaySize: displaySize) {
             return true
         }
-#if targetEnvironment(simulator)
-        // Simulator mouse/XCTest drags arrive as direct touches. Unlike a physical
-        // iPad there is no Apple Pencil input available, so direct drags must be
-        // accepted or the lasso can never be exercised in Simulator.
-        return true
-#else
         // On a physical iPad a finger keeps navigating the page while Apple Pencil
-        // creates a new lasso. A finger can still move an existing selection above.
-        return touchType != .direct
-#endif
+        // creates a new lasso. Simulator drawing uses direct touches as Pencil input;
+        // navigation tests opt into the same Pencil-only policy as the physical iPad.
+        return CanvasController.allowsFingerDrawing || touchType != .direct
     }
 
     private func clearTextSelectionAfterEditing() {
@@ -2866,10 +3338,10 @@ private struct LassoSelectionOverlay: View {
             return
         }
         var offset = CGSize(width: 12, height: 12)
-        if selection.axisAlignedBounds.maxX + offset.width > logicalPageSize.width {
+        if !projection.isUnbounded, selection.axisAlignedBounds.maxX + offset.width > logicalPageSize.width {
             offset.width = -abs(offset.width)
         }
-        if selection.axisAlignedBounds.maxY + offset.height > logicalPageSize.height {
+        if !projection.isUnbounded, selection.axisAlignedBounds.maxY + offset.height > logicalPageSize.height {
             offset.height = -abs(offset.height)
         }
 
@@ -2878,7 +3350,7 @@ private struct LassoSelectionOverlay: View {
             let copiedIndices = controller.duplicateStrokes(
                 at: selection.content.strokeIndices,
                 offset: offset,
-                within: logicalPageSize
+                within: projection.isUnbounded ? nil : logicalPageSize
             )
             copiedStrokeIndices = copiedIndices
         }
@@ -3082,7 +3554,8 @@ private struct LassoSelectionOverlay: View {
                   drawing: controller.drawing,
                   pageElements: pageElements,
                   cropRect: selection.axisAlignedBounds.insetBy(dx: -4, dy: -4),
-                  logicalPageSize: logicalPageSize
+                  logicalPageSize: logicalPageSize,
+                  canvasBackground: canvasBackground
               ) else { return }
         TiyiAnnotationPasteboard.copy(snapshot.image, logicalSize: snapshot.logicalSize)
     }
@@ -3307,7 +3780,7 @@ private struct LassoSelectionOverlay: View {
         handle: LassoResizeHandle,
         translation: CGSize
     ) -> LassoStrokeSelection {
-        let minimumSize = max(8, logicalPageSize.width * 0.018)
+        let minimumSize = max(8, projection.logicalBounds.width * 0.018)
         let cosine = cos(selection.rotationRadians)
         let sine = sin(selection.rotationRadians)
         let localTranslation = CGSize(
@@ -3429,7 +3902,7 @@ private struct LassoSelectionOverlay: View {
             x: center.x + cosine * dx - sine * dy,
             y: center.y + sine * dx + cosine * dy
         )
-        let hitSlop = max(3, logicalPageSize.width * 0.006)
+        let hitSlop = max(3, projection.logicalBounds.width * 0.006)
         return selection.logicalBounds.insetBy(dx: -hitSlop, dy: -hitSlop)
             .contains(localPoint)
     }
@@ -3513,34 +3986,19 @@ private struct LassoSelectionOverlay: View {
     }
 
     private func logicalPoint(for displayPoint: CGPoint, in displaySize: CGSize) -> CGPoint {
-        CGPoint(
-            x: min(max(displayPoint.x / max(displaySize.width, 1) * logicalPageSize.width, 0), logicalPageSize.width),
-            y: min(max(displayPoint.y / max(displaySize.height, 1) * logicalPageSize.height, 0), logicalPageSize.height)
-        )
+        projection.logicalPoint(displayPoint, displaySize: displaySize)
     }
 
     private func displayPoint(for logicalPoint: CGPoint, in displaySize: CGSize) -> CGPoint {
-        CGPoint(
-            x: logicalPoint.x / max(logicalPageSize.width, 1) * displaySize.width,
-            y: logicalPoint.y / max(logicalPageSize.height, 1) * displaySize.height
-        )
+        projection.displayPoint(logicalPoint, displaySize: displaySize)
     }
 
     private func displayRect(for logicalRect: CGRect, in displaySize: CGSize) -> CGRect {
-        let origin = displayPoint(for: logicalRect.origin, in: displaySize)
-        return CGRect(
-            x: origin.x,
-            y: origin.y,
-            width: logicalRect.width / max(logicalPageSize.width, 1) * displaySize.width,
-            height: logicalRect.height / max(logicalPageSize.height, 1) * displaySize.height
-        )
+        projection.displayRect(logicalRect, displaySize: displaySize)
     }
 
     private func logicalTranslation(_ translation: CGSize, displaySize: CGSize) -> CGSize {
-        CGSize(
-            width: translation.width / max(displaySize.width, 1) * logicalPageSize.width,
-            height: translation.height / max(displaySize.height, 1) * logicalPageSize.height
-        )
+        projection.logicalTranslation(translation, displaySize: displaySize)
     }
 }
 
@@ -4067,14 +4525,15 @@ private enum LassoSnapshotRenderer {
         drawing: PKDrawing,
         pageElements: [CanvasPageElement],
         cropRect: CGRect,
-        logicalPageSize: CGSize
+        logicalPageSize: CGSize,
+        canvasBackground: LibraryPage? = nil
     ) -> LassoSnapshot? {
         let pageRect = CGRect(origin: .zero, size: logicalPageSize)
-        let cropRect = cropRect.intersection(pageRect).integral
+        let cropRect = (canvasBackground == nil ? cropRect.intersection(pageRect) : cropRect).integral
         guard !cropRect.isNull, cropRect.width > 1, cropRect.height > 1 else { return nil }
 
         let format = UIGraphicsImageRendererFormat()
-        format.scale = 2
+        format.scale = canvasBackground == nil ? 2 : min(2, 4096 / max(cropRect.width, cropRect.height))
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: cropRect.size, format: format)
         let image = renderer.image { rendererContext in
@@ -4082,6 +4541,17 @@ private enum LassoSnapshotRenderer {
             rendererContext.fill(CGRect(origin: .zero, size: cropRect.size))
 
             let context = rendererContext.cgContext
+            if let canvasBackground {
+                context.saveGState()
+                context.translateBy(x: -cropRect.minX, y: -cropRect.minY)
+                CanvasBackgroundRenderer.draw(
+                    in: context,
+                    bounds: cropRect,
+                    style: canvasBackground.backgroundStyle ?? .blank,
+                    color: canvasBackground.backgroundColor ?? .white
+                )
+                context.restoreGState()
+            }
             let pageBounds = page.bounds(for: .mediaBox)
             let pageScale = min(
                 logicalPageSize.width / max(pageBounds.width, 1),
@@ -4101,7 +4571,9 @@ private enum LassoSnapshotRenderer {
             context.translateBy(x: pageOrigin.x, y: pageOrigin.y + renderedSize.height)
             context.scaleBy(x: pageScale, y: -pageScale)
             context.translateBy(x: -pageBounds.minX, y: -pageBounds.minY)
-            page.draw(with: .mediaBox, to: context)
+            if canvasBackground == nil || canvasBackground?.sourceKind == .pdf {
+                page.draw(with: .mediaBox, to: context)
+            }
             context.restoreGState()
 
             for element in pageElements.sorted(by: {
@@ -4365,11 +4837,11 @@ private struct PageThumbnailSidebar: View {
                                     forDeletedPage: page,
                                     size: CGSize(width: 220, height: 310)
                                 )
-                                : documentStore.thumbnail(
-                                    forPage: pageIndex,
-                                    in: documentID,
-                                    size: CGSize(width: 220, height: 310)
-                                ),
+                                : nil,
+                            pdfPage: filter == .deleted
+                                ? nil
+                                : documentStore.page(at: pageIndex, in: documentID),
+                            drawingActivitySource: documentStore,
                             pageIndex: pageIndex,
                             isCurrent: filter != .deleted && pageIndex == currentPageIndex,
                             isSelected: selectedPageIDs.contains(page.id),
@@ -4686,6 +5158,8 @@ private struct PageReorderDropDelegate: DropDelegate {
 
 private struct PageThumbnailCard: View {
     let image: UIImage?
+    let pdfPage: PDFPage?
+    let drawingActivitySource: DrawingDocumentStore?
     let pageIndex: Int
     let isCurrent: Bool
     let isSelected: Bool
@@ -4704,6 +5178,15 @@ private struct PageThumbnailCard: View {
                             .resizable()
                             .interpolation(.high)
                             .aspectRatio(contentMode: .fit)
+                    } else if let pdfPage {
+                        // Live page thumbnails share the background raster cache with the main
+                        // page. PDFKit no longer blocks MainActor while the sidebar is visible.
+                        PDFPageView(
+                            page: pdfPage,
+                            queuePriority: .low,
+                            drawingActivitySource: drawingActivitySource,
+                            allowsInitialRenderDuringHandwriting: false
+                        )
                     } else {
                         Rectangle()
                             .fill(TiyiNoteTheme.surfaceRaised)
