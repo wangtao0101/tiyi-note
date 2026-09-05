@@ -15,7 +15,6 @@ struct PDFDocumentTabBar: View {
     let onShowLibrary: () -> Void
 
     private var isCompact: Bool { horizontalSizeClass == .compact }
-    private var tabStride: CGFloat { (isCompact ? 196 : 248) + 2 }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -34,26 +33,46 @@ struct PDFDocumentTabBar: View {
                 .fill(Color.white.opacity(0.14))
                 .frame(width: 1, height: 22)
 
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 2) {
-                        ForEach(openDocuments) { document in
-                            reorderableTab(document)
+            GeometryReader { geometry in
+                let minimumTabWidth: CGFloat = isCompact ? 144 : 168
+                let tabWidth = min(240, max(minimumTabWidth,
+                    (geometry.size.width - 12) / CGFloat(max(openDocuments.count, 1))
+                ))
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 0) {
+                            ForEach(Array(openDocuments.enumerated()), id: \.element.id) { index, document in
+                                reorderableTab(document, width: tabWidth)
+                                    .overlay(alignment: .trailing) {
+                                        if document.id != activeDocumentID,
+                                           document.id != draggedDocumentID,
+                                           index < openDocuments.count - 1,
+                                           openDocuments[index + 1].id != activeDocumentID {
+                                            Rectangle()
+                                                .fill(TiyiNoteTheme.documentChromeMuted.opacity(0.24))
+                                                .frame(width: 1, height: 18)
+                                                .allowsHitTesting(false)
+                                        }
+                                    }
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.top, 4)
+                    }
+                    .accessibilityIdentifier("document-tab-scroll")
+                    .onAppear {
+                        scrollActiveTab(with: proxy, animated: false)
+                    }
+                    .onChange(of: activeDocumentID) { _, documentID in
+                        guard draggedDocumentID == nil else { return }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo(documentID, anchor: .center)
                         }
                     }
-                    .padding(.horizontal, 6)
-                }
-                .accessibilityIdentifier("document-tab-scroll")
-                .onAppear {
-                    scrollActiveTab(with: proxy, animated: false)
-                }
-                .onChange(of: activeDocumentID) { _, documentID in
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        proxy.scrollTo(documentID, anchor: .center)
+                    .onChange(of: openDocuments.map(\.id)) { _, _ in
+                        guard draggedDocumentID == nil else { return }
+                        scrollActiveTab(with: proxy, animated: false)
                     }
-                }
-                .onChange(of: openDocuments.map(\.id)) { _, _ in
-                    scrollActiveTab(with: proxy, animated: false)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -86,43 +105,48 @@ struct PDFDocumentTabBar: View {
     }
 
     @ViewBuilder
-    private func reorderableTab(_ document: PDFWorkspaceDocument) -> some View {
+    private func reorderableTab(_ document: PDFWorkspaceDocument, width: CGFloat) -> some View {
         let tab = PDFDocumentTab(
             document: document,
             isActive: document.id == activeDocumentID,
             canClose: openDocuments.count > 1,
-            isCompact: isCompact,
-            onSelect: { onSelectDocument(document.id) },
+            width: width,
+            onSelect: {
+                guard draggedDocumentID == nil else { return }
+                onSelectDocument(document.id)
+            },
             onClose: { onCloseDocument(document.id) }
         )
+        .disabled(draggedDocumentID != nil)
         .id(document.id)
-        .offset(x: horizontalDragOffset(for: document.id))
+        .offset(x: horizontalDragOffset(for: document.id, stride: width))
         .zIndex(tabZIndex(for: document.id))
 
         #if targetEnvironment(macCatalyst)
-        tab.highPriorityGesture(macDocumentDragGesture(for: document.id))
+        tab.highPriorityGesture(macDocumentDragGesture(for: document.id, stride: width))
         #else
         if UIDevice.current.userInterfaceIdiom == .phone {
-            // On iPhone the tab strip is narrower than two tabs. A long-press
-            // reorder recognizer on every tab prevents the horizontal scroll view
-            // from taking ownership of swipes, making off-screen tabs unreachable.
-            // Phone is read-only and prioritizes reliable tab navigation; iPad
-            // keeps drag-to-reorder below.
             tab
         } else {
-            tab.simultaneousGesture(touchDocumentDragGesture(for: document.id))
+            tab.background {
+                DocumentTabDragBridge(
+                    onBegan: { beginDocumentDrag(document.id) },
+                    onChanged: { updateDocumentDrag(document.id, translationX: $0, stride: width) },
+                    onEnded: finishDocumentDrag
+                )
+            }
         }
         #endif
     }
 
-    private func horizontalDragOffset(for documentID: String) -> CGFloat {
+    private func horizontalDragOffset(for documentID: String, stride: CGFloat) -> CGFloat {
         guard documentID == draggedDocumentID,
               let dragOriginIndex,
               let currentIndex = openDocuments.firstIndex(where: { $0.id == documentID }) else {
             return 0
         }
 
-        let reorderedDistance = CGFloat(currentIndex - dragOriginIndex) * tabStride
+        let reorderedDistance = CGFloat(currentIndex - dragOriginIndex) * stride
         return dragTranslationX - reorderedDistance
     }
 
@@ -142,7 +166,7 @@ struct PDFDocumentTabBar: View {
         dragTranslationX = 0
     }
 
-    private func updateDocumentDrag(_ documentID: String, translationX: CGFloat) {
+    private func updateDocumentDrag(_ documentID: String, translationX: CGFloat, stride: CGFloat) {
         beginDocumentDrag(documentID)
         guard draggedDocumentID == documentID,
               let dragOriginIndex,
@@ -152,7 +176,7 @@ struct PDFDocumentTabBar: View {
         }
 
         dragTranslationX = translationX
-        let projectedIndex = CGFloat(dragOriginIndex) + translationX / tabStride
+        let projectedIndex = CGFloat(dragOriginIndex) + translationX / stride
         let destinationIndex = min(
             max(Int(projectedIndex.rounded()), 0),
             openDocuments.count - 1
@@ -174,41 +198,152 @@ struct PDFDocumentTabBar: View {
     }
 
     #if targetEnvironment(macCatalyst)
-    private func macDocumentDragGesture(for documentID: String) -> some Gesture {
+    private func macDocumentDragGesture(for documentID: String, stride: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 4, coordinateSpace: .global)
             .onChanged { value in
-                updateDocumentDrag(documentID, translationX: value.translation.width)
-            }
-            .onEnded { _ in
-                finishDocumentDrag()
-            }
-    }
-    #else
-    private func touchDocumentDragGesture(for documentID: String) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.25, maximumDistance: 12)
-            .sequenced(
-                before: DragGesture(minimumDistance: 0, coordinateSpace: .global)
-            )
-            .onChanged { value in
-                switch value {
-                case .first(true):
-                    beginDocumentDrag(documentID)
-                case .second(true, let dragValue):
-                    if let dragValue {
-                        updateDocumentDrag(
-                            documentID,
-                            translationX: dragValue.translation.width
-                        )
-                    }
-                default:
-                    break
-                }
+                updateDocumentDrag(documentID, translationX: value.translation.width, stride: stride)
             }
             .onEnded { _ in
                 finishDocumentDrag()
             }
     }
     #endif
+}
+
+/// Native long press leaves short swipes to the tab strip's scroll view. A SwiftUI sequenced
+/// long-press/drag on every tab can claim those swipes before the scroll view starts scrolling.
+private struct DocumentTabDragBridge: UIViewRepresentable {
+    let onBegan: () -> Void
+    let onChanged: (CGFloat) -> Void
+    let onEnded: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> DocumentTabDragAnchor {
+        let view = DocumentTabDragAnchor()
+        let coordinator = context.coordinator
+        view.onMoved = { [weak view, weak coordinator] in
+            guard let view else { return }
+            coordinator?.attach(to: view)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: DocumentTabDragAnchor, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.attach(to: uiView)
+    }
+
+    static func dismantleUIView(_ uiView: DocumentTabDragAnchor, coordinator: Coordinator) {
+        coordinator.detach()
+        uiView.onMoved = nil
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var parent: DocumentTabDragBridge
+        private weak var anchor: UIView?
+        private weak var scrollView: UIScrollView?
+        private weak var gestureHost: UIView?
+        private var recognizer: UILongPressGestureRecognizer?
+        private var originX: CGFloat = 0
+        private var isDragging = false
+        private var restoresPan = false
+
+        init(parent: DocumentTabDragBridge) { self.parent = parent }
+
+        func attach(to anchor: UIView) {
+            self.anchor = anchor
+            var ancestor = anchor.superview
+            var contentHost = anchor
+            while let view = ancestor {
+                if let scrollView = view as? UIScrollView {
+                    guard self.gestureHost !== contentHost else { return }
+                    detach()
+                    self.anchor = anchor
+                    self.scrollView = scrollView
+                    gestureHost = contentHost
+                    let gesture = UILongPressGestureRecognizer(target: self, action: #selector(handleDrag(_:)))
+                    gesture.minimumPressDuration = 0.28
+                    gesture.allowableMovement = 12
+                    gesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+                    gesture.delaysTouchesBegan = false
+                    gesture.delaysTouchesEnded = false
+                    gesture.delegate = self
+                    // Keep this recognizer in the scroll content; HostingScrollView owns
+                    // the lifecycle and arbitration of the recognizers installed on itself.
+                    contentHost.addGestureRecognizer(gesture)
+                    recognizer = gesture
+                    return
+                }
+                contentHost = view
+                ancestor = view.superview
+            }
+        }
+
+        func detach() {
+            finishDrag()
+            if let recognizer { gestureHost?.removeGestureRecognizer(recognizer) }
+            recognizer = nil
+            scrollView = nil
+            gestureHost = nil
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard let anchor, anchor.window != nil else { return false }
+            let point = touch.location(in: anchor)
+            // A close button remains an ordinary button, even while the finger rests on it.
+            guard anchor.bounds.contains(point), point.x < anchor.bounds.width - 38 else { return false }
+            originX = touch.location(in: anchor.window).x
+            return true
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            // SwiftUI's button responder begins on touch-down. Let the long press observe
+            // the same contact; an actual drag temporarily pauses the scroll view's pan.
+            return true
+        }
+
+        @objc private func handleDrag(_ gesture: UILongPressGestureRecognizer) {
+            guard let anchor else { return }
+            switch gesture.state {
+            case .began:
+                isDragging = true
+                restoresPan = scrollView?.panGestureRecognizer.isEnabled == true
+                scrollView?.panGestureRecognizer.isEnabled = false
+                parent.onBegan()
+            case .changed:
+                parent.onChanged(gesture.location(in: anchor.window).x - originX)
+            case .ended, .cancelled, .failed:
+                finishDrag()
+            default:
+                break
+            }
+        }
+
+        private func finishDrag() {
+            if restoresPan { scrollView?.panGestureRecognizer.isEnabled = true }
+            restoresPan = false
+            if isDragging {
+                isDragging = false
+                parent.onEnded()
+            }
+        }
+    }
+}
+
+private final class DocumentTabDragAnchor: UIView {
+    var onMoved: (() -> Void)?
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        onMoved?()
+        DispatchQueue.main.async { [weak self] in self?.onMoved?() }
+    }
 }
 
 /// The trailing document commands in Goodnotes' writing-tool row. Only actions that Tiyi already
@@ -225,9 +360,9 @@ struct DocumentToolbarActions: View {
         HStack(spacing: 1) {
             if canImportPDF {
                 Button(action: onImportPDF) {
-                    DocumentTopBarIcon(symbol: "doc.badge.plus")
+                    DocumentToolbarIcon(symbol: "doc.badge.plus")
                 }
-                .buttonStyle(DocumentTopBarPressedStyle())
+                .buttonStyle(DocumentToolbarPressedStyle(isSelected: false))
                 .accessibilityLabel("导入 PDF 或可编辑文稿")
                 .accessibilityIdentifier("document-import-button")
             }
@@ -247,7 +382,7 @@ struct DocumentToolbarActions: View {
                     Label("多人协作", systemImage: "person.2.badge.plus")
                 }
             } label: {
-                DocumentTopBarIcon(symbol: "square.and.arrow.up")
+                DocumentToolbarIcon(symbol: "square.and.arrow.up")
             }
             .disabled(!hasActiveDocument)
             .accessibilityLabel("导出和分享")
@@ -266,7 +401,7 @@ struct DocumentToolbarActions: View {
                     }
                 }
             } label: {
-                DocumentTopBarIcon(symbol: "ellipsis.circle")
+                DocumentToolbarIcon(symbol: "ellipsis.circle")
             }
             .disabled(!hasActiveDocument)
             .accessibilityLabel("更多文稿操作")
@@ -274,34 +409,11 @@ struct DocumentToolbarActions: View {
     }
 }
 
-private struct DocumentTopBarIcon: View {
-    let symbol: String
-
-    var body: some View {
-        Image(systemName: symbol)
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(TiyiNoteTheme.documentChromeForeground)
-            .frame(width: 38, height: 38)
-            .contentShape(Rectangle())
-    }
-}
-
-private struct DocumentTopBarPressedStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background(
-                Color.white.opacity(configuration.isPressed ? 0.13 : 0),
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-            )
-            .scaleEffect(configuration.isPressed ? 0.96 : 1)
-    }
-}
-
 private struct PDFDocumentTab: View {
     let document: PDFWorkspaceDocument
     let isActive: Bool
     let canClose: Bool
-    let isCompact: Bool
+    let width: CGFloat
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -325,7 +437,7 @@ private struct PDFDocumentTab: View {
                                 : TiyiNoteTheme.documentChromeMuted
                         )
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -341,34 +453,46 @@ private struct PDFDocumentTab: View {
                                 ? TiyiNoteTheme.documentChromeForeground.opacity(0.76)
                                 : TiyiNoteTheme.documentChromeMuted.opacity(0.74)
                         )
-                        .frame(width: 24, height: 30)
+                        .frame(width: 28, height: 32)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("关闭 \(document.title)")
             }
         }
-        .padding(.leading, 12)
-        .padding(.trailing, 8)
-        .frame(
-            width: isCompact ? 196 : 248,
-            height: 42
-        )
+        .padding(.leading, 16)
+        .padding(.trailing, 10)
+        .frame(width: width, height: 40)
         .background {
             if isActive {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                BrowserDocumentTabShape()
                     .fill(TiyiNoteTheme.documentToolbar)
             }
         }
-        .overlay(alignment: .bottom) {
-            if isActive {
-                Capsule()
-                    .fill(Color.white.opacity(0.88))
-                    .frame(height: 2)
-                    .padding(.horizontal, 14)
-            }
-        }
         .contentShape(Rectangle())
+    }
+}
+
+/// Rounded shoulders connect the active tab to the command row, like a browser tab strip.
+private struct BrowserDocumentTabShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let shoulder: CGFloat = 7
+        let corner: CGFloat = 11
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addQuadCurve(to: CGPoint(x: rect.minX + shoulder, y: rect.maxY - shoulder),
+                          control: CGPoint(x: rect.minX + shoulder, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX + shoulder, y: rect.minY + corner))
+        path.addQuadCurve(to: CGPoint(x: rect.minX + shoulder + corner, y: rect.minY),
+                          control: CGPoint(x: rect.minX + shoulder, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX - shoulder - corner, y: rect.minY))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX - shoulder, y: rect.minY + corner),
+                          control: CGPoint(x: rect.maxX - shoulder, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX - shoulder, y: rect.maxY - shoulder))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.maxY),
+                          control: CGPoint(x: rect.maxX - shoulder, y: rect.maxY))
+        path.closeSubpath()
+        return path
     }
 }
 

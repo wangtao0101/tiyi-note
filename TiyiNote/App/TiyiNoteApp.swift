@@ -205,10 +205,19 @@ private struct TextInteractionUITestHost: View {
                 )
             }
         }
-        let retainedOpenDocumentIDs = Set(
+        var retainedOpenDocumentIDs = Set(
             [firstDocument.id, secondDocument.id, workspacePDFDocument?.id]
                 .compactMap { $0 }
         )
+        if configuration.token.hasPrefix("tabs-overflow-") {
+            for index in 3...8 {
+                let document = try! store.createCanvas(
+                    named: "UITest Tab \(index)", in: nil,
+                    backgroundStyle: .blank, backgroundColor: .white
+                )
+                retainedOpenDocumentIDs.insert(document.id)
+            }
+        }
         for documentID in store.openDocumentIDs
         where !retainedOpenDocumentIDs.contains(documentID) {
             store.closeDocument(documentID)

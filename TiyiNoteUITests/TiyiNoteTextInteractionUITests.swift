@@ -75,15 +75,20 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let app = launchIsolatedApp(prefix: "library-return-context")
         XCTAssertTrue(app.staticTexts["返回目录"].firstMatch.waitForExistence(timeout: 8))
         XCTAssertFalse(app.buttons["隐藏侧栏"].exists)
-        let libraryTitle = app.staticTexts["document-library-title"]
+        let librarySearch = app.descendants(matching: .any)["library-search-field"]
+        XCTAssertTrue(librarySearch.waitForExistence(timeout: 3))
         let folderArtwork = app.descendants(matching: .any)
             .matching(NSPredicate(format: "label == %@", "返回目录文件夹外观")).firstMatch
         // SF Symbols' accessibility frame includes the glyph's small built-in side bearing.
-        XCTAssertEqual(folderArtwork.frame.minX, libraryTitle.frame.minX, accuracy: 5)
-        XCTAssertEqual(app.buttons["library-filter-menu"].frame.minX, libraryTitle.frame.minX, accuracy: 1)
+        XCTAssertEqual(folderArtwork.frame.minX, librarySearch.frame.minX, accuracy: 5)
+        XCTAssertEqual(app.buttons["library-filter-menu"].frame.minX, librarySearch.frame.minX, accuracy: 1)
         let nameColumnX = app.staticTexts["返回目录"].firstMatch.frame.minX
         XCTAssertEqual(app.staticTexts["UITest One"].firstMatch.frame.minX, nameColumnX, accuracy: 1)
         app.staticTexts["返回目录"].firstMatch.tap()
+        let folderScreenshot = XCTAttachment(screenshot: app.screenshot())
+        folderScreenshot.name = "Compact folder path and list rows"
+        folderScreenshot.lifetime = .keepAlways
+        add(folderScreenshot)
         selectLibraryKind("canvas", in: app)
         let search = app.textFields["搜索文稿和文件夹"]
         search.tap()
@@ -95,7 +100,11 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(items.waitForExistence(timeout: 4))
         items.swipeUp()
         items.swipeUp()
-        XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
+        // UIKit can retain a zero-height keyboard accessibility node after dismissal.
+        waitUntil(timeout: 3, application: app) {
+            let keyboard = app.keyboards.firstMatch
+            return !keyboard.exists || keyboard.frame.height < 1 || keyboard.frame.minY >= app.frame.maxY
+        }
         let visible = items.staticTexts.allElementsBoundByIndex.first {
             $0.label.hasPrefix("返回画板") && $0.isHittable
                 && $0.frame.minY > items.frame.minY + 30
@@ -152,10 +161,29 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             XCTAssertEqual(documents.frame.minY - chat.frame.maxY, features.frame.minY - documents.frame.maxY, accuracy: 1)
         }
 
+        func assertHeaderAligned(identifier: String) {
+            let headerContent = app.descendants(matching: .any)[identifier]
+            XCTAssertTrue(headerContent.waitForExistence(timeout: 4))
+            let sidebarSearch = app.textFields["sidebar-search"]
+            XCTAssertEqual(sidebarSearch.frame.midY, headerContent.frame.midY, accuracy: 1)
+            XCTAssertEqual(app.buttons["新聊天"].frame.midY, headerContent.frame.midY, accuracy: 1)
+            if identifier == "library-search-field" {
+                XCTAssertFalse(app.staticTexts["document-library-title"].exists)
+                XCTAssertFalse(app.buttons["返回首页"].exists)
+                XCTAssertEqual(app.buttons["library-filter-menu"].frame.minX, headerContent.frame.minX, accuracy: 1)
+            }
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "Aligned workspace header - \(identifier)"
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+        }
+
         assertNavigationRows(selected: chat)
+        assertHeaderAligned(identifier: "chat-page-title")
         documents.tap()
         let library = app.descendants(matching: .any)["document-library"]
         XCTAssertTrue(library.waitForExistence(timeout: 8))
+        assertHeaderAligned(identifier: "library-search-field")
         assertNavigationRows(selected: documents)
         XCTAssertLessThanOrEqual(documents.frame.maxX, library.frame.minX + 1)
         waitUntil(timeout: 4, application: app) { sidebar.frame.maxY > app.frame.maxY - 60 }
@@ -163,8 +191,13 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertFalse(app.buttons["隐藏侧栏"].exists)
         features.tap()
         assertNavigationRows(selected: features)
+        assertHeaderAligned(identifier: "feature-page-title")
         XCTAssertTrue(documents.isHittable)
         XCTAssertFalse(app.staticTexts["文件"].exists)
+        app.buttons.containing(.staticText, identifier: "错题本").firstMatch.tap()
+        assertHeaderAligned(identifier: "wrongbook-page-title")
+        app.buttons["返回功能"].tap()
+        assertHeaderAligned(identifier: "feature-page-title")
         chat.tap()
         XCTAssertTrue(library.waitForNonExistence(timeout: 3))
         assertNavigationRows(selected: chat)
@@ -173,6 +206,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         rotateApplicationToLandscape(app)
         waitUntil(timeout: 4) { documents.isHittable && documents.frame.maxX <= library.frame.minX + 1 }
         assertNavigationRows(selected: documents)
+        assertHeaderAligned(identifier: "library-search-field")
 
         let folderName = "导航验收 \(UUID().uuidString.prefix(6))"
         createFolder(named: folderName, in: app)
@@ -211,6 +245,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                 && sidebar.frame.maxY > app.frame.maxY - 60
         }
         assertNavigationRows(selected: documents)
+        assertHeaderAligned(identifier: "library-search-field")
 
         let search = app.textFields["搜索文稿和文件夹"]
         search.tap()
@@ -228,6 +263,111 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(app.buttons[folderName].firstMatch.exists)
         XCTAssertGreaterThan(sidebar.frame.maxY, app.frame.maxY - 60)
 #endif
+    }
+
+    func testIntegratedIPhoneLibraryDrawerAndReaderNavigation() throws {
+        guard UIDevice.current.userInterfaceIdiom == .phone else {
+            throw XCTSkip("This regression covers the integrated iPhone drawer")
+        }
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.tiyi.chat")
+        app.launch()
+        let documents = app.buttons["sidebar-documents"]
+        let chat = app.buttons["sidebar-chat"]
+        let features = app.buttons["sidebar-features"]
+        let library = app.descendants(matching: .any)["document-library"]
+        let search = app.descendants(matching: .any)["library-search-field"]
+
+        func edgeSwipe() {
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: 8, dy: app.frame.height * 0.55))
+                .press(forDuration: 0.05,
+                       thenDragTo: origin.withOffset(CGVector(dx: app.frame.width * 0.80, dy: app.frame.height * 0.55)),
+                       withVelocity: .slow, thenHoldForDuration: 0)
+        }
+        func openDrawer() {
+            edgeSwipe()
+            waitUntil(timeout: 4, application: app) { documents.exists && documents.isHittable }
+        }
+        func assertLibrary() {
+            XCTAssertTrue(search.waitForExistence(timeout: 5))
+            waitUntil(timeout: 4, application: app) { abs(search.frame.minX - 16) < 1 }
+            XCTAssertFalse(app.buttons["返回首页"].exists)
+            XCTAssertFalse(library.staticTexts["文稿"].exists)
+            XCTAssertFalse(app.buttons["新建"].exists)
+            XCTAssertFalse(app.buttons["选择项目"].exists)
+            XCTAssertEqual(app.buttons["library-filter-menu"].frame.minX, search.frame.minX, accuracy: 1)
+            XCTAssertEqual(app.buttons["iCloud 同步状态"].frame.midY, search.frame.midY, accuracy: 1)
+            XCTAssertLessThanOrEqual(app.buttons["iCloud 同步状态"].frame.maxX, app.frame.maxX - 16)
+        }
+
+        openDrawer()
+        documents.tap()
+        assertLibrary()
+        let folder = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "导航验收 ")).firstMatch
+        XCTAssertTrue(folder.waitForExistence(timeout: 4))
+        folder.tap()
+        let breadcrumbs = app.scrollViews["library-breadcrumbs"]
+        XCTAssertTrue(breadcrumbs.waitForExistence(timeout: 4))
+        let folderScreenshot = XCTAttachment(screenshot: app.screenshot())
+        folderScreenshot.name = "iPhone inline folder navigation"
+        folderScreenshot.lifetime = .keepAlways
+        add(folderScreenshot)
+        breadcrumbs.buttons["文稿"].tap()
+        assertLibrary()
+        let items = app.scrollViews["library-items"]
+        items.swipeUp()
+        items.swipeDown()
+        // A horizontal drag away from the opening edge must also leave the drawer closed.
+        items.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.50))
+            .press(forDuration: 0.05,
+                   thenDragTo: items.coordinate(withNormalizedOffset: CGVector(dx: 0.80, dy: 0.50)),
+                   withVelocity: .slow, thenHoldForDuration: 0)
+        assertLibrary()
+
+        openDrawer()
+        let drawerScreenshot = XCTAttachment(screenshot: app.screenshot())
+        drawerScreenshot.name = "iPhone document library edge drawer"
+        drawerScreenshot.lifetime = .keepAlways
+        add(drawerScreenshot)
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.55)).tap()
+        assertLibrary()
+        openDrawer()
+        chat.tap()
+        XCTAssertTrue(app.staticTexts["chat-page-title"].waitForExistence(timeout: 4))
+        XCTAssertTrue(library.waitForNonExistence(timeout: 4))
+        openDrawer()
+        features.tap()
+        XCTAssertTrue(app.staticTexts["feature-page-title"].waitForExistence(timeout: 4))
+        openDrawer()
+        documents.tap()
+        assertLibrary()
+
+        // Seed the integrated simulator with the iPad's library fixture before this test.
+        let document = app.staticTexts["未命名画板"].firstMatch
+        XCTAssertTrue(document.waitForExistence(timeout: 5))
+        let searchInput = app.textFields["搜索文稿和文件夹"]
+        searchInput.tap()
+        searchInput.typeText("未命名画板")
+        document.tap()
+        let home = app.buttons["home-button"]
+        XCTAssertTrue(home.waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts["只读"].waitForExistence(timeout: 4))
+        XCTAssertFalse(app.buttons["tool-pen"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["tiyi-main-sidebar"].exists)
+        edgeSwipe()
+        XCTAssertFalse(documents.exists, "The host drawer must leave the reader's gesture hierarchy")
+        home.tap()
+        assertLibrary()
+        XCTAssertEqual(searchInput.value as? String, "未命名画板")
+        app.buttons["清除搜索"].tap()
+        openDrawer()
+        documents.tap()
+        assertLibrary()
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "iPhone compact document library header"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
     }
 
     func testTabsAndTextEditorUseOneStableInteractionState() throws {
@@ -422,6 +562,9 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertLessThan(abs(thumbnails.frame.midY - importDocument.frame.midY), 3)
         XCTAssertLessThan(abs(thumbnails.frame.midY - output.frame.midY), 3)
         XCTAssertLessThan(abs(thumbnails.frame.midY - more.frame.midY), 3)
+        for button in [thumbnails, pen, image, importDocument, output, more] {
+            XCTAssertEqual(button.frame.midY, toolBar.frame.midY, accuracy: 1)
+        }
         for trailingAction in [importDocument, output, more] {
             XCTAssertGreaterThanOrEqual(
                 trailingAction.frame.minX,
@@ -477,6 +620,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertGreaterThan(undo.frame.minX, shape.frame.maxX)
         XCTAssertLessThan(toolBar.frame.maxX - more.frame.maxX, 20)
         XCTAssertEqual(undo.frame.midY, more.frame.midY, accuracy: 1)
+        XCTAssertEqual(pen.frame.midY, toolBar.frame.midY, accuracy: 1)
     }
 
     func testDockableToolPaletteSnapsAndReorientsOnAllFourEdges() throws {
@@ -2822,7 +2966,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let home = app.buttons["home-button"]
         XCTAssertTrue(home.waitForExistence(timeout: 3))
         home.tap()
-        XCTAssertTrue(app.staticTexts["文稿"].firstMatch.waitForExistence(timeout: 4))
+        XCTAssertTrue(app.descendants(matching: .any)["document-library"].waitForExistence(timeout: 4))
         XCTAssertFalse(app.buttons["新建"].exists)
         XCTAssertFalse(app.buttons["选择项目"].exists)
 
@@ -2913,6 +3057,44 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(activityList.waitForNonExistence(timeout: 4))
     }
 
+    func testTabletTabStripScrollsBothWaysWithoutReordering() throws {
+        guard UIDevice.current.userInterfaceIdiom == .pad else {
+            throw XCTSkip("iPad tab strip interaction")
+        }
+        let app = launchIsolatedApp(prefix: "tabs-overflow")
+        let strip = app.scrollViews["document-tab-scroll"]
+        let first = app.buttons["document-tab-UITest One"]
+        let last = app.buttons["document-tab-UITest Tab 8"]
+        XCTAssertTrue(strip.waitForExistence(timeout: 5))
+        XCTAssertTrue(first.isHittable)
+        let tabs = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "document-tab-"))
+        let originalOrder = tabs.allElementsBoundByIndex.map(\.identifier)
+        XCTAssertEqual(originalOrder.count, 8)
+
+        func isVisible(_ tab: XCUIElement) -> Bool {
+            strip.frame.contains(CGPoint(x: tab.frame.midX, y: tab.frame.midY))
+        }
+        func swipeStrip(left: Bool) {
+            let origin = strip.coordinate(withNormalizedOffset: .zero)
+            let y = first.frame.midY - strip.frame.minY
+            origin.withOffset(CGVector(dx: strip.frame.width * (left ? 0.82 : 0.18), dy: y))
+                .press(forDuration: 0.04,
+                       thenDragTo: origin.withOffset(CGVector(dx: strip.frame.width * (left ? 0.18 : 0.82), dy: y)),
+                       withVelocity: .slow, thenHoldForDuration: 0)
+        }
+        for _ in 0..<4 where !isVisible(last) { swipeStrip(left: true) }
+        XCTAssertTrue(last.isHittable, "A finger swipe must reveal overflow tabs on iPad")
+        XCTAssertEqual(first.value as? String, "active", "Scrolling must not switch or reorder documents")
+        XCTAssertEqual(tabs.allElementsBoundByIndex.map(\.identifier), originalOrder)
+        last.tap()
+        XCTAssertEqual(last.value as? String, "active")
+        for _ in 0..<4 where !isVisible(first) { swipeStrip(left: false) }
+        XCTAssertTrue(first.isHittable, "The strip must also scroll back to the first document")
+        XCTAssertEqual(tabs.allElementsBoundByIndex.map(\.identifier), originalOrder)
+        first.tap()
+        XCTAssertEqual(first.value as? String, "active")
+    }
+
     func testTabsReorderCloseAndHomeRemainUsable() throws {
         let app = launchIsolatedApp(prefix: "tabs-home")
         let firstTab = app.buttons["document-tab-UITest One"]
@@ -2932,6 +3114,19 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             secondTab.frame.minX < firstTab.frame.minX
         }
         XCTAssertEqual(firstTab.frame.minY, secondTab.frame.minY, accuracy: 1)
+        XCTAssertEqual(firstTab.value as? String, "active")
+
+        let reverseDragStart = secondTab.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.45, dy: 0.50)
+        )
+        reverseDragStart.press(
+            forDuration: 0.35,
+            thenDragTo: reverseDragStart.withOffset(CGVector(dx: 250, dy: 0))
+        )
+        waitUntil(timeout: 3) {
+            firstTab.frame.minX < secondTab.frame.minX
+        }
+        XCTAssertEqual(firstTab.value as? String, "active")
 
         firstTab.tap()
         XCTAssertEqual(firstTab.value as? String, "active")
@@ -2948,13 +3143,13 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(home.waitForExistence(timeout: 3))
         home.tap()
         XCTAssertTrue(
-            app.staticTexts["文稿"].firstMatch.waitForExistence(timeout: 3)
+            app.descendants(matching: .any)["document-library"].waitForExistence(timeout: 3)
         )
     }
 
     func testLibraryCreatesNestedFoldersCanvasAndReturnsFromDocument() throws {
         let app = launchIsolatedApp(prefix: "library-create-nested")
-        XCTAssertTrue(app.staticTexts["文稿"].firstMatch.waitForExistence(timeout: 8))
+        XCTAssertTrue(app.descendants(matching: .any)["document-library"].waitForExistence(timeout: 8))
 
         createFolder(named: "项目 A", in: app)
         let project = app.staticTexts["项目 A"].firstMatch
@@ -2988,7 +3183,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         canvas.tap()
         XCTAssertTrue(app.buttons["home-button"].waitForExistence(timeout: 5))
         app.buttons["home-button"].tap()
-        XCTAssertTrue(app.staticTexts["文稿"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["document-library"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["项目 A"].firstMatch.exists)
     }
 
@@ -3175,7 +3370,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
 
     func testLibraryFolderSubtreeTrashRestoreCycleGuardAndEmptyTrash() throws {
         let app = launchIsolatedApp(prefix: "library-folder-subtree")
-        XCTAssertTrue(app.staticTexts["文稿"].firstMatch.waitForExistence(timeout: 8))
+        XCTAssertTrue(app.descendants(matching: .any)["document-library"].waitForExistence(timeout: 8))
         createFolder(named: "父文件夹", in: app)
         app.staticTexts["父文件夹"].firstMatch.tap()
         createFolder(named: "子文件夹", in: app)

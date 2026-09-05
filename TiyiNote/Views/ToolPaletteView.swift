@@ -58,7 +58,7 @@ struct ToolPaletteView: View {
             GeometryReader { geometry in
                 let horizontalPadding: CGFloat = 20
                 let leadingControlsWidth: CGFloat = 78
-                let dividerWidth: CGFloat = 1
+                let dividerWidth: CGFloat = 5
                 let outerSpacing: CGFloat = 24
                 let trailingActionCount = canImportPDF ? 3 : 2
                 let trailingActionsWidth = CGFloat(trailingActionCount * 38)
@@ -74,31 +74,31 @@ struct ToolPaletteView: View {
                 )
 
                 HStack(spacing: 8) {
-                HStack(spacing: 2) {
-                    DocumentToolbarButton(
-                        symbol: "rectangle.split.1x2",
-                        title: showsThumbnails ? "关闭页面缩略图" : "打开页面缩略图",
-                        isSelected: showsThumbnails
-                    ) {
-                        withAnimation(.easeInOut(duration: 0.22)) {
-                            showsThumbnails.toggle()
+                    HStack(spacing: 2) {
+                        DocumentToolbarButton(
+                            symbol: "rectangle.split.1x2",
+                            title: showsThumbnails ? "关闭页面缩略图" : "打开页面缩略图",
+                            isSelected: showsThumbnails
+                        ) {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                showsThumbnails.toggle()
+                            }
                         }
+
+                        DocumentToolbarButton(
+                            symbol: "magnifyingglass",
+                            title: "搜索 PDF",
+                            action: onSearch
+                        )
                     }
 
-                    DocumentToolbarButton(
-                        symbol: "magnifyingglass",
-                        title: "搜索 PDF",
-                        action: onSearch
-                    )
-                }
+                    DocumentToolbarDivider()
 
-                DocumentToolbarDivider()
-
-                // Only the drawing-tool cluster is allowed to scroll. Keeping the document
-                // actions outside this scroll view guarantees that import, export, and More stay
-                // visible at the trailing edge, matching Goodnotes. The old outer ScrollView
-                // contained flexible Spacers; under an unbounded horizontal proposal they could
-                // expand and push the trailing actions completely off screen.
+                    // Only the drawing-tool cluster is allowed to scroll. Keeping the document
+                    // actions outside this scroll view guarantees that import, export, and More stay
+                    // visible at the trailing edge, matching Goodnotes. The old outer ScrollView
+                    // contained flexible Spacers; under an unbounded horizontal proposal they could
+                    // expand and push the trailing actions completely off screen.
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 3) {
                             ToolButton(tool: .lasso, isSelected: selectedTool == .lasso) {
@@ -176,7 +176,7 @@ struct ToolPaletteView: View {
                         // horizontally scrolling portion of the toolbar.
                         .frame(minWidth: centerWidth, alignment: .center)
                     }
-                    .frame(width: centerWidth)
+                    .frame(width: centerWidth, height: 38)
                     .accessibilityIdentifier("tool-settings-scroll")
 
                     DocumentToolbarActions(
@@ -189,7 +189,7 @@ struct ToolPaletteView: View {
                     )
                     .fixedSize(horizontal: true, vertical: false)
                 }
-                .frame(width: max(geometry.size.width - horizontalPadding, 0))
+                .frame(width: max(geometry.size.width - horizontalPadding, 0), height: geometry.size.height)
                 .padding(.horizontal, horizontalPadding / 2)
             }
         }
@@ -1066,8 +1066,7 @@ private struct ToolButton: View {
                 if tool == .marker {
                     HighlighterToolIcon()
                 } else {
-                    Image(systemName: tool.symbolName)
-                        .font(.system(size: 16, weight: .semibold))
+                    DocumentToolbarGlyph(symbol: tool.symbolName)
                 }
             }
             .foregroundStyle(
@@ -1143,15 +1142,46 @@ private struct DocumentToolbarButton: View {
     }
 }
 
-private struct DocumentToolbarIcon: View {
+/// Fit symbols by their visible shape, so text-baseline metrics cannot shift individual icons.
+private struct DocumentToolbarGlyph: View {
+    let symbol: String
+
+    // These compound symbols include unequal internal bearings around the badge/arrow.
+    // Match their visible 20-point outline to the circle and the leading toolbar icons.
+    private var outlineHeight: CGFloat {
+        switch symbol {
+        case "doc.badge.plus", "square.and.arrow.up": 21
+        default: 20
+        }
+    }
+
+    private var opticalOffsetY: CGFloat {
+        switch symbol {
+        case "doc.badge.plus": 0.5
+        case "square.and.arrow.up": -0.5
+        default: 0
+        }
+    }
+
+    var body: some View {
+        Image(systemName: symbol)
+            .resizable()
+            .scaledToFit()
+            .frame(width: 20, height: outlineHeight)
+            .offset(y: opticalOffsetY)
+            .frame(width: 20, height: 20)
+            .font(.system(size: 16, weight: .semibold))
+    }
+}
+
+struct DocumentToolbarIcon: View {
     let symbol: String
     var isEnabled = true
     var isSelected = false
     var tint = TiyiNoteTheme.documentChromeForeground
 
     var body: some View {
-        Image(systemName: symbol)
-            .font(.system(size: 16, weight: .semibold))
+        DocumentToolbarGlyph(symbol: symbol)
             .foregroundStyle(
                 isEnabled
                     ? (isSelected ? TiyiNoteTheme.documentChrome : tint)
@@ -1166,7 +1196,7 @@ private struct DocumentToolbarIcon: View {
     }
 }
 
-private struct DocumentToolbarPressedStyle: ButtonStyle {
+struct DocumentToolbarPressedStyle: ButtonStyle {
     let isSelected: Bool
 
     func makeBody(configuration: Configuration) -> some View {

@@ -1,6 +1,14 @@
 import SwiftUI
 import UIKit
 
+/// Shared geometry keeps the host sidebar and every workspace header on the library's baseline.
+public enum TiyiWorkspaceLayout {
+    public static let headerHeight: CGFloat = 44
+    public static let headerSearchHeight: CGFloat = 32
+    public static let headerTitleFont = Font.system(size: 18, weight: .semibold)
+    public static let headerSearchFont = Font.system(size: 14)
+}
+
 enum TiyiNoteTheme {
     static let workspace = adaptive(
         light: rgb(0.969, 0.976, 0.984),

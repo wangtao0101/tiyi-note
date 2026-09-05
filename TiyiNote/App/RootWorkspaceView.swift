@@ -17,6 +17,7 @@ struct RootWorkspaceView: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     let onExit: (() -> Void)?
     let librarySidebar: AnyView?
+    let libraryContainer: ((AnyView) -> AnyView)?
 
     @State private var libraryBrowsingState = LibraryBrowserState()
 
@@ -39,38 +40,22 @@ struct RootWorkspaceView: View {
     init(
         documentStore: DrawingDocumentStore,
         onExit: (() -> Void)? = nil,
-        librarySidebar: AnyView? = nil
+        librarySidebar: AnyView? = nil,
+        libraryContainer: ((AnyView) -> AnyView)? = nil
     ) {
         self.documentStore = documentStore
         self.onExit = onExit
         self.librarySidebar = librarySidebar
+        self.libraryContainer = libraryContainer
     }
 
     var body: some View {
         Group {
             switch destination {
             case .library:
-                HStack(spacing: 0) {
-                    if let librarySidebar {
-                        librarySidebar
-                        Divider()
-                            .ignoresSafeArea(.keyboard, edges: .bottom)
-                    }
-                    LibraryBrowserView(
-                        documentStore: documentStore,
-                        browsingState: libraryBrowsingState,
-                        onExit: librarySidebar == nil ? onExit : nil,
-                        onSyncNow: {
-                            await refreshSharedDocuments()
-                            await synchronizeAllCloudZones()
-                        },
-                        onOpenDocument: openDocument,
-                        canEditDocument: canEditDocument,
-                        onCollaborateDocument: presentCollaboration
-                    )
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .transition(.opacity)
+                librarySurface
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .transition(.opacity)
             case .workspace:
                 CanvasScreen(
                     documentStore: documentStore,
@@ -221,6 +206,37 @@ struct RootWorkspaceView: View {
                 await scheduleAllCloudZones()
             }
         }
+    }
+
+    @ViewBuilder
+    private var librarySurface: some View {
+        if let libraryContainer {
+            libraryContainer(AnyView(libraryBrowser))
+        } else {
+            HStack(spacing: 0) {
+                if let librarySidebar {
+                    librarySidebar
+                    Divider()
+                        .ignoresSafeArea(.keyboard, edges: .bottom)
+                }
+                libraryBrowser
+            }
+        }
+    }
+
+    private var libraryBrowser: some View {
+        LibraryBrowserView(
+            documentStore: documentStore,
+            browsingState: libraryBrowsingState,
+            onExit: librarySidebar == nil && libraryContainer == nil ? onExit : nil,
+            onSyncNow: {
+                await refreshSharedDocuments()
+                await synchronizeAllCloudZones()
+            },
+            onOpenDocument: openDocument,
+            canEditDocument: canEditDocument,
+            onCollaborateDocument: presentCollaboration
+        )
     }
 
     private func openDocument(_ documentID: String) {

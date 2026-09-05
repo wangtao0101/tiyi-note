@@ -6,11 +6,13 @@ public struct TiyiDocumentsView: View {
     @StateObject private var documentStore: DrawingDocumentStore
     private let onExit: () -> Void
     private let librarySidebar: AnyView?
+    private let libraryContainer: ((AnyView) -> AnyView)?
 
     public init(onExit: @escaping () -> Void) {
         _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
         self.onExit = onExit
         librarySidebar = nil
+        libraryContainer = nil
     }
 
     /// The host app's navigation is mounted only beside the library. Opening a document removes
@@ -23,13 +25,27 @@ public struct TiyiDocumentsView: View {
         _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
         self.onExit = onExit
         self.librarySidebar = AnyView(librarySidebar())
+        libraryContainer = nil
+    }
+
+    /// A phone host can supply its drawer around the library only. The editor is rendered
+    /// outside this container, keeping host navigation gestures away from its canvas.
+    public init<LibraryContainer: View>(
+        onExit: @escaping () -> Void,
+        @ViewBuilder libraryContainer: @escaping (AnyView) -> LibraryContainer
+    ) {
+        _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
+        self.onExit = onExit
+        librarySidebar = nil
+        self.libraryContainer = { AnyView(libraryContainer($0)) }
     }
 
     public var body: some View {
         RootWorkspaceView(
             documentStore: documentStore,
             onExit: onExit,
-            librarySidebar: librarySidebar
+            librarySidebar: librarySidebar,
+            libraryContainer: libraryContainer
         )
 #if targetEnvironment(macCatalyst)
         .background {

@@ -57,6 +57,7 @@ struct LibraryBrowserView: View {
         libraryPage(folderID: scope == .documents ? browsingState.selectedFolderID : nil)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("document-library")
+        .accessibilityLabel("文稿")
         .fileImporter(
             isPresented: $showsPDFImporter,
             allowedContentTypes: [.pdf, .tiyiNoteDocument],
@@ -162,7 +163,14 @@ struct LibraryBrowserView: View {
             isSelecting: $isSelecting,
             selectedFolderIDs: $selectedFolderIDs,
             selectedDocumentIDs: $selectedDocumentIDs,
-            onSetScope: { browsingState.scope = $0 },
+            onSetScope: {
+                browsingState.scope = $0
+                // Selecting a library location also returns to its root when that location
+                // was already selected while browsing a nested folder.
+                finishSelecting()
+                browsingState.selectedFolderID = nil
+                browsingState.scrollOffset = 0
+            },
             onSetFilter: { browsingState.kindFilter = $0 },
             onSetLayout: { layoutRawValue = $0.rawValue },
             onSetSort: { sortRawValue = $0.rawValue },
@@ -230,38 +238,32 @@ struct LibraryBrowserView: View {
 
     private var libraryNavigationBar: some View {
         HStack(spacing: 10) {
-            if let onExit {
-                Button(action: onExit) {
-                    LibraryToolbarIcon(symbol: "chevron.left", fontSize: 14, frameSize: 30)
-                }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.circle)
-                .controlSize(.small)
-                .accessibilityLabel("返回首页")
-            }
-
-            Text("文稿")
-                .font(.system(size: 18, weight: .semibold))
-                .accessibilityIdentifier("document-library-title")
-
-            LibraryInlineSearchField(text: $browsingState.searchText)
+            LibraryInlineSearchField(text: $browsingState.searchText, fillsAvailableWidth: isCompact)
 
             Spacer(minLength: 0)
+
+            if let onExit {
+                Button(action: onExit) {
+                    LibraryToolbarIcon(symbol: "house", fontSize: 16, frameSize: 32)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("返回首页")
+            }
 
             Button {
                 showsCloudSyncStatus = true
             } label: {
-                LibraryToolbarIcon(symbol: cloudStatusSymbol, fontSize: 14, frameSize: 30)
+                LibraryToolbarIcon(symbol: cloudStatusSymbol, fontSize: 16, frameSize: 32)
             }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.circle)
-            .controlSize(.small)
+            .buttonStyle(.plain)
             .accessibilityLabel("iCloud 同步状态")
             .accessibilityValue(cloudStatusLabel)
         }
         .padding(.horizontal, isCompact ? 16 : 20)
-        .frame(height: 44)
+        .frame(height: TiyiWorkspaceLayout.headerHeight)
         .background(TiyiNoteTheme.chrome)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("document-library-header")
     }
 
     private var cloudStatusSymbol: String {
@@ -617,6 +619,7 @@ private struct LibraryToolbarIcon: View {
 
 private struct LibraryInlineSearchField: View {
     @Binding var text: String
+    let fillsAvailableWidth: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -626,7 +629,7 @@ private struct LibraryInlineSearchField: View {
 
             TextField("搜索文稿和文件夹", text: $text)
                 .textFieldStyle(.plain)
-                .font(.system(size: 14))
+                .font(TiyiWorkspaceLayout.headerSearchFont)
                 .foregroundStyle(TiyiNoteTheme.textPrimary)
 
             if !text.isEmpty {
@@ -642,26 +645,38 @@ private struct LibraryInlineSearchField: View {
             }
         }
         .padding(.horizontal, 12)
-        .frame(minWidth: 170, idealWidth: 250, maxWidth: 300)
-        .frame(height: 32)
+        .frame(minWidth: 0, idealWidth: 250, maxWidth: fillsAvailableWidth ? .infinity : 300)
+        .frame(height: TiyiWorkspaceLayout.headerSearchHeight)
         .contentShape(Rectangle())
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .background(TiyiNoteTheme.textPrimary.opacity(0.045), in: Capsule())
         .accessibilityElement(children: .contain)
         .accessibilityLabel("搜索文稿和文件夹")
+        .accessibilityIdentifier("library-search-field")
     }
 }
 
-private struct LibraryGlassControlGroup<Content: View>: View {
-    private let content: Content
+/// A compact visible control with extra vertical hit space, without automatic glass padding
+/// or a shadow that gets clipped by the phone's horizontal toolbar viewport.
+private struct LibraryCompactControlStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    var isProminent = false
+    var horizontalPadding: CGFloat = 10
 
-    init(@ViewBuilder content: () -> Content) {
-        self.content = content()
-    }
-
-    var body: some View {
-        GlassEffectContainer(spacing: 8) {
-            content
-        }
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, horizontalPadding)
+            .frame(height: 28)
+            .foregroundStyle(
+                isProminent ? Color.white
+                    : configuration.role == .destructive ? TiyiNoteTheme.danger : TiyiNoteTheme.textPrimary
+            )
+            .background(
+                isProminent ? TiyiNoteTheme.selectionBlue : TiyiNoteTheme.textPrimary.opacity(0.045),
+                in: Capsule()
+            )
+            .opacity(isEnabled ? (configuration.isPressed ? 0.65 : 1) : 0.45)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
     }
 }
 
@@ -698,16 +713,6 @@ private struct LibraryContentPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             pageHeader
-            if scope == .documents, searchText.isEmpty, folderID != nil {
-                LibraryBreadcrumbs(
-                    folderID: folderID,
-                    folders: documentStore.folders,
-                    onNavigate: onNavigate
-                )
-                .padding(.horizontal, isCompactLayout ? 16 : 20)
-                .padding(.bottom, 8)
-            }
-
             if folders.isEmpty, documents.isEmpty {
                 emptyState
             } else {
@@ -806,8 +811,8 @@ private struct LibraryContentPage: View {
     }
 
     private var pageHeader: some View {
-        VStack(alignment: .leading) {
-            if isCompactLayout {
+        VStack(alignment: .leading, spacing: 0) {
+            if isCompactLayout && !showsFolderPath {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         filterControl
@@ -815,19 +820,42 @@ private struct LibraryContentPage: View {
                         utilityControls
                     }
                 }
+                .frame(height: 36)
             } else {
                 HStack(spacing: 8) {
                     filterControl
-                    Spacer(minLength: 16)
+                        .fixedSize(horizontal: true, vertical: false)
+                    if showsFolderPath {
+                        Rectangle()
+                            .fill(TiyiNoteTheme.hairline)
+                            .frame(width: 1, height: 16)
+                            .padding(.horizontal, 2)
+                        LibraryBreadcrumbs(
+                            folderID: folderID,
+                            folders: documentStore.folders,
+                            onNavigate: onNavigate
+                        )
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                    } else {
+                        Spacer(minLength: 16)
+                    }
                     primaryAction
+                        .fixedSize(horizontal: true, vertical: false)
                     utilityControls
+                        .fixedSize(horizontal: true, vertical: false)
                 }
+                .frame(height: 36)
             }
         }
-        .controlSize(.small)
         .padding(.horizontal, isCompactLayout ? 16 : 20)
-        .padding(.vertical, 6)
+        .padding(.vertical, 2)
         .background(TiyiNoteTheme.chrome)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("library-controls-bar")
+    }
+
+    private var showsFolderPath: Bool {
+        scope == .documents && searchText.isEmpty && folderID != nil
     }
 
     private var filterControl: some View {
@@ -872,7 +900,7 @@ private struct LibraryContentPage: View {
                 .frame(height: 28)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.glass)
+        .buttonStyle(LibraryCompactControlStyle())
         .accessibilityLabel("筛选：\(scope == .documents ? "全部" : scope.title)，\(kindFilter.title)")
         .accessibilityIdentifier("library-filter-menu")
     }
@@ -903,20 +931,20 @@ private struct LibraryContentPage: View {
                     .padding(.horizontal, 2)
                     .frame(height: 28)
             }
-            .buttonStyle(.glassProminent)
+            .buttonStyle(LibraryCompactControlStyle(isProminent: true))
             .tint(TiyiNoteTheme.selectionBlue)
         } else if PlatformCapabilities.current.canManageLibrary,
                   scope == .trash,
                   !folders.isEmpty || !documents.isEmpty {
             Button("清空", role: .destructive, action: onEmptyTrash)
                 .font(.system(size: 13, weight: .semibold))
-                .buttonStyle(.glass)
+                .buttonStyle(LibraryCompactControlStyle())
                 .tint(TiyiNoteTheme.danger)
         }
     }
 
     private var utilityControls: some View {
-        LibraryGlassControlGroup {
+        Group {
             HStack(spacing: 8) {
                 Button {
                     onSetLayout(layoutMode == .list ? .grid : .list)
@@ -927,7 +955,7 @@ private struct LibraryContentPage: View {
                         frameSize: 28
                     )
                 }
-                .buttonStyle(.glass)
+                .buttonStyle(LibraryCompactControlStyle(horizontalPadding: 4))
                 .accessibilityLabel(layoutMode == .list ? "网格视图" : "列表视图")
 
                 Menu {
@@ -948,7 +976,7 @@ private struct LibraryContentPage: View {
                         frameSize: 28
                     )
                 }
-                .buttonStyle(.glass)
+                .buttonStyle(LibraryCompactControlStyle(horizontalPadding: 4))
                 .accessibilityLabel("排序：\(sortOrder.title)")
 
                 if PlatformCapabilities.current.canManageLibrary,
@@ -967,7 +995,7 @@ private struct LibraryContentPage: View {
                             frameSize: 28
                         )
                     }
-                    .buttonStyle(.glass)
+                    .buttonStyle(LibraryCompactControlStyle(horizontalPadding: 4))
                     .accessibilityLabel(isSelecting ? "完成选择" : "选择项目")
                 }
             }
@@ -1016,7 +1044,8 @@ private struct LibraryContentPage: View {
                     }
                 }
                 .padding(.horizontal, isCompactLayout ? 16 : 20)
-                .padding(.vertical, 8)
+                .padding(.top, 4)
+                .padding(.bottom, 8)
             } else {
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 170, maximum: 240), spacing: 18)],
@@ -1305,10 +1334,11 @@ private struct LibraryFolderListRow: View {
                 Text(folder.title)
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(TiyiNoteTheme.textPrimary)
-                    .lineLimit(2)
+                    .lineLimit(1)
                 Text(detail)
                     .font(.system(size: 12))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
+                    .lineLimit(1)
             }
             Spacer(minLength: 8)
             if isSelecting {
@@ -1329,9 +1359,7 @@ private struct LibraryFolderListRow: View {
                 .disabled(!canManage)
             }
         }
-        .padding(.leading, 0)
-        .padding(.trailing, 0)
-        .padding(.vertical, 10)
+        .frame(height: 60)
         .background(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -1389,10 +1417,11 @@ private struct LibraryDocumentListRow: View {
                 Text(document.title)
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(TiyiNoteTheme.textPrimary)
-                    .lineLimit(2)
+                    .lineLimit(1)
                 Text(detail)
                     .font(.system(size: 12))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
+                    .lineLimit(1)
             }
             Spacer(minLength: 8)
             if isSelecting {
@@ -1411,9 +1440,7 @@ private struct LibraryDocumentListRow: View {
                 .disabled(!canManage)
             }
         }
-        .padding(.leading, 0)
-        .padding(.trailing, 0)
-        .padding(.vertical, 10)
+        .frame(height: 60)
         .background(isSelected ? TiyiNoteTheme.selectionBackground : Color.clear)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -1750,20 +1777,30 @@ private struct LibraryBreadcrumbs: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 7) {
+            HStack(spacing: 6) {
                 Button("文稿") { onNavigate(nil) }
-                    .foregroundStyle(folderID == nil ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.selectionBlue)
+                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+                    .frame(height: 36)
                 ForEach(LibraryPath.ancestors(endingAt: folderID, folders: folders)) { folder in
                     Image(systemName: "chevron.right")
-                        .font(.caption2)
+                        .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(TiyiNoteTheme.textTertiary)
                     Button(folder.title) { onNavigate(folder.id) }
-                        .foregroundStyle(folder.id == folderID ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.selectionBlue)
+                        .fontWeight(folder.id == folderID ? .semibold : .regular)
+                        .foregroundStyle(folder.id == folderID ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textSecondary)
+                        .frame(height: 36)
                 }
             }
-            .font(.system(size: 13, weight: .medium))
+            .font(.system(size: 13))
+            .buttonStyle(.plain)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
         }
-        .frame(height: 26)
+        .defaultScrollAnchor(.trailing)
+        .defaultScrollAnchor(.leading, for: .alignment)
+        .frame(height: 36)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("library-breadcrumbs")
     }
 }
 
