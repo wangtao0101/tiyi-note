@@ -19,6 +19,7 @@ struct PDFDocumentReaderView: View {
     let eraserSize: CanvasEraserSize
     let eraserMode: CanvasEraserMode
     let isAnnotationEditingEnabled: Bool
+    let practice: TiyiPracticeWorkspace?
     let onSelectLassoTool: () -> Void
     let onSelectTextTool: () -> Void
     let onActiveCanvasChanged: (CanvasController, Int) -> Void
@@ -34,8 +35,8 @@ struct PDFDocumentReaderView: View {
     private var isUnboundedCanvas: Bool {
         documentStore.document(withID: documentID)?.kind == .canvas
     }
-    private let minimumZoomScale: CGFloat = 1
-    private let maximumZoomScale: CGFloat = 3
+    private let minimumZoomScale = CanvasViewport.minimumZoomScale
+    private let maximumZoomScale = CanvasViewport.maximumZoomScale
 
     init(
         documentStore: DrawingDocumentStore,
@@ -51,6 +52,7 @@ struct PDFDocumentReaderView: View {
         eraserSize: CanvasEraserSize,
         eraserMode: CanvasEraserMode,
         isAnnotationEditingEnabled: Bool = true,
+        practice: TiyiPracticeWorkspace? = nil,
         initialPageIndex: Int,
         onSelectLassoTool: @escaping () -> Void,
         onSelectTextTool: @escaping () -> Void,
@@ -69,6 +71,7 @@ struct PDFDocumentReaderView: View {
         self.eraserSize = eraserSize
         self.eraserMode = eraserMode
         self.isAnnotationEditingEnabled = isAnnotationEditingEnabled
+        self.practice = practice
         self.onSelectLassoTool = onSelectLassoTool
         self.onSelectTextTool = onSelectTextTool
         self.onActiveCanvasChanged = onActiveCanvasChanged
@@ -94,6 +97,7 @@ struct PDFDocumentReaderView: View {
                     documentStore: documentStore,
                     documentID: documentID,
                     currentPageIndex: currentPageIndex,
+                    practice: practice,
                     onSelectPage: requestPage,
                     onClose: {
                         withAnimation(.easeInOut(duration: 0.22)) {
@@ -111,14 +115,55 @@ struct PDFDocumentReaderView: View {
             pagesScrollView
         }
         .background(TiyiNoteTheme.documentWorkspace)
+        .overlay(alignment: .bottomTrailing) { zoomResetControl }
+    }
+
+    private var effectiveZoomScale: CGFloat {
+        isUnboundedCanvas
+            ? canvasViewports[documentStore.pageID(at: currentPageIndex, in: documentID) ?? ""]?.zoomScale ?? 1
+            : displayedZoomScale(zoomScale * liveFingerPinchMagnification)
+    }
+
+    private var zoomResetControl: some View {
+        Button(action: resetZoom) {
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("\(Int((effectiveZoomScale * 100).rounded()))%")
+                    .monospacedDigit()
+            }
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(
+                abs(effectiveZoomScale - 1) > 0.01
+                    ? TiyiNoteTheme.selectionForeground
+                    : TiyiNoteTheme.textSecondary
+            )
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(
+                abs(effectiveZoomScale - 1) > 0.01
+                    ? TiyiNoteTheme.selectionBackground
+                    : TiyiNoteTheme.chrome.opacity(0.90),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule().stroke(
+                    abs(effectiveZoomScale - 1) > 0.01
+                        ? TiyiNoteTheme.selectionBorder
+                        : TiyiNoteTheme.hairline,
+                    lineWidth: 1
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("当前缩放 \(Int((effectiveZoomScale * 100).rounded()))%，\(isUnboundedCanvas ? "点击重置缩放" : "点击恢复适页")")
+        .accessibilityIdentifier("zoom-reset")
+        .padding(.trailing, 24)
+        .padding(.bottom, 24)
     }
 
     private var pagesScrollView: some View {
         GeometryReader { geometry in
-            let effectiveZoomScale = isUnboundedCanvas
-                ? canvasViewports[documentStore.pageID(at: currentPageIndex, in: documentID) ?? ""]?.zoomScale ?? 1
-                : displayedZoomScale(zoomScale * liveFingerPinchMagnification)
-
             Group {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
@@ -136,6 +181,7 @@ struct PDFDocumentReaderView: View {
                 .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
                 .scrollPosition(id: $visiblePageID, anchor: .top)
                 .accessibilityIdentifier("document-page-pager")
+                .accessibilityValue("\(currentPageIndex + 1) / \(documentStore.pageCount(for: documentID))")
                 .coordinateSpace(name: "pdfVerticalScroll")
                 .onPreferenceChange(PageOffsetPreferenceKey.self, perform: updateCurrentPage)
                 .onChange(of: externalPageRequest) { _, pageIndex in
@@ -145,67 +191,11 @@ struct PDFDocumentReaderView: View {
                     requestPage(pageIndex)
                     externalPageRequest = nil
                 }
-                .overlay(alignment: .bottomTrailing) {
-                    VStack(alignment: .trailing, spacing: 8) {
-                        Button(action: resetZoom) {
-                            HStack(spacing: 5) {
-                                Image(systemName: "magnifyingglass")
-                                    .font(.system(size: 10, weight: .semibold))
-                                Text("\(Int((effectiveZoomScale * 100).rounded()))%")
-                                    .monospacedDigit()
-                            }
-                            .font(.system(size: 11, weight: .semibold, design: .rounded))
-                            .foregroundStyle(
-                                abs(effectiveZoomScale - 1) > 0.01
-                                    ? TiyiNoteTheme.selectionForeground
-                                    : TiyiNoteTheme.textSecondary
-                            )
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 7)
-                            .background(
-                                abs(effectiveZoomScale - 1) > 0.01
-                                    ? TiyiNoteTheme.selectionBackground
-                                    : TiyiNoteTheme.chrome.opacity(0.90),
-                                in: Capsule()
-                            )
-                            .overlay {
-                                Capsule().stroke(
-                                    abs(effectiveZoomScale - 1) > 0.01
-                                        ? TiyiNoteTheme.selectionBorder
-                                        : TiyiNoteTheme.hairline,
-                                    lineWidth: 1
-                                )
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("当前缩放 \(Int((effectiveZoomScale * 100).rounded()))%，\(isUnboundedCanvas ? "点击重置缩放" : "点击恢复适页")")
-                        .accessibilityIdentifier("zoom-reset")
 
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(TiyiNoteTheme.selectionBlue)
-                                .frame(width: 5, height: 5)
-                            Text("\(currentPageIndex + 1) / \(documentStore.pageCount(for: documentID))")
-                                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                .monospacedDigit()
-                                .accessibilityIdentifier("document-page-counter")
-                        }
-                        .foregroundStyle(TiyiNoteTheme.textSecondary)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 7)
-                        .background(TiyiNoteTheme.chrome.opacity(0.90), in: Capsule())
-                        .overlay {
-                            Capsule().stroke(TiyiNoteTheme.hairline, lineWidth: 1)
-                        }
-                        .allowsHitTesting(false)
-                    }
-                    .padding(14)
-                    .padding(.bottom, geometry.safeAreaInsets.bottom)
-                }
             }
         }
-        // The scroll view extends under the home-indicator safe area. Measure that same viewport
-        // for every page target, while keeping the floating controls above the safe-area inset.
+        // Page targets use the full scroll viewport. The zoom control belongs to the outer
+        // reader, whose layout respects the home indicator and window safe area.
         .ignoresSafeArea(.container, edges: .bottom)
         .clipped()
     }
@@ -585,8 +575,6 @@ private struct PDFPageAnnotationView: View {
     @State private var shapeFillColorDraft = InkPaletteColor.ocean
     @State private var shapeLineWidthDraft = 3.0
     @State private var shapeDashedDraft = false
-    @State private var pasteMenuLocation: CGPoint?
-    @State private var pasteFeedback: String?
 
     private var controller: CanvasController {
         controllerHolder.controller
@@ -667,9 +655,6 @@ private struct PDFPageAnnotationView: View {
                     logicalPageSize: logicalPageSize,
                     logicalViewport: logicalViewport,
                     isCurrentPage: allowsInitialPDFRenderDuringHandwriting,
-                    onFingerLongPress: { point in
-                        presentPasteMenu(at: point)
-                    },
                     onFingerPinchChanged: onFingerPinchChanged,
                     onFingerPinchEnded: onFingerPinchEnded,
                     onFingerPinchCancelled: onFingerPinchCancelled,
@@ -693,11 +678,7 @@ private struct PDFPageAnnotationView: View {
                     pageElements: $pageElements,
                     requestedSelection: $requestedSelection,
                     onBeginInteraction: {
-                        dismissPasteMenu()
                         onReady(controller, pageIndex)
-                    },
-                    onFingerLongPress: { point in
-                        presentPasteMenu(at: point)
                     },
                     onPageElementsChanged: {
                         markPageElementsChanged()
@@ -722,38 +703,17 @@ private struct PDFPageAnnotationView: View {
                     inlineTextEditor(in: geometry.size)
                 }
 
-                if let pasteMenuLocation {
-                    Color.black.opacity(0.001)
-                        .contentShape(Rectangle())
-                        .onTapGesture(perform: dismissPasteMenu)
-
-                    PagePasteMenu(
-                        canPaste: TiyiAnnotationPasteboard.copiedContent != nil,
-                        onPaste: {
-                            pasteCopiedContent(at: pasteMenuLocation, in: geometry.size)
-                        }
-                    )
-                    .position(pasteMenuPosition(for: pasteMenuLocation, in: geometry.size))
-                }
-
-                if let pasteFeedback {
-                    Text(pasteFeedback)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(TiyiNoteTheme.textPrimary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(TiyiNoteTheme.chrome.opacity(0.96), in: Capsule())
-                        .overlay {
-                            Capsule().stroke(TiyiNoteTheme.hairline, lineWidth: 1)
-                        }
-                        .position(x: geometry.size.width / 2, y: 30)
-                        .allowsHitTesting(false)
-                }
             }
         }
         .background(Color.white)
         .onAppear(perform: preparePageCanvas)
         .onDisappear(perform: releasePageCanvas)
+        .onReceive(NotificationCenter.default.publisher(for: .tiyiPracticeCheckpoint)) { notification in
+            guard let owner = notification.object as? DrawingDocumentStore, owner === documentStore else { return }
+            controller.finishEndedInteractionForCheckpoint()
+            commitTextEdit()
+            persistPendingPageChanges()
+        }
         .onChange(of: selectedTool) { _, tool in
             applySelectedTool()
             if tool != .lasso {
@@ -829,6 +789,7 @@ private struct PDFPageAnnotationView: View {
     }
 
     private func preparePageCanvas() {
+        controller.allowsPracticeFingerDrawing = documentStore.allowsPracticeFingerDrawing
         if !drawingPersistence.hasLoadedDrawing {
             let initialDrawing = documentStore.loadDrawing(
                 forPage: resolvedPageIndex,
@@ -858,6 +819,27 @@ private struct PDFPageAnnotationView: View {
             drawingPersistence.hasLoadedDrawing = true
         }
 
+        controller.pageElementsProvider = { pageElements }
+        controller.onRequestContentSelection = { strokeIndices, elementIDs in
+            guard isAnnotationEditingEnabled else { return }
+            var bounds = controller.boundsForStrokes(at: strokeIndices) ?? .null
+            for element in pageElements where elementIDs.contains(element.id) {
+                bounds = bounds.union(element.logicalBounds)
+            }
+            guard !bounds.isNull else { return }
+            onReady(controller, pageIndex)
+            onSelectLassoTool()
+            requestedSelection = LassoSelectionRequest(
+                content: LassoSelectionContent(strokeIndices: strokeIndices, elementIDs: elementIDs),
+                logicalBounds: bounds
+            )
+        }
+        controller.onPageElementsUpdated = { elements, shouldPersist in
+            guard isAnnotationEditingEnabled else { return }
+            pageElements = elements
+            arePageElementsDirty = true
+            if shouldPersist { markPageElementsChanged() }
+        }
         controller.onDrawingChanged = { [weak documentStore] containsOnlyAppendedStrokes in
             guard isAnnotationEditingEnabled, let documentStore else { return }
 #if DEBUG
@@ -965,6 +947,9 @@ private struct PDFPageAnnotationView: View {
         )
         documentStore.setDrawingInteractionActive(false, id: drawingPersistence.interactionID)
         controller.onDrawingChanged = nil
+        controller.pageElementsProvider = nil
+        controller.onRequestContentSelection = nil
+        controller.onPageElementsUpdated = nil
         controller.onToolInteractionChanged = nil
         controller.onBecameActive = nil
         onRelease(controller, pageIndex)
@@ -1777,89 +1762,6 @@ private struct PDFPageAnnotationView: View {
         drawingPersistence.loadedPageAssetRevision = revision
     }
 
-    private func presentPasteMenu(at point: CGPoint) {
-        guard isAnnotationEditingEnabled else { return }
-        onReady(controller, pageIndex)
-        pasteFeedback = nil
-        pasteMenuLocation = point
-    }
-
-    private func dismissPasteMenu() {
-        pasteMenuLocation = nil
-    }
-
-    private func pasteCopiedContent(at displayPoint: CGPoint, in displaySize: CGSize) {
-        guard isAnnotationEditingEnabled,
-              let copiedContent = TiyiAnnotationPasteboard.copiedContent else { return }
-        let logicalPoint = projection.logicalPoint(displayPoint, displaySize: displaySize)
-        pasteMenuLocation = nil
-        switch copiedContent {
-        case .drawing(let drawing):
-            let insertedIndices = controller.pasteDrawing(
-                drawing,
-                centeredAt: logicalPoint,
-                within: projection.isUnbounded ? nil : logicalPageSize
-            )
-            guard
-                !insertedIndices.isEmpty,
-                let bounds = controller.boundsForStrokes(at: insertedIndices)
-            else { return }
-            requestedSelection = LassoSelectionRequest(
-                content: LassoSelectionContent(strokeIndices: insertedIndices),
-                logicalBounds: bounds
-            )
-        case .image(let image, let copiedSize):
-            let maximumWidth = logicalPageSize.width * 0.78
-            let maximumHeight = logicalPageSize.height * 0.78
-            let scale = min(
-                1,
-                maximumWidth / max(copiedSize.width, 1),
-                maximumHeight / max(copiedSize.height, 1)
-            )
-            let size = CGSize(
-                width: copiedSize.width * scale,
-                height: copiedSize.height * scale
-            )
-            let bounds = projection.constrain(CGRect(
-                x: logicalPoint.x - size.width / 2,
-                y: logicalPoint.y - size.height / 2,
-                width: size.width,
-                height: size.height
-            ))
-            guard let pngData = image.pngData() else { return }
-            let element = CanvasPageElement(
-                id: UUID(),
-                logicalBounds: bounds,
-                payload: .image(PageImagePayload(pngData: pngData))
-            )
-            pageElements.append(element)
-            markPageElementsChanged()
-            requestedSelection = LassoSelectionRequest(
-                content: LassoSelectionContent(elementIDs: [element.id]),
-                logicalBounds: element.logicalBounds
-            )
-        }
-        onSelectLassoTool()
-        showPasteFeedback("已粘贴")
-    }
-
-    private func showPasteFeedback(_ text: String) {
-        pasteFeedback = text
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            guard pasteFeedback == text else { return }
-            withAnimation(.easeOut(duration: 0.15)) {
-                pasteFeedback = nil
-            }
-        }
-    }
-
-    private func pasteMenuPosition(for point: CGPoint, in displaySize: CGSize) -> CGPoint {
-        let x = min(max(point.x, 54), max(54, displaySize.width - 54))
-        let y = point.y > 70 ? point.y - 44 : min(displaySize.height - 28, point.y + 44)
-        return CGPoint(x: x, y: y)
-    }
-
     private func displayRect(for logicalRect: CGRect, in displaySize: CGSize) -> CGRect {
         projection.displayRect(logicalRect, displaySize: displaySize)
     }
@@ -2516,38 +2418,11 @@ private struct PageShapeElementView: View {
 
     var body: some View {
         Canvas { context, size in
-            let rect = CGRect(origin: .zero, size: size).insetBy(
-                dx: max(1, CGFloat(payload.lineWidth) * displayScale) / 2,
-                dy: max(1, CGFloat(payload.lineWidth) * displayScale) / 2
-            )
-            var path = Path()
-            switch payload.kind {
-            case .line, .arrow:
-                path.move(to: CGPoint(x: rect.minX, y: rect.midY))
-                path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
-                if payload.kind == .arrow {
-                    let head = min(rect.height * 0.35, rect.width * 0.18, 18)
-                    path.move(to: CGPoint(x: rect.maxX, y: rect.midY))
-                    path.addLine(to: CGPoint(x: rect.maxX - head, y: rect.midY - head * 0.72))
-                    path.move(to: CGPoint(x: rect.maxX, y: rect.midY))
-                    path.addLine(to: CGPoint(x: rect.maxX - head, y: rect.midY + head * 0.72))
-                }
-            case .rectangle:
-                path.addRect(rect)
-            case .ellipse:
-                path.addEllipse(in: rect)
-            case .triangle:
-                path.move(to: CGPoint(x: rect.midX, y: rect.minY))
-                path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-                path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-                path.closeSubpath()
-            case .diamond:
-                path.move(to: CGPoint(x: rect.midX, y: rect.minY))
-                path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
-                path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
-                path.addLine(to: CGPoint(x: rect.minX, y: rect.midY))
-                path.closeSubpath()
-            }
+            let logicalSize = CGSize(width: size.width / max(displayScale, 0.0001),
+                                     height: size.height / max(displayScale, 0.0001))
+            var transform = CGAffineTransform(scaleX: displayScale, y: displayScale)
+            let outline = payload.path(in: CGRect(origin: .zero, size: logicalSize), displayScale: displayScale)
+            let path = Path(outline.copy(using: &transform) ?? outline)
 
             if let fillHex = payload.fillColorHex,
                ![.line, .arrow].contains(payload.kind) {
@@ -2710,7 +2585,6 @@ private struct LassoSelectionOverlay: View {
     @Binding var pageElements: [CanvasPageElement]
     @Binding var requestedSelection: LassoSelectionRequest?
     let onBeginInteraction: () -> Void
-    let onFingerLongPress: (CGPoint) -> Void
     let onPageElementsChanged: () -> Void
     let onInsertTextElement: (CGPoint) -> Void
     let onSelectTextTool: () -> Void
@@ -2759,8 +2633,7 @@ private struct LassoSelectionOverlay: View {
                             // active tool. Reusing the single-tap path keeps repeated
                             // taps deterministic: lasso always selects, text always edits.
                             handleTap(at: point, displaySize: geometry.size)
-                        },
-                        onFingerLongPress: onFingerLongPress
+                        }
                     )
 
                     if allowsLassoCreation {
@@ -2858,13 +2731,15 @@ private struct LassoSelectionOverlay: View {
               let request = requestedSelection else { return }
         onBeginInteraction()
         let content = expandedContentForGroups(request.content)
+        let singleElement = content.strokeIndices.isEmpty && content.elementIDs.count == 1
+            ? pageElements.first(where: { content.elementIDs.contains($0.id) }) : nil
         selection = LassoStrokeSelection(
             content: content,
             logicalBounds: logicalBounds(
                 for: content,
                 fallback: request.logicalBounds
             ),
-            rotationRadians: 0
+            rotationRadians: CGFloat(singleElement?.rotationRadians ?? 0)
         )
         requestedSelection = nil
     }
@@ -2872,7 +2747,8 @@ private struct LassoSelectionOverlay: View {
     private func handleTap(at displayPoint: CGPoint, displaySize: CGSize) {
         if allowsLassoCreation {
             if !selectionContains(displayPoint, displaySize: displaySize),
-               !selectElement(at: displayPoint, displaySize: displaySize) {
+               !selectElement(at: displayPoint, displaySize: displaySize),
+               !selectInk(at: displayPoint, displaySize: displaySize) {
                 dismissSelectionIfNeeded(at: displayPoint, displaySize: displaySize)
             }
         } else if !editTextElement(at: displayPoint, displaySize: displaySize) {
@@ -2896,7 +2772,7 @@ private struct LassoSelectionOverlay: View {
         // On a physical iPad a finger keeps navigating the page while Apple Pencil
         // creates a new lasso. Simulator drawing uses direct touches as Pencil input;
         // navigation tests opt into the same Pencil-only policy as the physical iPad.
-        return CanvasController.allowsFingerDrawing || touchType != .direct
+        return controller.allowsDirectDrawing || touchType != .direct
     }
 
     private func clearTextSelectionAfterEditing() {
@@ -3004,7 +2880,7 @@ private struct LassoSelectionOverlay: View {
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
     ) -> some View {
-        let displayBounds = displayRect(for: selection.logicalBounds, in: displaySize)
+        let displayBounds = selectionDisplayBounds(for: selection, in: displaySize)
         let rotation = Angle.radians(Double(selection.rotationRadians))
         let rotationAnchor = rotationHandlePosition(for: selection, in: displaySize)
         let boxBottom = rotatedDisplayPoint(
@@ -3201,9 +3077,10 @@ private struct LassoSelectionOverlay: View {
             return
         }
 
-        let strokeIndices = controller.strokeIndices(inside: completedPath)
+        let strokeIndices = controller.strokeIndices(inside: completedPath, tolerance: 3 / displayScale(in: displaySize))
         let directlySelectedElementIDs = Set(pageElements.compactMap { element in
-            polygonContains(element.logicalBounds.midPoint, polygon: completedPath)
+            element.intersectsLasso(completedPath, tolerance: 3 / displayScale(in: displaySize),
+                                    displayScale: displayScale(in: displaySize))
                 ? element.id
                 : nil
         })
@@ -3243,7 +3120,7 @@ private struct LassoSelectionOverlay: View {
     private func selectElement(at displayPoint: CGPoint, displaySize: CGSize) -> Bool {
         let logicalPoint = logicalPoint(for: displayPoint, in: displaySize)
         let matchingElements = pageElements
-            .filter { elementContains(logicalPoint, element: $0) }
+            .filter { elementContains(logicalPoint, element: $0, displaySize: displaySize) }
             .sorted { lhs, rhs in
                 if lhs.zIndex != rhs.zIndex { return lhs.zIndex < rhs.zIndex }
                 return lhs.id.uuidString < rhs.id.uuidString
@@ -3268,12 +3145,24 @@ private struct LassoSelectionOverlay: View {
     }
 
     @discardableResult
+    private func selectInk(at displayPoint: CGPoint, displaySize: CGSize) -> Bool {
+        let point = logicalPoint(for: displayPoint, in: displaySize)
+        guard let index = controller.strokeIndex(at: point, tolerance: 14 / displayScale(in: displaySize)),
+              let bounds = controller.boundsForStrokes(at: [index]) else { return false }
+        onBeginInteraction()
+        controller.cancelStrokeTransform()
+        selection = LassoStrokeSelection(content: LassoSelectionContent(strokeIndices: [index]),
+                                         logicalBounds: bounds, rotationRadians: 0)
+        return true
+    }
+
+    @discardableResult
     private func editTextElement(at displayPoint: CGPoint, displaySize: CGSize) -> Bool {
         let logicalPoint = logicalPoint(for: displayPoint, in: displaySize)
         let editableTextElements = pageElements
             .filter({ element in
                 guard !element.isLocked, case .text = element.payload else { return false }
-                return elementContains(logicalPoint, element: element)
+                return elementContains(logicalPoint, element: element, displaySize: displaySize)
             })
             .sorted { lhs, rhs in
                 if lhs.zIndex != rhs.zIndex { return lhs.zIndex < rhs.zIndex }
@@ -3290,21 +3179,13 @@ private struct LassoSelectionOverlay: View {
         return true
     }
 
-    private func elementContains(_ point: CGPoint, element: CanvasPageElement) -> Bool {
-        let radians = -CGFloat(element.rotationRadians)
-        guard abs(radians) > 0.0001 else {
-            return element.logicalBounds.insetBy(dx: -4, dy: -4).contains(point)
-        }
-        let center = element.logicalBounds.midPoint
-        let cosine = cos(radians)
-        let sine = sin(radians)
-        let dx = point.x - center.x
-        let dy = point.y - center.y
-        let unrotatedPoint = CGPoint(
-            x: center.x + cosine * dx - sine * dy,
-            y: center.y + sine * dx + cosine * dy
-        )
-        return element.logicalBounds.insetBy(dx: -4, dy: -4).contains(unrotatedPoint)
+    private func displayScale(in displaySize: CGSize) -> CGFloat {
+        max(displaySize.width / max(projection.logicalBounds.width, 1), 0.0001)
+    }
+
+    private func elementContains(_ point: CGPoint, element: CanvasPageElement, displaySize: CGSize) -> Bool {
+        let scale = displayScale(in: displaySize)
+        return element.hitArea(tolerance: 14 / scale, displayScale: scale, includesInterior: true).contains(point)
     }
 
     private func cropSelectedImage() {
@@ -3563,10 +3444,7 @@ private struct LassoSelectionOverlay: View {
     }
 
     private func dismissSelectionIfNeeded(at displayPoint: CGPoint, displaySize: CGSize) {
-        guard let selection else { return }
-        let selectionBounds = displayRect(for: selection.axisAlignedBounds, in: displaySize)
-            .insetBy(dx: -8, dy: -8)
-        guard !selectionBounds.contains(displayPoint) else { return }
+        guard selection != nil, !selectionContains(displayPoint, displaySize: displaySize) else { return }
         clearSelection()
     }
 
@@ -3904,18 +3782,28 @@ private struct LassoSelectionOverlay: View {
             x: center.x + cosine * dx - sine * dy,
             y: center.y + sine * dx + cosine * dy
         )
-        let hitSlop = max(3, projection.logicalBounds.width * 0.006)
-        return selection.logicalBounds.insetBy(dx: -hitSlop, dy: -hitSlop)
+        let scale = displayScale(in: displaySize)
+        let hitSlopX = max(0, (44 / scale - selection.logicalBounds.width) / 2) + 8 / scale
+        let hitSlopY = max(0, (44 / scale - selection.logicalBounds.height) / 2) + 8 / scale
+        return selection.logicalBounds.insetBy(dx: -hitSlopX, dy: -hitSlopY)
             .contains(localPoint)
+    }
+
+    private func selectionDisplayBounds(for selection: LassoStrokeSelection, in displaySize: CGSize) -> CGRect {
+        let bounds = displayRect(for: selection.logicalBounds, in: displaySize)
+        // Thin strokes and zoomed-out shapes need a real move target. Keep the rotation and
+        // corner handles outside that target instead of stacking their touch areas on the ink.
+        return bounds.insetBy(dx: -max(0, (44 - bounds.width) / 2),
+                              dy: -max(0, (44 - bounds.height) / 2))
     }
 
     private func rotationHandlePosition(
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
     ) -> CGPoint {
-        let bounds = displayRect(for: selection.logicalBounds, in: displaySize)
+        let bounds = selectionDisplayBounds(for: selection, in: displaySize)
         return rotatedDisplayPoint(
-            CGPoint(x: bounds.midX, y: bounds.maxY + 20),
+            CGPoint(x: bounds.midX, y: bounds.maxY + 26),
             around: bounds.midPoint,
             radians: selection.rotationRadians
         )
@@ -3940,7 +3828,9 @@ private struct LassoSelectionOverlay: View {
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
     ) -> CGPoint {
-        let bounds = displayRect(for: selection.axisAlignedBounds, in: displaySize)
+        let rawBounds = displayRect(for: selection.axisAlignedBounds, in: displaySize)
+        let bounds = rawBounds.insetBy(dx: -max(0, (44 - rawBounds.width) / 2),
+                                      dy: -max(0, (44 - rawBounds.height) / 2))
         let halfToolbarWidth: CGFloat = selectedEditableTextID != nil
             || selectedCroppableImageID != nil
             || selectedEditableShapeID != nil
@@ -4238,7 +4128,6 @@ private struct LassoInputView: UIViewRepresentable {
     let onEnded: (CGPoint) -> Void
     let onTap: (CGPoint) -> Void
     let onDoubleTap: (CGPoint) -> Void
-    let onFingerLongPress: (CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -4270,25 +4159,6 @@ private struct LassoInputView: UIViewRepresentable {
         ]
 #endif
 
-        let longPressGesture = UILongPressGestureRecognizer(
-            target: context.coordinator,
-            action: #selector(Coordinator.handleLongPress(_:))
-        )
-        longPressGesture.minimumPressDuration = 0.52
-        longPressGesture.allowableMovement = 12
-        longPressGesture.cancelsTouchesInView = false
-        longPressGesture.delegate = context.coordinator
-#if targetEnvironment(simulator)
-        longPressGesture.allowedTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue),
-            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
-        ]
-#else
-        longPressGesture.allowedTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue)
-        ]
-#endif
-
         let doubleTapGesture = UITapGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.handleDoubleTap(_:))
@@ -4296,7 +4166,6 @@ private struct LassoInputView: UIViewRepresentable {
         doubleTapGesture.numberOfTapsRequired = 2
         doubleTapGesture.cancelsTouchesInView = false
         doubleTapGesture.delegate = context.coordinator
-        doubleTapGesture.require(toFail: longPressGesture)
         doubleTapGesture.allowedTouchTypes = [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.pencil.rawValue),
@@ -4309,7 +4178,6 @@ private struct LassoInputView: UIViewRepresentable {
         )
         tapGesture.cancelsTouchesInView = false
         tapGesture.delegate = context.coordinator
-        tapGesture.require(toFail: longPressGesture)
         tapGesture.allowedTouchTypes = [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.pencil.rawValue),
@@ -4319,7 +4187,6 @@ private struct LassoInputView: UIViewRepresentable {
 
         view.addGestureRecognizer(lassoGesture)
         view.lassoGestureRecognizer = lassoGesture
-        view.addGestureRecognizer(longPressGesture)
         view.addGestureRecognizer(doubleTapGesture)
         view.addGestureRecognizer(tapGesture)
         return view
@@ -4358,11 +4225,6 @@ private struct LassoInputView: UIViewRepresentable {
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
             guard gesture.state == .ended else { return }
             parent.onDoubleTap(gesture.location(in: gesture.view))
-        }
-
-        @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-            guard gesture.state == .began else { return }
-            parent.onFingerLongPress(gesture.location(in: gesture.view))
         }
 
         func gestureRecognizer(
@@ -4424,39 +4286,6 @@ private final class LassoPanGestureRecognizer: UIPanGestureRecognizer {
     }
 }
 
-private struct PagePasteMenu: View {
-    let canPaste: Bool
-    let onPaste: () -> Void
-
-    var body: some View {
-        Button(action: onPaste) {
-            HStack(spacing: 7) {
-                Image(systemName: "doc.on.clipboard")
-                    .font(.system(size: 13, weight: .semibold))
-                Text("粘贴")
-                    .font(.system(size: 13, weight: .semibold))
-            }
-            .foregroundStyle(canPaste ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textTertiary)
-            .padding(.horizontal, 14)
-            .frame(height: 38)
-            .background(TiyiNoteTheme.chrome.opacity(0.98), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(TiyiNoteTheme.strongHairline, lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.42), radius: 9, y: 4)
-        }
-        .buttonStyle(.plain)
-        .disabled(!canPaste)
-        .accessibilityLabel("粘贴最近拷贝的内容")
-    }
-}
-
-private enum TiyiCopiedAnnotationContent {
-    case drawing(PKDrawing)
-    case image(UIImage, logicalSize: CGSize)
-}
-
 private struct TiyiClipboardImageArchive: Codable {
     let pngData: Data
     let logicalWidth: Double
@@ -4466,29 +4295,6 @@ private struct TiyiClipboardImageArchive: Codable {
 private enum TiyiAnnotationPasteboard {
     static let drawingType = "com.tiyi.note.pkdrawing"
     static let imageType = "com.tiyi.note.annotation-image"
-
-    static var copiedContent: TiyiCopiedAnnotationContent? {
-        if
-            let data = UIPasteboard.general.data(forPasteboardType: drawingType),
-            let drawing = try? PKDrawing(data: data)
-        {
-            return .drawing(drawing)
-        }
-        if
-            let data = UIPasteboard.general.data(forPasteboardType: imageType),
-            let archive = try? JSONDecoder().decode(TiyiClipboardImageArchive.self, from: data),
-            let image = UIImage(data: archive.pngData)
-        {
-            return .image(
-                image,
-                logicalSize: CGSize(
-                    width: CGFloat(archive.logicalWidth),
-                    height: CGFloat(archive.logicalHeight)
-                )
-            )
-        }
-        return nil
-    }
 
     static func copy(_ drawing: PKDrawing) {
         guard !drawing.strokes.isEmpty else { return }
@@ -4697,6 +4503,7 @@ private struct PageThumbnailSidebar: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     let documentID: String
     let currentPageIndex: Int
+    let practice: TiyiPracticeWorkspace?
     let onSelectPage: (Int) -> Void
     let onClose: () -> Void
 
@@ -4912,7 +4719,7 @@ private struct PageThumbnailSidebar: View {
                 .accessibilityIdentifier("page-confirm-delete")
             Button("取消", role: .cancel) {}
         } message: {
-            Text("页面会进入本页回收站，并通过协作历史同步；可稍后恢复。")
+            Text("页面会移入回收站，保留笔迹，可稍后恢复。")
         }
         .alert("页面操作失败", isPresented: Binding(
             get: { errorMessage != nil },
@@ -4999,19 +4806,30 @@ private struct PageThumbnailSidebar: View {
                 selectedPageIDs.remove(page.id)
             }
         } else {
-            onSelectPage(pageIndex)
+            navigate(to: page.id)
+        }
+    }
+
+    private func mutatePages(_ mutation: () throws -> Void) throws {
+        if let practice {
+            try practice.performPageMutation(mutation)
+        } else {
+            try mutation()
         }
     }
 
     private func insertPage(style: CanvasBackgroundStyle) {
         do {
-            let page = try documentStore.insertTemplatePage(
-                after: currentPageID,
-                in: documentID,
-                style: style,
-                color: .white
-            )
-            navigate(to: page.id)
+            try mutatePages {
+                let page = try documentStore.insertTemplatePage(
+                    after: currentPageID,
+                    in: documentID,
+                    style: style,
+                    color: .white,
+                    size: practice == nil ? CGSize(width: 1024, height: 768) : CGSize(width: 768, height: 1086)
+                )
+                navigate(to: page.id)
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -5019,9 +4837,11 @@ private struct PageThumbnailSidebar: View {
 
     private func duplicatePage(_ pageID: String) {
         do {
-            let page = try documentStore.duplicatePage(pageID, in: documentID)
-            selectedPageIDs = [page.id]
-            navigate(to: page.id)
+            try mutatePages {
+                let page = try documentStore.duplicatePage(pageID, in: documentID)
+                selectedPageIDs = [page.id]
+                navigate(to: page.id)
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -5029,8 +4849,10 @@ private struct PageThumbnailSidebar: View {
 
     private func rotatePages(_ pageIDs: Set<String>, clockwise: Bool) {
         do {
-            for pageID in orderedPages.map(\.id) where pageIDs.contains(pageID) {
-                try documentStore.rotatePage(pageID, clockwise: clockwise, in: documentID)
+            try mutatePages {
+                for pageID in orderedPages.map(\.id) where pageIDs.contains(pageID) {
+                    try documentStore.rotatePage(pageID, clockwise: clockwise, in: documentID)
+                }
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -5039,12 +4861,14 @@ private struct PageThumbnailSidebar: View {
 
     private func setBookmark(_ pageIDs: Set<String>, isBookmarked: Bool) {
         do {
-            for pageID in pageIDs {
-                try documentStore.setPageBookmark(
-                    pageID,
-                    isBookmarked: isBookmarked,
-                    in: documentID
-                )
+            try mutatePages {
+                for pageID in pageIDs {
+                    try documentStore.setPageBookmark(
+                        pageID,
+                        isBookmarked: isBookmarked,
+                        in: documentID
+                    )
+                }
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -5054,7 +4878,7 @@ private struct PageThumbnailSidebar: View {
     private func requestDelete(_ pageIDs: Set<String>) {
         guard !pageIDs.isEmpty else { return }
         guard pageIDs.count < orderedPages.count else {
-            errorMessage = "文稿至少需要保留一页。"
+            errorMessage = practice == nil ? "文稿至少需要保留一页。" : "作答至少需要保留一页。"
             return
         }
         pendingDeletionPageIDs = pageIDs
@@ -5063,16 +4887,17 @@ private struct PageThumbnailSidebar: View {
 
     private func deletePendingPages() {
         do {
-            let oldCurrentID = currentPageID
-            try documentStore.deletePages(pendingDeletionPageIDs, in: documentID)
-            selectedPageIDs.subtract(pendingDeletionPageIDs)
-            pendingDeletionPageIDs.removeAll()
-            let remaining = documentStore.pages(in: documentID)
-            if let oldCurrentID,
-               let newIndex = remaining.firstIndex(where: { $0.id == oldCurrentID }) {
-                onSelectPage(newIndex)
-            } else if !remaining.isEmpty {
-                onSelectPage(min(currentPageIndex, remaining.count - 1))
+            try mutatePages {
+                let oldCurrentID = currentPageID
+                try documentStore.deletePages(pendingDeletionPageIDs, in: documentID)
+                selectedPageIDs.subtract(pendingDeletionPageIDs)
+                pendingDeletionPageIDs.removeAll()
+                let remaining = documentStore.pages(in: documentID)
+                if let oldCurrentID, remaining.contains(where: { $0.id == oldCurrentID }) {
+                    navigate(to: oldCurrentID)
+                } else if !remaining.isEmpty {
+                    navigate(to: remaining[min(currentPageIndex, remaining.count - 1)].id)
+                }
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -5081,14 +4906,16 @@ private struct PageThumbnailSidebar: View {
 
     private func restorePages(_ pageIDs: Set<String>) {
         do {
-            try documentStore.restoreDeletedPages(pageIDs, in: documentID)
-            selectedPageIDs.subtract(pageIDs)
-            if documentStore.deletedPages(in: documentID).isEmpty {
-                filter = .all
-                isSelecting = false
-            }
-            if let restoredID = pageIDs.sorted().first {
-                navigate(to: restoredID)
+            try mutatePages {
+                try documentStore.restoreDeletedPages(pageIDs, in: documentID)
+                selectedPageIDs.subtract(pageIDs)
+                if documentStore.deletedPages(in: documentID).isEmpty {
+                    filter = .all
+                    isSelecting = false
+                }
+                if let restoredID = pageIDs.sorted().first {
+                    navigate(to: restoredID)
+                }
             }
         } catch {
             errorMessage = error.localizedDescription
@@ -5101,8 +4928,10 @@ private struct PageThumbnailSidebar: View {
                   $0.id == destinationPageID
               }) else { return false }
         do {
-            try documentStore.movePage(sourcePageID, to: destinationIndex, in: documentID)
-            navigate(to: sourcePageID)
+            try mutatePages {
+                try documentStore.movePage(sourcePageID, to: destinationIndex, in: documentID)
+                navigate(to: sourcePageID)
+            }
             return true
         } catch {
             errorMessage = error.localizedDescription
@@ -5112,6 +4941,7 @@ private struct PageThumbnailSidebar: View {
 
     private func navigate(to pageID: String) {
         guard let index = documentStore.pageIndex(for: pageID, in: documentID) else { return }
+        practice?.selectPage(pageID)
         onSelectPage(index)
     }
 }
@@ -5189,6 +5019,7 @@ private struct PageThumbnailCard: View {
                             drawingActivitySource: drawingActivitySource,
                             allowsInitialRenderDuringHandwriting: false
                         )
+                        .allowsHitTesting(false)
                     } else {
                         Rectangle()
                             .fill(TiyiNoteTheme.surfaceRaised)
@@ -5242,6 +5073,7 @@ private struct PageThumbnailCard: View {
                     )
             }
             .padding(6)
+            .contentShape(Rectangle())
             .background(
                 isCurrent || isSelected ? TiyiNoteTheme.selectionBackground : Color.clear,
                 in: RoundedRectangle(cornerRadius: 8, style: .continuous)

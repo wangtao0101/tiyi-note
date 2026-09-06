@@ -37,6 +37,9 @@ final class CanvasController: NSObject, ObservableObject {
     var onDrawingChanged: ((Bool) -> Void)?
     var onBecameActive: (() -> Void)?
     var onToolInteractionChanged: ((Bool) -> Void)?
+    var pageElementsProvider: (() -> [CanvasPageElement])?
+    var onPageElementsUpdated: (([CanvasPageElement], Bool) -> Void)?
+    var onRequestContentSelection: ((Set<Int>, Set<UUID>) -> Void)?
 
     private var isInstallingDrawing = false
     private var strokeTransformSession: StrokeTransformSession?
@@ -52,12 +55,20 @@ final class CanvasController: NSObject, ObservableObject {
     private var shapeGestureOriginStrokeCount: Int?
     private var shapeSnapInkStyle: ShapeSnapInkStyle?
     private let heldInkRecognizer = HeldInkGestureRecognizer()
+    private let shapeEraserRecognizer = ShapeEraserGestureRecognizer()
+    private let fingerSelectionRecognizer = FingerContentTapGestureRecognizer()
+    private var fingerSelectionTarget: (strokes: Set<Int>, elements: Set<UUID>)?
+    private var erasedElements: [CanvasPageElement] = []
+    private var eraserRadius: CGFloat = 9
+    private var usesStrokeEraser = false
     private var heldShape: (drawing: PKDrawing, kind: HeldInkShapeKind)?
     private var shapePreview: UIImageView?
     private var originalCanvasMask: CALayer?
     private var isShapePreviewVisible = false
     private var authoritativeSnappedDrawing: PKDrawing?
     private var isAnnotationInputEditable = true
+    var allowsPracticeFingerDrawing = false
+    var allowsDirectDrawing: Bool { Self.allowsFingerDrawing || allowsPracticeFingerDrawing }
 
     override init() {
         let canvasView = TiyiPencilCanvasView(frame: .zero)
@@ -65,6 +76,43 @@ final class CanvasController: NSObject, ObservableObject {
         super.init()
 
         canvasView.delegate = self
+        canvasView.addGestureRecognizer(fingerSelectionRecognizer)
+        fingerSelectionRecognizer.canSelect = { [weak self] point in
+            guard let self, self.isAnnotationInputEditable, self.selectedToolKind.usesInkSettings else { return false }
+            let scale = max(self.canvasView.zoomScale, 0.0001)
+            let worldPoint = CGPoint(x: point.x / scale + self.canvasWorldOrigin.x,
+                                     y: point.y / scale + self.canvasWorldOrigin.y)
+            if let element = self.pageElementsProvider?()
+                .filter({ element in
+                    guard case .shape = element.payload else { return false }
+                    return element.hitArea(tolerance: 14 / scale, displayScale: scale, includesInterior: true).contains(worldPoint)
+                })
+                .sorted(by: { $0.zIndex == $1.zIndex ? $0.id.uuidString < $1.id.uuidString : $0.zIndex < $1.zIndex }).last {
+                self.fingerSelectionTarget = ([], [element.id])
+            } else if let stroke = self.strokeIndex(at: worldPoint, tolerance: 14 / scale, shapesOnly: true) {
+                self.fingerSelectionTarget = ([stroke], [])
+            } else {
+                self.fingerSelectionTarget = nil
+            }
+            return self.fingerSelectionTarget != nil
+        }
+        fingerSelectionRecognizer.onSelect = { [weak self] in
+            guard let self, let target = self.fingerSelectionTarget else { return }
+            self.onRequestContentSelection?(target.strokes, target.elements)
+            self.fingerSelectionTarget = nil
+        }
+        // Only a short finger contact over existing content waits for tap-vs-drag. Pencil and
+        // blank-space contacts fail the tap recognizer immediately and keep the normal ink path.
+        fingerSelectionRecognizer.drawingRecognizer = canvasView.drawingGestureRecognizer
+        canvasView.addGestureRecognizer(shapeEraserRecognizer)
+        shapeEraserRecognizer.canTrack = { [weak self] in
+            guard let self else { return false }
+            return self.isAnnotationInputEditable && self.selectedToolKind == .eraser
+                && self.canvasView.drawingGestureRecognizer.isEnabled
+        }
+        shapeEraserRecognizer.onContactBegan = { [weak self] in self?.beginToolInteraction() }
+        shapeEraserRecognizer.onSegment = { [weak self] start, end in self?.eraseShapes(from: start, to: end) }
+        shapeEraserRecognizer.onContactEnded = { [weak self] in self?.requestToolInteractionFinish() }
         canvasView.addGestureRecognizer(heldInkRecognizer)
         heldInkRecognizer.canTrack = { [weak self] in
             guard let self else { return false }
@@ -139,6 +187,7 @@ final class CanvasController: NSObject, ObservableObject {
         redoActions.removeAll()
         toolInteractionOriginDrawing = nil
         toolInteractionDidChangeDrawing = false
+        erasedElements.removeAll()
         toolInteractionEndWorkItem?.cancel()
         toolInteractionEndWorkItem = nil
         postLiftDrawingRetryCount = 0
@@ -177,6 +226,8 @@ final class CanvasController: NSObject, ObservableObject {
     ) {
         let previousToolKind = selectedToolKind
         selectedToolKind = kind
+        eraserRadius = eraserSize.width / 2
+        usesStrokeEraser = eraserMode == .stroke
         if kind == .eraser {
             if previousToolKind != .eraser {
                 // Erasing can mutate or split any stroke, so it is the one live tool that needs a
@@ -234,24 +285,24 @@ final class CanvasController: NSObject, ObservableObject {
             canvasView.tool = eraserMode == .stroke
                 ? PKEraserTool(.vector)
                 : PKEraserTool(.fixedWidthBitmap, width: eraserSize.width)
-        case .lasso:
-            canvasView.tool = PKLassoTool()
-        case .text:
-            // Text is handled by the page-object interaction layer. Keeping the
-            // PencilKit recognizer disabled prevents an accidental ink stroke
-            // while the text tool is visibly selected.
-            canvasView.tool = PKLassoTool()
+        case .lasso, .text:
+            // Both modes belong to our object interaction layer. Installing PKLassoTool also
+            // activates PencilKit's separate selection recognizers and its Select All / Insert
+            // Space menu, even with drawingGestureRecognizer disabled and responder actions off.
+            canvasView.tool = PKInkingTool(.monoline, color: .clear, width: 1)
         }
+        (canvasView as? TiyiPencilCanvasView)?.disableSystemEditingInteractions()
     }
 
     func configureAnnotationInput(isEditable: Bool = true) {
         isAnnotationInputEditable = isEditable
         if !isEditable { cancelHeldInkRecognition() }
-        heldInkRecognizer.allowedTouchTypes = Self.allowsFingerDrawing ? [
+        heldInkRecognizer.allowedTouchTypes = allowsDirectDrawing ? [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.pencil.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
         ] : [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        shapeEraserRecognizer.allowedTouchTypes = heldInkRecognizer.allowedTouchTypes
         guard isEditable else {
             canvasView.drawingGestureRecognizer.isEnabled = false
             canvasView.drawingPolicy = .pencilOnly
@@ -259,8 +310,8 @@ final class CanvasController: NSObject, ObservableObject {
         }
 
         canvasView.drawingGestureRecognizer.isEnabled = true
-        canvasView.drawingPolicy = Self.allowsFingerDrawing ? .anyInput : .pencilOnly
-        canvasView.drawingGestureRecognizer.allowedTouchTypes = Self.allowsFingerDrawing ? [
+        canvasView.drawingPolicy = allowsDirectDrawing ? .anyInput : .pencilOnly
+        canvasView.drawingGestureRecognizer.allowedTouchTypes = allowsDirectDrawing ? [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.pencil.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
@@ -291,24 +342,46 @@ final class CanvasController: NSObject, ObservableObject {
         replaceDrawing(PKDrawing(), actionName: "清空画板")
     }
 
-    func strokeIndices(inside polygon: [CGPoint]) -> Set<Int> {
+    func strokeIndices(inside polygon: [CGPoint], tolerance: CGFloat = 2) -> Set<Int> {
         guard polygon.count >= 3 else { return [] }
-        let polygonBounds = Self.boundingRect(for: polygon).insetBy(dx: -2, dy: -2)
+        let polygonBounds = Self.boundingRect(for: polygon).insetBy(dx: -tolerance, dy: -tolerance)
+        let path = CGMutablePath()
+        path.addLines(between: polygon)
+        path.closeSubpath()
+        let edge = path.copy(strokingWithWidth: tolerance * 2, lineCap: .round, lineJoin: .round, miterLimit: 10)
 
         return Set(self.drawing.strokes.enumerated().compactMap { index, stroke in
             guard stroke.renderBounds.intersects(polygonBounds) else { return nil }
 
-            if polygonContains(stroke.renderBounds.center, polygon: polygon) {
+            if stroke.mask == nil, polygonContains(stroke.renderBounds.center, polygon: polygon) {
                 return index
             }
 
-            for point in stroke.path.interpolatedPoints(by: .distance(3)) {
-                if polygonContains(point.location, polygon: polygon) {
-                    return index
+            for points in CanvasHitGeometry.visiblePoints(in: stroke) {
+                for point in points {
+                    let location = point.location.applying(stroke.transform)
+                    if path.contains(location) || edge.contains(location) {
+                        return index
+                    }
                 }
             }
             return nil
         })
+    }
+
+    func strokeIndex(at point: CGPoint, tolerance: CGFloat, shapesOnly: Bool = false) -> Int? {
+        var match: (index: Int, distance: CGFloat)?
+        for (index, stroke) in drawing.strokes.enumerated() {
+            guard let distance = CanvasHitGeometry.distance(to: point, stroke: stroke, tolerance: tolerance) else { continue }
+            if shapesOnly {
+                guard stroke.mask == nil,
+                      HeldInkShapeRecognizer.recognize(CanvasHitGeometry.visiblePoints(in: stroke).flatMap {
+                          $0.map { $0.location.applying(stroke.transform) }
+                      }) != nil else { continue }
+            }
+            if match == nil || distance <= match!.distance { match = (index, distance) }
+        }
+        return match?.index
     }
 
     func boundsForStrokes(at indices: Set<Int>) -> CGRect? {
@@ -573,7 +646,32 @@ final class CanvasController: NSObject, ObservableObject {
             guard currentDrawing != drawing else { return nil }
             installCanvasDrawing(drawing)
             return .restoreDrawing(currentDrawing)
+        case .restorePageContent(let drawing, let elements, let replacingIDs):
+            let currentDrawing = drawing == nil ? nil : self.drawing
+            let currentElements = pageElementsProvider?() ?? []
+            let replacedElements = currentElements.filter { replacingIDs.contains($0.id) }
+            if let drawing { installCanvasDrawing(drawing) }
+            onPageElementsUpdated?(currentElements.filter { !replacingIDs.contains($0.id) } + elements, true)
+            return .restorePageContent(drawing: currentDrawing, elements: replacedElements, replacingIDs: replacingIDs)
         }
+    }
+
+    private func eraseShapes(from localStart: CGPoint, to localEnd: CGPoint) {
+        guard selectedToolKind == .eraser, isAnnotationInputEditable,
+              let elements = pageElementsProvider?() else { return }
+        let scale = max(canvasView.zoomScale, 0.0001)
+        let radius = usesStrokeEraser ? 8 / scale : max(eraserRadius, 5 / scale)
+        let start = CGPoint(x: localStart.x + canvasWorldOrigin.x, y: localStart.y + canvasWorldOrigin.y)
+        let end = CGPoint(x: localEnd.x + canvasWorldOrigin.x, y: localEnd.y + canvasWorldOrigin.y)
+        let hits = elements.filter { element in
+            guard !element.isLocked, case .shape = element.payload else { return false }
+            let area = element.hitArea(tolerance: radius, displayScale: scale, includesInterior: false)
+            return CanvasHitGeometry.segment(from: start, to: end, intersects: area, step: radius / 2)
+        }
+        guard !hits.isEmpty else { return }
+        erasedElements.append(contentsOf: hits)
+        let ids = Set(hits.map(\.id))
+        onPageElementsUpdated?(elements.filter { !ids.contains($0.id) }, false)
     }
 
     private func beginToolInteraction() {
@@ -593,6 +691,7 @@ final class CanvasController: NSObject, ObservableObject {
             toolInteractionOriginDrawing = nil
         }
         toolInteractionDidChangeDrawing = false
+        erasedElements.removeAll(keepingCapacity: true)
         postLiftDrawingRetryCount = 0
         setToolInteractionActive(true)
         onBecameActive?()
@@ -635,9 +734,23 @@ final class CanvasController: NSObject, ObservableObject {
                 // the stroke itself is captured only if the user actually asks for Undo.
                 recordUndoAction(.removeTrailingStrokes(1))
                 knownStrokeCount += 1
-            } else if selectedToolKind == .eraser,
+            } else if selectedToolKind == .eraser, erasedElements.isEmpty,
                       let originDrawing = toolInteractionOriginDrawing {
                 recordUndoAction(.restoreDrawing(originDrawing))
+                let finalDrawing = self.drawing
+                knownStrokeCount = finalDrawing.strokes.count
+                eraserBaselineDrawing = finalDrawing
+            }
+        }
+        if !erasedElements.isEmpty {
+            recordUndoAction(.restorePageContent(
+                drawing: didChangeDrawing ? toolInteractionOriginDrawing : nil,
+                elements: erasedElements,
+                replacingIDs: Set(erasedElements.map(\.id))
+            ))
+            onPageElementsUpdated?(pageElementsProvider?() ?? [], true)
+            erasedElements.removeAll(keepingCapacity: true)
+            if didChangeDrawing {
                 let finalDrawing = self.drawing
                 knownStrokeCount = finalDrawing.strokes.count
                 eraserBaselineDrawing = finalDrawing
@@ -679,7 +792,8 @@ final class CanvasController: NSObject, ObservableObject {
 
     private var hasActiveDrawingContact: Bool {
         let drawingState = canvasView.drawingGestureRecognizer.state
-        return heldInkRecognizer.isTrackingContact || drawingState == .began || drawingState == .changed
+        return heldInkRecognizer.isTrackingContact || shapeEraserRecognizer.isTrackingContact
+            || drawingState == .began || drawingState == .changed
     }
 
     private func beginShapeTracking() {
@@ -702,6 +816,15 @@ final class CanvasController: NSObject, ObservableObject {
             return
         }
         finishToolInteractionNow()
+    }
+
+    /// Explicit saves may arrive between the final PencilKit drawing callback and its queued
+    /// lift completion. Close that completed contact before the page serializes its checkpoint.
+    func finishEndedInteractionForCheckpoint() {
+        guard isUsingTool, !hasActiveDrawingContact,
+              toolInteractionDidChangeDrawing || !erasedElements.isEmpty else { return }
+        toolInteractionEndWorkItem?.cancel()
+        finishShapeTrackingAfterPencilLift()
     }
 
     func cancelHeldInkRecognition() {
@@ -831,12 +954,72 @@ private final class TiyiPencilCanvasView: PKCanvasView {
     override var undoManager: UndoManager? {
         pencilUndoManager
     }
+
+    // Selection and clipboard actions belong to our lasso/text layers. Native PencilKit editing
+    // can leave an invisible ink selection active after double-tap and consume subsequent writing.
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
+
+    override func addGestureRecognizer(_ gestureRecognizer: UIGestureRecognizer) {
+        super.addGestureRecognizer(gestureRecognizer)
+        disableEditingGesture(gestureRecognizer)
+    }
+
+    override func addInteraction(_ interaction: UIInteraction) {
+        guard !(interaction is UIEditMenuInteraction), !(interaction is UIContextMenuInteraction) else { return }
+        super.addInteraction(interaction)
+    }
+
+    override func didAddSubview(_ subview: UIView) {
+        super.didAddSubview(subview)
+        disableSystemEditingInteractions(in: subview)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        disableSystemEditingInteractions()
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // PencilKit may recreate its content views/gestures after a tool or drawing replacement.
+        // Check again before the next contact, including taps beneath our SwiftUI lasso handles.
+        disableSystemEditingInteractions()
+        return super.hitTest(point, with: event)
+    }
+
+    func disableSystemEditingInteractions() {
+        disableSystemEditingInteractions(in: self)
+    }
+
+    private func disableSystemEditingInteractions(in view: UIView) {
+        for interaction in view.interactions {
+            if let menu = interaction as? UIEditMenuInteraction {
+                menu.dismissMenu()
+                view.removeInteraction(menu)
+            } else if let menu = interaction as? UIContextMenuInteraction {
+                menu.dismissMenu()
+                view.removeInteraction(menu)
+            }
+        }
+        for gesture in view.gestureRecognizers ?? [] { disableEditingGesture(gesture) }
+        for subview in view.subviews { disableSystemEditingInteractions(in: subview) }
+    }
+
+    private func disableEditingGesture(_ gesture: UIGestureRecognizer) {
+        // Restrict this to PencilKit's subtree. Our finger-to-lasso observer is a plain gesture
+        // recognizer; the custom lasso/text views are siblings, so their controls remain active.
+        if gesture is UITapGestureRecognizer || gesture is UILongPressGestureRecognizer {
+            if gesture.isEnabled { gesture.isEnabled = false }
+        }
+    }
 }
 
 private enum DrawingHistoryAction {
     case removeTrailingStrokes(Int)
     case appendStrokes([PKStroke])
     case restoreDrawing(PKDrawing)
+    case restorePageContent(drawing: PKDrawing?, elements: [CanvasPageElement], replacingIDs: Set<UUID>)
 }
 
 private struct StrokeTransformSession {

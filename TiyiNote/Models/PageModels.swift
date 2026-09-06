@@ -429,10 +429,7 @@ struct PDFSearchHighlight: Hashable {
 
 enum DocumentOutputAction: String, CaseIterable, Identifiable {
     case flattenedPDF
-    case pageImages
-    case editablePackage
     case printDocument
-    case collaboration
     case conflictVersions
 
     var id: String { rawValue }
@@ -458,12 +455,14 @@ struct EditableDocumentPageAssets: Codable, Hashable, Sendable {
 /// Self-contained native backup/export. JSON keeps the format inspectable and versioned while
 /// preserving the original PDF, stable page IDs, editable assets, and collaboration history.
 struct EditableDocumentPackage: Codable, Hashable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     let schemaVersion: Int
     let exportedAt: Date
     let document: LibraryDocumentMetadata
     let pages: [LibraryPage]
+    /// Recycle-bin pages retain their own backgrounds, ink and delete/restore history.
+    let deletedPages: [LibraryPage]
     let sourcePDFData: Data
     let pageAssets: [EditableDocumentPageAssets]
     /// Document-wide operations currently include the collaborative title register. Schema-v1
@@ -475,6 +474,7 @@ struct EditableDocumentPackage: Codable, Hashable, Sendable {
         exportedAt: Date = Date(),
         document: LibraryDocumentMetadata,
         pages: [LibraryPage],
+        deletedPages: [LibraryPage] = [],
         sourcePDFData: Data,
         pageAssets: [EditableDocumentPageAssets],
         documentOperations: [CollaborationOperation] = []
@@ -483,6 +483,7 @@ struct EditableDocumentPackage: Codable, Hashable, Sendable {
         self.exportedAt = exportedAt
         self.document = document
         self.pages = pages
+        self.deletedPages = deletedPages
         self.sourcePDFData = sourcePDFData
         self.pageAssets = pageAssets
         self.documentOperations = documentOperations
@@ -490,7 +491,7 @@ struct EditableDocumentPackage: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, exportedAt, document, pages, sourcePDFData, pageAssets
-        case documentOperations
+        case documentOperations, deletedPages
     }
 
     init(from decoder: Decoder) throws {
@@ -499,6 +500,7 @@ struct EditableDocumentPackage: Codable, Hashable, Sendable {
         exportedAt = try container.decode(Date.self, forKey: .exportedAt)
         document = try container.decode(LibraryDocumentMetadata.self, forKey: .document)
         pages = try container.decode([LibraryPage].self, forKey: .pages)
+        deletedPages = try container.decodeIfPresent([LibraryPage].self, forKey: .deletedPages) ?? []
         sourcePDFData = try container.decode(Data.self, forKey: .sourcePDFData)
         pageAssets = try container.decode(
             [EditableDocumentPageAssets].self,

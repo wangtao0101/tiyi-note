@@ -38,13 +38,11 @@ struct ToolPaletteView: View {
 
     @State private var secondarySettings: SecondarySettings?
 
-    let onSearch: () -> Void
+    let onSearch: (() -> Void)?
     let onInsertImage: () -> Void
     let onInsertShape: (PageShapeKind) -> Void
     let hasActiveDocument: Bool
-    let canImportPDF: Bool
     let canClearPage: Bool
-    let onImportPDF: () -> Void
     let onDocumentAction: (DocumentOutputAction) -> Void
     let onClearPage: () -> Void
 
@@ -57,10 +55,10 @@ struct ToolPaletteView: View {
 
             GeometryReader { geometry in
                 let horizontalPadding: CGFloat = 20
-                let leadingControlsWidth: CGFloat = 78
+                let leadingControlsWidth: CGFloat = onSearch == nil ? 38 : 78
                 let dividerWidth: CGFloat = 5
                 let outerSpacing: CGFloat = 24
-                let trailingActionCount = canImportPDF ? 3 : 2
+                let trailingActionCount = 2
                 let trailingActionsWidth = CGFloat(trailingActionCount * 38)
                     + CGFloat(max(trailingActionCount - 1, 0))
                 let centerWidth = max(
@@ -85,17 +83,19 @@ struct ToolPaletteView: View {
                             }
                         }
 
-                        DocumentToolbarButton(
-                            symbol: "magnifyingglass",
-                            title: "搜索 PDF",
-                            action: onSearch
-                        )
+                        if let onSearch {
+                            DocumentToolbarButton(
+                                symbol: "magnifyingglass",
+                                title: "搜索 PDF",
+                                action: onSearch
+                            )
+                        }
                     }
 
                     DocumentToolbarDivider()
 
                     // Only the drawing-tool cluster is allowed to scroll. Keeping the document
-                    // actions outside this scroll view guarantees that import, export, and More stay
+                    // actions outside this scroll view guarantees that export and More stay
                     // visible at the trailing edge, matching Goodnotes. The old outer ScrollView
                     // contained flexible Spacers; under an unbounded horizontal proposal they could
                     // expand and push the trailing actions completely off screen.
@@ -181,9 +181,7 @@ struct ToolPaletteView: View {
 
                     DocumentToolbarActions(
                         hasActiveDocument: hasActiveDocument,
-                        canImportPDF: canImportPDF,
                         canClearPage: canClearPage,
-                        onImportPDF: onImportPDF,
                         onDocumentAction: onDocumentAction,
                         onClearPage: onClearPage
                     )
@@ -443,10 +441,8 @@ private struct EraserModeOption: View {
 
 struct ReadOnlyToolPaletteView: View {
     @Binding var showsThumbnails: Bool
-    let onSearch: () -> Void
+    let onSearch: (() -> Void)?
     let hasActiveDocument: Bool
-    let canImportPDF: Bool
-    let onImportPDF: () -> Void
     let onDocumentAction: (DocumentOutputAction) -> Void
 
     var body: some View {
@@ -467,11 +463,13 @@ struct ReadOnlyToolPaletteView: View {
                     }
                 }
 
-                DocumentToolbarButton(
-                    symbol: "magnifyingglass",
-                    title: "搜索 PDF",
-                    action: onSearch
-                )
+                if let onSearch {
+                    DocumentToolbarButton(
+                        symbol: "magnifyingglass",
+                        title: "搜索 PDF",
+                        action: onSearch
+                    )
+                }
 
                 DocumentToolbarDivider()
 
@@ -483,9 +481,7 @@ struct ReadOnlyToolPaletteView: View {
 
                 DocumentToolbarActions(
                     hasActiveDocument: hasActiveDocument,
-                    canImportPDF: canImportPDF,
                     canClearPage: false,
-                    onImportPDF: onImportPDF,
                     onDocumentAction: onDocumentAction,
                     onClearPage: {}
                 )
@@ -607,8 +603,7 @@ struct DockableToolPaletteView: View {
                 Color.clear
                     .contentShape(Rectangle())
                     .allowsHitTesting(false)
-                    .accessibilityElement()
-                    .accessibilityIdentifier("tool-palette-dock-region")
+                    .accessibilityHidden(true)
 
                 palette(
                     in: geometry.size,
@@ -821,7 +816,8 @@ struct DockableToolPaletteView: View {
     private func allowedCenterBounds(in containerSize: CGSize) -> CGRect {
         let halfWidth = measuredPaletteSize.width / 2
         let halfHeight = measuredPaletteSize.height / 2
-        let minX = min(containerSize.width / 2, leadingContentInset + edgeInset + halfWidth)
+        let contentMidX = (min(leadingContentInset, containerSize.width) + containerSize.width) / 2
+        let minX = min(contentMidX, leadingContentInset + edgeInset + halfWidth)
         let maxX = max(minX, containerSize.width - edgeInset - halfWidth)
         let minY = min(containerSize.height / 2, edgeInset + halfHeight)
         let maxY = max(minY, containerSize.height - edgeInset - halfHeight)
@@ -1150,14 +1146,13 @@ private struct DocumentToolbarGlyph: View {
     // Match their visible 20-point outline to the circle and the leading toolbar icons.
     private var outlineHeight: CGFloat {
         switch symbol {
-        case "doc.badge.plus", "square.and.arrow.up": 21
+        case "square.and.arrow.up": 21
         default: 20
         }
     }
 
     private var opticalOffsetY: CGFloat {
         switch symbol {
-        case "doc.badge.plus": 0.5
         case "square.and.arrow.up": -0.5
         default: 0
         }

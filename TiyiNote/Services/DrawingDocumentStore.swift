@@ -259,6 +259,7 @@ final class DrawingDocumentStore: ObservableObject {
 
     private let fileManager: FileManager
     private let userDefaults: UserDefaults
+    private let includesBundledSamples: Bool
     private let workspaceDirectory: URL
     private let importsDirectory: URL
     private let drawingsDirectory: URL
@@ -291,6 +292,7 @@ final class DrawingDocumentStore: ObservableObject {
     /// immutable result has been handed to the durable writers. CloudKit must not race that handoff.
     private var pendingEditorDrawingPersistenceIDs: Set<UUID> = []
     private(set) var lastDrawingInteractionAt: Date?
+    var allowsPracticeFingerDrawing = false
 #if DEBUG
     private(set) var debugAppendOnlyDrawingSaveCount = 0
     private(set) var debugFullDrawingDiffSaveCount = 0
@@ -304,10 +306,12 @@ final class DrawingDocumentStore: ObservableObject {
     init(
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
-        workspaceDirectoryOverride: URL? = nil
+        workspaceDirectoryOverride: URL? = nil,
+        includesBundledSamples: Bool = true
     ) {
         self.fileManager = fileManager
         self.userDefaults = userDefaults
+        self.includesBundledSamples = includesBundledSamples
         lastCloudSyncAt = userDefaults.object(forKey: Self.lastCloudSyncAtKey) as? Date
 
         let applicationSupport = fileManager.urls(
@@ -2153,7 +2157,8 @@ final class DrawingDocumentStore: ObservableObject {
             throw PDFWorkspaceError.cannotAccess("仍有批注未能保存")
         }
         let documentPages = pages(in: documentID)
-        let assets = documentPages.map { page in
+        let archivedPages = deletedPages(in: documentID)
+        let assets = (documentPages + archivedPages).map { page in
             EditableDocumentPageAssets(
                 pageID: page.id,
                 backgroundPDFData: try? Data(
@@ -2171,6 +2176,7 @@ final class DrawingDocumentStore: ObservableObject {
         let package = EditableDocumentPackage(
             document: metadata,
             pages: documentPages,
+            deletedPages: archivedPages,
             sourcePDFData: try Data(contentsOf: sourceURL),
             pageAssets: assets,
             documentOperations: loadCollaborationOperations(
@@ -2223,7 +2229,8 @@ final class DrawingDocumentStore: ObservableObject {
             : oldDocumentID
         let existingPageIDs = Set(pages.map(\.id))
         var pageIDMap: [String: String] = [:]
-        for page in package.pages {
+        let allPackagePages = package.pages + package.deletedPages
+        for page in allPackagePages {
             pageIDMap[page.id] = newDocumentID != oldDocumentID || existingPageIDs.contains(page.id)
                 ? UUID().uuidString.lowercased()
                 : page.id
@@ -2292,12 +2299,13 @@ final class DrawingDocumentStore: ObservableObject {
         let targetFileName = "\(newDocumentID).pdf"
         let targetPDFURL = importsDirectory.appendingPathComponent(targetFileName)
         var affectedURLs = [registryURL, collaborationClockURL, targetPDFURL]
-        for page in importedPages {
-            affectedURLs.append(pageBackgroundURL(forPageID: page.id, in: newDocumentID))
-            affectedURLs.append(drawingURL(forPageID: page.id, in: newDocumentID))
-            affectedURLs.append(imageAnnotationsURL(forPageID: page.id, in: newDocumentID))
+        for page in allPackagePages {
+            let pageID = pageIDMap[page.id]!
+            affectedURLs.append(pageBackgroundURL(forPageID: pageID, in: newDocumentID))
+            affectedURLs.append(drawingURL(forPageID: pageID, in: newDocumentID))
+            affectedURLs.append(imageAnnotationsURL(forPageID: pageID, in: newDocumentID))
             affectedURLs.append(
-                collaborationOperationsURL(forPageID: page.id, in: newDocumentID)
+                collaborationOperationsURL(forPageID: pageID, in: newDocumentID)
             )
         }
         affectedURLs.append(
@@ -2355,37 +2363,37 @@ final class DrawingDocumentStore: ObservableObject {
             )
 
             try package.sourcePDFData.write(to: targetPDFURL, options: .atomic)
-            for (index, oldPage) in orderedPackagePages.enumerated() {
-                let importedPage = importedPages[index]
+            for oldPage in allPackagePages {
+                let importedPageID = pageIDMap[oldPage.id]!
                 guard let assets = assetsByOldPageID[oldPage.id],
                       let backgroundData = assets.backgroundPDFData else {
                     throw LibraryStoreError.invalidSnapshot("页面背景资产缺失")
                 }
                 try backgroundData.write(
                     to: pageBackgroundURL(
-                        forPageID: importedPage.id,
+                        forPageID: importedPageID,
                         in: newDocumentID
                     ),
                     options: .atomic
                 )
                 if let drawingData = assets.drawingData {
                     try drawingData.write(
-                        to: drawingURL(forPageID: importedPage.id, in: newDocumentID),
+                        to: drawingURL(forPageID: importedPageID, in: newDocumentID),
                         options: .atomic
                     )
                 }
                 if let elementsData = assets.elementsData {
                     try elementsData.write(
                         to: imageAnnotationsURL(
-                            forPageID: importedPage.id,
+                            forPageID: importedPageID,
                             in: newDocumentID
                         ),
                         options: .atomic
                     )
                 }
                 try saveCollaborationOperations(
-                    transformedPageOperations[importedPage.id] ?? [],
-                    forPageID: importedPage.id,
+                    transformedPageOperations[importedPageID] ?? [],
+                    forPageID: importedPageID,
                     in: newDocumentID
                 )
             }
@@ -2429,18 +2437,20 @@ final class DrawingDocumentStore: ObservableObject {
         guard isSafePathComponent(package.document.id),
               isSafePathComponent(package.document.fileName),
               !package.pages.isEmpty,
-              package.pages.count <= 10_000,
+              package.pages.count + package.deletedPages.count <= 10_000,
               let sourcePDF = PDFDocument(data: package.sourcePDFData),
               sourcePDF.pageCount == package.pages.count else {
             throw LibraryStoreError.invalidSnapshot("文稿身份、PDF 或页数无效")
         }
         _ = try normalizedTitle(package.document.title)
 
-        let pageIDs = package.pages.map(\.id)
+        let allPackagePages = package.pages + package.deletedPages
+        let deletedPageIDs = Set(package.deletedPages.map(\.id))
+        let pageIDs = allPackagePages.map(\.id)
         guard Set(pageIDs).count == pageIDs.count else {
             throw LibraryStoreError.invalidSnapshot("可编辑包包含重复页面 ID")
         }
-        for page in package.pages {
+        for page in allPackagePages {
             guard page.documentID == package.document.id,
                   isSafePathComponent(page.id),
                   page.orderIndex >= 0,
@@ -2487,6 +2497,16 @@ final class DrawingDocumentStore: ObservableObject {
                 $0.documentID == package.document.id && $0.pageID == assets.pageID
             }) else {
                 throw LibraryStoreError.invalidSnapshot("页面 operation 引用了其他文稿或页面")
+            }
+            if deletedPageIDs.contains(assets.pageID) {
+                let state = CollaborationMergeEngine.materialize(assets.operations)
+                guard state.isDeleted,
+                      let data = state.metadata["pageArchive"],
+                      let archive = try? JSONDecoder().decode(LibraryPage.self, from: data),
+                      archive.id == assets.pageID,
+                      archive.documentID == package.document.id else {
+                    throw LibraryStoreError.invalidSnapshot("回收站页面的恢复数据不完整")
+                }
             }
         }
         guard package.documentOperations.allSatisfy({
@@ -2815,13 +2835,34 @@ final class DrawingDocumentStore: ObservableObject {
         signalLocalCloudChange()
     }
 
+    /// Practice keeps its original question PDFs as backgrounds while adopting the same camera,
+    /// thumbnails and uncropped exports as a canvas. Existing page IDs, ink and objects stay valid.
+    func enableUnboundedCanvas(for documentID: String) throws {
+        try requireEditableSharedDocument(documentID)
+        guard let index = documentMetadata.firstIndex(where: { $0.id == documentID }) else {
+            throw LibraryStoreError.documentNotFound(documentID)
+        }
+        guard documentMetadata[index].kind != .canvas else { return }
+        var updatedMetadata = documentMetadata
+        updatedMetadata[index].kind = .canvas
+        updatedMetadata[index].canvasBackgroundStyle = .blank
+        updatedMetadata[index].canvasBackgroundColor = .white
+        updatedMetadata[index].modifiedAt = Date()
+        updatedMetadata[index].contentModifiedAt = updatedMetadata[index].modifiedAt
+        try persistRegistry(folders: folders, documents: updatedMetadata)
+        documentMetadata = updatedMetadata
+        rebuildWorkspaceDocuments()
+        thumbnailCache.removeAll()
+        signalLocalCloudChange()
+    }
+
     func canvasViewport(forPageID pageID: String, in documentID: String, referenceSize: CGSize) -> CanvasViewport {
         let fallback = CanvasViewport(referenceSize: referenceSize)
         guard let data = userDefaults.data(forKey: "canvas.viewport.v1.\(documentID).\(pageID)"),
               var viewport = try? JSONDecoder().decode(CanvasViewport.self, from: data),
               viewport.center.x.isFinite, viewport.center.y.isFinite,
               viewport.zoomScale.isFinite else { return fallback }
-        viewport.zoomScale = min(max(viewport.zoomScale, 0.5), 3)
+        viewport.zoomScale = min(max(viewport.zoomScale, CanvasViewport.minimumZoomScale), CanvasViewport.maximumZoomScale)
         return viewport
     }
 
@@ -5210,10 +5251,10 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func defaultBundledMetadata() -> [LibraryDocumentMetadata] {
-        let includesBundledSamples = Bundle.main.object(
+        let hostIncludesBundledSamples = Bundle.main.object(
             forInfoDictionaryKey: "TiyiDocumentsIncludesBundledSamples"
         ) as? Bool ?? true
-        guard includesBundledSamples else { return [] }
+        guard includesBundledSamples && hostIncludesBundledSamples else { return [] }
 
         // A fixed old timestamp lets a genuinely renamed/moved CloudKit sample always win over a
         // pristine sample installed for the first time on another device.

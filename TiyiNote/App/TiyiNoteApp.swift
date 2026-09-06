@@ -68,7 +68,11 @@ struct TiyiNoteApp: App {
         WindowGroup {
 #if DEBUG
             if let interactionConfiguration = TextInteractionUITestConfiguration() {
-                TextInteractionUITestHost(configuration: interactionConfiguration)
+                if interactionConfiguration.token.hasPrefix("practice-sidebar") {
+                    PracticeSidebarUITestHost(configuration: interactionConfiguration)
+                } else {
+                    TextInteractionUITestHost(configuration: interactionConfiguration)
+                }
             } else if let libraryConfiguration = LibraryFeatureSmokeConfiguration() {
                 LibraryFeatureSmokeHarnessView(configuration: libraryConfiguration)
             } else if let smokeConfiguration = CloudKitSmokeConfiguration() {
@@ -101,6 +105,36 @@ private struct TextInteractionUITestConfiguration {
         token = String(safeToken.prefix(48))
         reuseExistingWorkspace = arguments.contains(Self.reuseWorkspaceArgument)
     }
+}
+
+@MainActor
+private struct PracticeSidebarUITestHost: View {
+    @StateObject private var workspace: TiyiPracticeWorkspace
+
+    init(configuration: TextInteractionUITestConfiguration) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TiyiPracticeSidebarUITest")
+            .appendingPathComponent(configuration.token)
+        if !configuration.reuseExistingWorkspace {
+            try? FileManager.default.removeItem(at: directory)
+            UserDefaults(suiteName: "tiyi.practice.\(configuration.token)")?
+                .removePersistentDomain(forName: "tiyi.practice.\(configuration.token)")
+        }
+        let sections = [TiyiPracticeSection(id: "a", label: "第 1 题"), .init(id: "b", label: "第 2 题")]
+        let seeds = sections.map { section in
+            let image = UIGraphicsImageRenderer(size: CGSize(width: 696, height: 220)).image { context in
+                UIColor.white.setFill(); context.fill(CGRect(x: 0, y: 0, width: 696, height: 220))
+                ("\(section.label)：已知 x² + 1 = 5，求 x 的值。" as NSString).draw(
+                    at: CGPoint(x: 20, y: 24), withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
+                )
+            }
+            return TiyiPracticePageSeed(questionID: section.id, image: image)
+        }
+        let workspace = try! TiyiPracticeWorkspace(directory: directory, title: "作答页面自测", sections: sections, seeds: seeds)
+        _workspace = StateObject(wrappedValue: workspace)
+    }
+
+    var body: some View { TiyiPracticeEditor(workspace: workspace, onExit: {}) }
 }
 
 @MainActor
@@ -258,8 +292,7 @@ private struct TextInteractionUITestHost: View {
                         )
                         showsWorkspace = true
                     },
-                    canEditDocument: { _ in true },
-                    onCollaborateDocument: { _ in }
+                    canEditDocument: { _ in true }
                 )
             }
         }

@@ -27,8 +27,6 @@ struct RootWorkspaceView: View {
     @State private var sharedSyncCoordinators: [String: CloudLibrarySyncCoordinator] = [:]
     @State private var cloudSyncWasDeferredByDrawing = false
     @State private var collaborativeZonesByDocumentID: [String: CloudDocumentSharedZone] = [:]
-    @State private var cloudSharePresentation: CloudSharePresentation?
-    @State private var isPreparingCollaboration = false
     @State private var collaborationErrorMessage: String?
     /// Acquired while switching from the library into an editable hierarchy. It provides a
     /// cancellation barrier between a delayed maintenance pass and the first Pencil sample, then is
@@ -60,7 +58,6 @@ struct RootWorkspaceView: View {
                 CanvasScreen(
                     documentStore: documentStore,
                     canEditActiveDocument: canEditDocument(activeDocumentID),
-                    onCollaborateDocument: presentCollaboration,
                     onShowLibrary: showLibrary
                 )
                 .transition(.opacity)
@@ -68,28 +65,7 @@ struct RootWorkspaceView: View {
         }
         .animation(.easeInOut(duration: 0.16), value: destination)
         .tint(TiyiNoteTheme.selectionBlue)
-        .overlay {
-            if isPreparingCollaboration {
-                ZStack {
-                    Color.black.opacity(0.22).ignoresSafeArea()
-                    ProgressView("正在准备多人协作…")
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 16)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-                }
-            }
-        }
-        .sheet(item: $cloudSharePresentation, onDismiss: refreshAfterSharingSheet) { item in
-            CloudSharingControllerView(
-                preparation: item.preparation,
-                title: item.title,
-                onChanged: refreshAfterSharingSheet,
-                onFailure: { error in
-                    collaborationErrorMessage = error.localizedDescription
-                }
-            )
-        }
-        .alert("多人协作失败", isPresented: collaborationErrorIsPresented) {
+        .alert("iCloud 文稿加载失败", isPresented: collaborationErrorIsPresented) {
             Button("好", role: .cancel) { collaborationErrorMessage = nil }
         } message: {
             Text(collaborationErrorMessage ?? "请稍后重试。")
@@ -217,7 +193,7 @@ struct RootWorkspaceView: View {
                 if let librarySidebar {
                     librarySidebar
                     Divider()
-                        .ignoresSafeArea(.keyboard, edges: .bottom)
+                        .ignoresSafeArea(.all, edges: .vertical)
                 }
                 libraryBrowser
             }
@@ -234,8 +210,7 @@ struct RootWorkspaceView: View {
                 await synchronizeAllCloudZones()
             },
             onOpenDocument: openDocument,
-            canEditDocument: canEditDocument,
-            onCollaborateDocument: presentCollaboration
+            canEditDocument: canEditDocument
         )
     }
 
@@ -289,57 +264,6 @@ struct RootWorkspaceView: View {
 
     private func canEditDocument(_ documentID: String) -> Bool {
         collaborativeZonesByDocumentID[documentID]?.accessLevel.canEdit ?? true
-    }
-
-    private func presentCollaboration(_ documentID: String) {
-        guard let document = documentStore.document(withID: documentID),
-              !isPreparingCollaboration else { return }
-        Task { @MainActor in
-            isPreparingCollaboration = true
-            defer { isPreparingCollaboration = false }
-            do {
-                let preparation: CloudDocumentSharePreparation
-                if let zone = collaborativeZonesByDocumentID[documentID] {
-                    preparation = try await CloudDocumentShareService.loadExistingShare(
-                        zone: zone,
-                        dataSource: documentStore
-                    )
-                } else {
-                    preparation = try await CloudDocumentShareService.prepareShare(
-                        documentID: documentID,
-                        title: document.title,
-                        dataSource: documentStore
-                    )
-                    let zone = CloudDocumentSharedZone(
-                        documentID: documentID,
-                        zoneID: preparation.zoneID,
-                        databaseScope: .private,
-                        accessLevel: .owner
-                    )
-                    collaborativeZonesByDocumentID[documentID] = zone
-                    sharedSyncCoordinators[zone.key] = preparation.syncCoordinator
-                    if let cloudSyncCoordinator {
-                        await cloudSyncCoordinator.setExcludedDocumentIDs(
-                            Set(collaborativeZonesByDocumentID.keys)
-                        )
-                    }
-                }
-                // The preparation owns a scoped coordinator; retaining it keeps local changes
-                // flowing into the document zone after the invitation sheet closes.
-                if let zone = collaborativeZonesByDocumentID[documentID] {
-                    sharedSyncCoordinators[zone.key] = preparation.syncCoordinator
-                }
-                // Share preparation is an explicit foreground action and has already completed its
-                // required sync. Future passes use the same deep-idle scheduler as every other zone.
-                await preparation.syncCoordinator.resumeAutomaticSync()
-                cloudSharePresentation = CloudSharePresentation(
-                    title: document.title,
-                    preparation: preparation
-                )
-            } catch {
-                collaborationErrorMessage = error.localizedDescription
-            }
-        }
     }
 
     @MainActor
@@ -458,20 +382,9 @@ struct RootWorkspaceView: View {
 
     @MainActor
     private func reloadAcceptedShare() async {
-        isPreparingCollaboration = true
-        defer { isPreparingCollaboration = false }
         await refreshSharedDocuments()
         if destination == .library {
             await synchronizeAllCloudZones()
-        }
-    }
-
-    private func refreshAfterSharingSheet() {
-        Task { @MainActor in
-            await refreshSharedDocuments()
-            if destination == .library {
-                await synchronizeAllCloudZones()
-            }
         }
     }
 
@@ -506,71 +419,6 @@ struct RootWorkspaceView: View {
         return true
 #endif
 #endif
-    }
-}
-
-private struct CloudSharePresentation: Identifiable {
-    let id = UUID()
-    let title: String
-    let preparation: CloudDocumentSharePreparation
-}
-
-private struct CloudSharingControllerView: UIViewControllerRepresentable {
-    let preparation: CloudDocumentSharePreparation
-    let title: String
-    let onChanged: () -> Void
-    let onFailure: (Error) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(title: title, onChanged: onChanged, onFailure: onFailure)
-    }
-
-    func makeUIViewController(context: Context) -> UICloudSharingController {
-        let controller = UICloudSharingController(
-            share: preparation.share,
-            container: preparation.container
-        )
-        controller.delegate = context.coordinator
-        controller.availablePermissions = [.allowPrivate, .allowReadOnly, .allowReadWrite]
-        return controller
-    }
-
-    func updateUIViewController(
-        _ uiViewController: UICloudSharingController,
-        context: Context
-    ) {}
-
-    final class Coordinator: NSObject, UICloudSharingControllerDelegate {
-        let title: String
-        let onChanged: () -> Void
-        let onFailure: (Error) -> Void
-
-        init(
-            title: String,
-            onChanged: @escaping () -> Void,
-            onFailure: @escaping (Error) -> Void
-        ) {
-            self.title = title
-            self.onChanged = onChanged
-            self.onFailure = onFailure
-        }
-
-        func itemTitle(for csc: UICloudSharingController) -> String? { title }
-
-        func cloudSharingControllerDidSaveShare(_ csc: UICloudSharingController) {
-            onChanged()
-        }
-
-        func cloudSharingControllerDidStopSharing(_ csc: UICloudSharingController) {
-            onChanged()
-        }
-
-        func cloudSharingController(
-            _ csc: UICloudSharingController,
-            failedToSaveShareWithError error: Error
-        ) {
-            onFailure(error)
-        }
     }
 }
 

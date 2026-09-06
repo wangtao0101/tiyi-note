@@ -124,3 +124,138 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 }
+
+/// Observes the same contact as PencilKit's eraser without competing with drawing or navigation.
+/// Independent vector objects participate in that contact's undo transaction alongside native ink.
+final class ShapeEraserGestureRecognizer: UIGestureRecognizer {
+    var canTrack: (() -> Bool)?
+    var onContactBegan: (() -> Void)?
+    var onSegment: ((CGPoint, CGPoint) -> Void)?
+    var onContactEnded: (() -> Void)?
+    private weak var trackedTouch: UITouch?
+    private var lastPoint: CGPoint?
+    var isTrackingContact: Bool { trackedTouch != nil }
+
+    init() {
+        super.init(target: nil, action: nil)
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+        requiresExclusiveTouchType = false
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard trackedTouch == nil, touches.count == 1, canTrack?() == true,
+              let touch = touches.first else {
+            endContact()
+            state = .failed
+            return
+        }
+        trackedTouch = touch
+        onContactBegan?()
+        append(touch)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = trackedTouch, touches.contains(touch) else { return }
+        for sample in event.coalescedTouches(for: touch) ?? [touch] { append(sample) }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = trackedTouch, touches.contains(touch) else { return }
+        append(touch)
+        endContact()
+        state = .failed
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        endContact()
+        state = .failed
+    }
+
+    override func reset() {
+        endContact()
+        super.reset()
+    }
+
+    private func append(_ touch: UITouch) {
+        guard let canvas = view as? PKCanvasView else { return }
+        let location = touch.location(in: canvas)
+        let scale = max(canvas.zoomScale, 0.0001)
+        let point = CGPoint(x: location.x / scale, y: location.y / scale)
+        onSegment?(lastPoint ?? point, point)
+        lastPoint = point
+    }
+
+    private func endContact() {
+        guard trackedTouch != nil else { return }
+        trackedTouch = nil
+        lastPoint = nil
+        onContactEnded?()
+    }
+}
+
+/// Finger taps select; movement, a second finger, Pencil and long holds immediately leave control
+/// with the existing drawing/navigation recognizers. No native text-selection interaction is used.
+final class FingerContentTapGestureRecognizer: UIGestureRecognizer {
+    weak var drawingRecognizer: UIGestureRecognizer?
+    var canSelect: ((CGPoint) -> Bool)?
+    var onSelect: (() -> Void)?
+    private weak var trackedTouch: UITouch?
+    private var initialPoint = CGPoint.zero
+    private var timeout: DispatchWorkItem?
+
+    init() {
+        super.init(target: nil, action: nil)
+        allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func shouldBeRequiredToFail(by otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // A Pencil contact never depends on this finger-only recognizer, even when practice
+        // enables finger drawing. Only a live, eligible finger tap delays native ink recognition.
+        otherGestureRecognizer === drawingRecognizer && trackedTouch != nil
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard trackedTouch == nil, touches.count == 1, let touch = touches.first,
+              touch.type == .direct, canSelect?(touch.location(in: view)) == true else {
+            state = .failed
+            return
+        }
+        trackedTouch = touch
+        initialPoint = touch.location(in: nil)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.state == .possible else { return }
+            self.state = .failed
+        }
+        timeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = trackedTouch, touches.contains(touch) else { return }
+        let point = touch.location(in: nil)
+        if hypot(point.x - initialPoint.x, point.y - initialPoint.y) > 8 { state = .failed }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let touch = trackedTouch, touches.contains(touch), state == .possible else { return }
+        state = .recognized
+        onSelect?()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { state = .failed }
+
+    override func reset() {
+        timeout?.cancel()
+        timeout = nil
+        trackedTouch = nil
+        super.reset()
+    }
+}

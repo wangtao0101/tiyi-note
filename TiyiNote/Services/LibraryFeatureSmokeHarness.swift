@@ -1285,9 +1285,9 @@ private enum LibraryFeatureSmokeHarness {
             eraserSize: .small,
             eraserMode: .stroke
         )
-        guard controller.canvasView.tool is PKLassoTool,
+        guard !(controller.canvasView.tool is PKLassoTool),
               !controller.canvasView.drawingGestureRecognizer.isEnabled else {
-            throw SmokeError.validationFailed("套索工具没有接管绘图手势")
+            throw SmokeError.validationFailed("自定义套索未独占交互，或仍启用了系统套索")
         }
     }
 

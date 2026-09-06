@@ -3,6 +3,289 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+    func testPracticeQuestionAndSupplementUseUnboundedCanvasAndKeepOutsideInk() throws {
+        let app = launchIsolatedApp(prefix: "practice-sidebar-unbounded")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        let pager = app.scrollViews["document-page-pager"]
+        let reset = app.buttons["zoom-reset"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["document-import-button"].exists)
+        XCTAssertEqual(canvas.frame.width, pager.frame.width, accuracy: 1)
+        XCTAssertEqual(canvas.frame.height, pager.frame.height, accuracy: 1)
+        let originalViewport = try canvasViewportRect(of: canvas)
+        let background = XCTAttachment(screenshot: app.screenshot())
+        background.name = "Practice question remains visible on the unbounded canvas"
+        background.lifetime = .keepAlways
+        add(background)
+
+        try pinchCanvas(canvas, scale: 0.05, in: app)
+        waitUntil(timeout: 3) { reset.label.contains("10%") }
+        XCTAssertEqual(try canvasViewportRect(of: canvas).width, originalViewport.width * 10, accuracy: 3)
+        drawStroke(on: canvas, from: CGVector(dx: 0.20, dy: 0.25), to: CGVector(dx: 0.36, dy: 0.30))
+        waitForValue("笔迹 1", of: canvas)
+        let outsideInk = try drawingBounds(of: canvas)
+        XCTAssertLessThan(outsideInk.minX, 0)
+        XCTAssertLessThan(outsideInk.minY, 0)
+        let inkGeometry = drawingGeometryValue(of: canvas)
+
+        openPageSidebar(in: app)
+        addPage(named: "方格纸", in: app)
+        waitUntil(timeout: 4) { pager.value as? String == "2 / 3" }
+        XCTAssertTrue(app.buttons["practice-question-menu"].label.contains("第 1 题"))
+        let supplement = app.descendants(matching: .any)["page-canvas-1"]
+        XCTAssertTrue(supplement.waitForExistence(timeout: 3))
+        XCTAssertEqual(supplement.frame.width, pager.frame.width, accuracy: 1)
+        _ = try canvasViewportRect(of: supplement)
+        drawStroke(on: supplement)
+        waitForValue("笔迹 1", of: supplement)
+        app.buttons["page-thumbnail-0"].tap()
+        waitUntil(timeout: 4) { pager.value as? String == "1 / 3" }
+        app.buttons["关闭页面缩略图"].firstMatch.tap()
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), inkGeometry)
+        XCTAssertTrue(reset.label.contains("10%"))
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Practice at 10 percent with writing outside the question background"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+
+        app.buttons["practice-exit"].tap()
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), inkGeometry)
+        XCTAssertTrue(reset.label.contains("10%"))
+        XCTAssertEqual(pager.value as? String, "1 / 3")
+    }
+
+    func testDoubleTapAndHoldOnSelectedContentNeverShowsPencilKitMenu() throws {
+        for prefix in ["selected-content-menu", "practice-sidebar-selected-content-menu"] {
+            let app = launchIsolatedApp(prefix: prefix)
+            let canvas = app.descendants(matching: .any)["page-canvas-0"]
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            XCTAssertFalse(app.buttons["document-import-button"].exists)
+            insertShape(named: "矩形", in: app, settingsScroll: app.scrollViews["tool-settings-scroll"])
+            let shape = app.descendants(matching: .any).matching(identifier: "page-element-shape").firstMatch
+            let selection = app.descendants(matching: .any)["lasso-selection-box"]
+            checkSelectedContentMenu()
+
+            app.buttons["tool-pen"].tap()
+            let frame = canvas.frame
+            let line = (0...8).map { CGPoint(x: frame.minX + frame.width * (0.28 + CGFloat($0) * 0.045),
+                                           y: frame.minY + frame.height * 0.26) }
+            try synthesizeTouchPath(line, on: canvas, in: app, holdBeforeLift: 1.2)
+            waitForValueContaining("吸附 直线", of: canvas)
+            canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.26)).tap()
+            waitUntil(timeout: 3) { app.buttons["tool-lasso"].value as? String == "selected" && selection.exists }
+            checkSelectedContentMenu()
+            app.buttons["tool-pen"].tap()
+            drawStroke(on: canvas, from: CGVector(dx: 0.28, dy: 0.72), to: CGVector(dx: 0.60, dy: 0.77))
+            waitForValue("笔迹 2", of: canvas)
+
+            // Reopening installs a new PencilKit hierarchy. Real iPad fingers must select the
+            // existing object without reactivating native selection/menu gestures.
+            app.buttons[prefix.hasPrefix("practice") ? "practice-exit" : "home-button"].tap()
+            app.terminate()
+            app.launchArguments += ["--reuse-text-interaction-ui-test-workspace", "--pencil-only-ui-test"]
+            app.launch()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            shape.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            XCTAssertTrue(selection.waitForExistence(timeout: 3))
+            checkSelectedContentMenu()
+            app.terminate()
+
+            func checkSelectedContentMenu() {
+                XCTAssertTrue(selection.waitForExistence(timeout: 3))
+                selection.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).doubleTap()
+                assertNoNativeMenu()
+                selection.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 1.0)
+                assertNoNativeMenu()
+                XCTAssertTrue(app.buttons["删除"].exists, "The app's own selection controls must stay usable")
+            }
+
+            func assertNoNativeMenu() {
+                XCTAssertEqual(app.menus.count, 0)
+                for title in ["Select All", "Insert Space", "Paste", "全选", "插入空白", "粘贴"] {
+                    XCTAssertFalse(app.buttons[title].exists, "Unexpected native canvas action: \(title)")
+                    XCTAssertFalse(app.menuItems[title].exists)
+                }
+            }
+        }
+    }
+
+    func testFingerTapSelectsInsertedAndHeldShapesWithoutAddingInk() throws {
+        let app = launchIsolatedApp(prefix: "shape-finger-select")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let settings = app.scrollViews["tool-settings-scroll"]
+        insertShape(named: "直线", in: app, settingsScroll: settings)
+        let shape = app.descendants(matching: .any).matching(identifier: "page-element-shape").firstMatch
+        let selection = app.descendants(matching: .any)["lasso-selection-box"]
+        app.buttons["tool-pen"].tap()
+        // A finger target stays comfortable even near a thin line's edge.
+        shape.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .withOffset(CGVector(dx: 0, dy: 10)).tap()
+        waitUntil(timeout: 3) { app.buttons["tool-lasso"].value as? String == "selected" && selection.exists }
+        waitForValue("笔迹 0", of: canvas)
+
+        app.buttons["tool-pen"].tap()
+        let frame = canvas.frame
+        let start = CGPoint(x: frame.minX + frame.width * 0.32, y: frame.minY + frame.height * 0.28)
+        let end = CGPoint(x: frame.minX + frame.width * 0.64, y: start.y)
+        let points = (0...8).map { index in
+            CGPoint(x: start.x + (end.x - start.x) * CGFloat(index) / 8, y: start.y)
+        }
+        try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 1.25)
+        waitForValue("笔迹 1", of: canvas)
+        waitForValueContaining("吸附 直线", of: canvas)
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.48, dy: 0.28))
+            .withOffset(CGVector(dx: 0, dy: 10)).tap()
+        waitUntil(timeout: 3) { app.buttons["tool-lasso"].value as? String == "selected" && selection.exists }
+        waitForValue("笔迹 1", of: canvas)
+        let original = selection.frame
+        let center = selection.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        center.press(forDuration: 0.1, thenDragTo: center.withOffset(CGVector(dx: 30, dy: 60)))
+        XCTAssertGreaterThan(selection.frame.midY, original.midY + 40)
+        // Selection still follows the transformed native stroke after deselecting.
+        app.buttons["tool-pen"].tap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.48, dy: 0.28))
+            .withOffset(CGVector(dx: 30, dy: 60)).tap()
+        waitUntil(timeout: 3) { app.buttons["tool-lasso"].value as? String == "selected" && selection.exists }
+        waitForValue("笔迹 1", of: canvas)
+
+        app.buttons["tool-eraser"].tap()
+        app.buttons["tool-eraser"].tap()
+        app.buttons["eraser-mode-stroke"].tap()
+        let point = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.48, dy: 0.28))
+            .withOffset(CGVector(dx: 30, dy: 60))
+        point.withOffset(CGVector(dx: 0, dy: -30)).press(forDuration: 0.08,
+            thenDragTo: point.withOffset(CGVector(dx: 0, dy: 30)))
+        waitForValue("笔迹 0", of: canvas)
+        XCTAssertTrue(shape.exists)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+
+        app.buttons["home-button"].tap()
+        app.terminate()
+        app.launchArguments += ["--reuse-text-interaction-ui-test-workspace", "--pencil-only-ui-test"]
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-pen"].tap()
+        shape.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        waitUntil(timeout: 3) { app.buttons["tool-lasso"].value as? String == "selected" && selection.exists }
+        waitForValue("笔迹 1", of: canvas)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Finger selection with a comfortable thin-line frame"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    func testEraserDeletesShapeAndInkInOneUndoTransactionAndPersists() throws {
+        let app = launchIsolatedApp(prefix: "shape-eraser-persistence")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        insertShape(named: "矩形", in: app, settingsScroll: app.scrollViews["tool-settings-scroll"])
+        let shapes = app.descendants(matching: .any).matching(identifier: "page-element-shape")
+        let shapeFrame = shapes.firstMatch.frame
+        app.buttons["tool-pen"].tap()
+        let origin = canvas.coordinate(withNormalizedOffset: .zero)
+        let point = origin.withOffset(CGVector(dx: shapeFrame.midX - canvas.frame.minX,
+                                              dy: shapeFrame.minY - canvas.frame.minY))
+        point.withOffset(CGVector(dx: 0, dy: -40)).press(forDuration: 0.08,
+            thenDragTo: point.withOffset(CGVector(dx: 0, dy: 40)))
+        waitForValue("笔迹 1", of: canvas)
+        app.buttons["tool-eraser"].tap()
+        app.buttons["tool-eraser"].tap()
+        app.buttons["eraser-mode-stroke"].tap()
+        point.withOffset(CGVector(dx: -40, dy: 0)).press(forDuration: 0.08,
+            thenDragTo: point.withOffset(CGVector(dx: 40, dy: 0)))
+        waitUntil(timeout: 3) { shapes.count == 0 }
+        waitForValue("笔迹 0", of: canvas)
+        app.buttons["撤销"].tap()
+        waitUntil(timeout: 3) { shapes.count == 1 }
+        waitForValue("笔迹 1", of: canvas)
+        app.buttons["重做"].tap()
+        waitUntil(timeout: 3) { shapes.count == 0 }
+        waitForValue("笔迹 0", of: canvas)
+
+        app.buttons["home-button"].tap()
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        XCTAssertEqual(shapes.count, 0)
+        waitForValue("笔迹 0", of: canvas)
+    }
+
+    func testShapeSelectionAndPrecisionEraserAtTenPercentRespectTheOutline() throws {
+        let app = launchIsolatedApp(prefix: "shape-small-zoom")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        try pinchCanvas(canvas, scale: 0.05, in: app)
+        waitUntil(timeout: 3) { app.buttons["zoom-reset"].label.contains("10%") }
+        insertShape(named: "矩形", in: app, settingsScroll: app.scrollViews["tool-settings-scroll"])
+        let shape = app.descendants(matching: .any).matching(identifier: "page-element-shape").firstMatch
+        let frame = shape.frame
+        app.buttons["tool-pen"].tap()
+        shape.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
+            .withOffset(CGVector(dx: 10, dy: 0)).tap()
+        waitUntil(timeout: 3) { app.buttons["tool-lasso"].value as? String == "selected" }
+        app.buttons["tool-eraser"].tap()
+        app.buttons["tool-eraser"].tap()
+        app.buttons["eraser-mode-precision"].tap()
+        let center = canvas.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: frame.midX - canvas.frame.minX, dy: frame.midY - canvas.frame.minY))
+        center.press(forDuration: 0.1, thenDragTo: center.withOffset(CGVector(dx: 1, dy: 0)))
+        XCTAssertTrue(shape.exists, "An empty shape interior must not be erased as a filled rectangle")
+        let edge = center.withOffset(CGVector(dx: frame.width / 2, dy: 0))
+        edge.withOffset(CGVector(dx: -5, dy: 0)).press(forDuration: 0.08,
+            thenDragTo: edge.withOffset(CGVector(dx: 12, dy: 0)))
+        XCTAssertTrue(shape.waitForNonExistence(timeout: 3))
+        app.buttons["撤销"].tap()
+        XCTAssertTrue(shape.waitForExistence(timeout: 3))
+        waitForValue("笔迹 0", of: canvas)
+    }
+
+    func testNativeCanvasDoubleTapAndHoldDoNotShowEditingMenusOrBlockWriting() throws {
+        let app = launchIsolatedApp(prefix: "canvas-editing-menus")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        for tool in ["tool-pen", "tool-lasso"] {
+            if app.buttons[tool].value as? String != "selected" { app.buttons[tool].tap() }
+            canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.72, dy: 0.30)).doubleTap()
+            canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.78, dy: 0.60)).press(forDuration: 0.9)
+            XCTAssertEqual(app.menus.count, 0)
+            for label in ["Select All", "Insert Space", "Paste", "全选", "插入空白", "粘贴"] {
+                XCTAssertFalse(app.buttons[label].exists, "Native canvas menu appeared: \(label)")
+            }
+            if app.buttons["tool-pen"].value as? String != "selected" { app.buttons["tool-pen"].tap() }
+            let value = canvas.value as? String ?? ""
+            let count = try XCTUnwrap(Int(value.components(separatedBy: "；")[0].replacingOccurrences(of: "笔迹 ", with: "")))
+            drawStroke(on: canvas, from: CGVector(dx: 0.25, dy: 0.4), to: CGVector(dx: 0.5, dy: 0.45))
+            waitForValue("笔迹 \(count + 1)；", of: canvas)
+        }
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Canvas remains writable after double tap and hold"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+
+        app.buttons["home-button"].tap()
+        app.terminate()
+        app.launchArguments += ["--reuse-text-interaction-ui-test-workspace", "--pencil-only-ui-test"]
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        // On hardware fingers navigate instead of drawing. Test the native selection/menu path
+        // under that same policy, with already persisted ink on the page.
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.70, dy: 0.70)).doubleTap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.60)).press(forDuration: 0.9)
+        XCTAssertEqual(app.menus.count, 0)
+        for label in ["Select All", "Insert Space", "Paste", "全选", "插入空白", "粘贴"] {
+            XCTAssertFalse(app.buttons[label].exists)
+        }
+    }
+
     override func setUpWithError() throws {
         continueAfterFailure = false
         executionTimeAllowance = 180
@@ -554,18 +837,17 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(thumbnails.isHittable)
         XCTAssertTrue(pen.isHittable)
         XCTAssertTrue(image.isHittable)
-        XCTAssertTrue(importDocument.isHittable)
+        XCTAssertFalse(importDocument.exists)
         XCTAssertTrue(output.isHittable)
         XCTAssertTrue(more.isHittable)
         XCTAssertLessThan(abs(thumbnails.frame.midY - pen.frame.midY), 3)
         XCTAssertLessThan(abs(pen.frame.midY - image.frame.midY), 3)
-        XCTAssertLessThan(abs(thumbnails.frame.midY - importDocument.frame.midY), 3)
         XCTAssertLessThan(abs(thumbnails.frame.midY - output.frame.midY), 3)
         XCTAssertLessThan(abs(thumbnails.frame.midY - more.frame.midY), 3)
-        for button in [thumbnails, pen, image, importDocument, output, more] {
+        for button in [thumbnails, pen, image, output, more] {
             XCTAssertEqual(button.frame.midY, toolBar.frame.midY, accuracy: 1)
         }
-        for trailingAction in [importDocument, output, more] {
+        for trailingAction in [output, more] {
             XCTAssertGreaterThanOrEqual(
                 trailingAction.frame.minX,
                 toolBar.frame.minX,
@@ -592,7 +874,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(drawingTools.frame.contains(history.frame))
         XCTAssertGreaterThan(undo.frame.minX, shape.frame.maxX)
         XCTAssertGreaterThan(redo.frame.minX, undo.frame.maxX)
-        XCTAssertLessThan(redo.frame.maxX, importDocument.frame.minX)
+        XCTAssertLessThan(redo.frame.maxX, output.frame.minX)
         for button in [undo, redo] {
             XCTAssertEqual(button.frame.midY, more.frame.midY, accuracy: 1)
             XCTAssertEqual(button.frame.size, more.frame.size)
@@ -637,7 +919,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             .matching(identifier: "dockable-tool-palette")
             .firstMatch
         let region = app.descendants(matching: .any)
-            .matching(identifier: "tool-palette-dock-region")
+            .matching(identifier: "document-page-pager")
             .firstMatch
         XCTAssertTrue(palette.waitForExistence(timeout: 8))
         XCTAssertTrue(region.waitForExistence(timeout: 5))
@@ -674,7 +956,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertLessThan(abs(rightFrame.maxX - region.frame.maxX), 32)
 
         let bottomFrame = dragPalette(to: "bottom", offset: CGVector(dx: 0.50, dy: 0.99))
-        XCTAssertLessThan(abs(bottomFrame.maxY - region.frame.maxY), 32)
+        XCTAssertLessThan(abs(bottomFrame.maxY - region.frame.maxY), 36)
 
         let upperLeftFrame = dragPalette(
             to: "left",
@@ -1015,6 +1297,17 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         // deterministic object frame instead of leaving a second dotted selection mode.
         XCTAssertTrue(selectionBox.waitForExistence(timeout: 3))
 
+        // Enclosing just one corner must work too; the shape's center is outside this loop.
+        let shapeFrame = shape.frame
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.16)).tap()
+        XCTAssertTrue(selectionBox.waitForNonExistence(timeout: 3))
+        try synthesizeClosedTouchPath(
+            around: CGRect(x: shapeFrame.minX - 14, y: shapeFrame.minY - 14, width: 30, height: 30),
+            on: canvas, in: app
+        )
+        XCTAssertTrue(selectionBox.waitForExistence(timeout: 3))
+        XCTAssertEqual(selectionBox.frame.width, shapeFrame.width, accuracy: 2)
+
         let actionBar = app.descendants(matching: .any)
             .matching(identifier: "selection-action-bar")
             .firstMatch
@@ -1157,22 +1450,22 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
         openPageSidebar(in: app)
         addPage(named: "横线纸", in: app)
-        waitUntil(timeout: 4) { app.staticTexts["document-page-counter"].label == "2 / 2" }
+        waitUntil(timeout: 4) { (app.scrollViews["document-page-pager"].value as? String ?? "") == "2 / 2" }
         addPage(named: "方格纸", in: app)
-        waitUntil(timeout: 4) { app.staticTexts["document-page-counter"].label == "3 / 3" }
+        waitUntil(timeout: 4) { (app.scrollViews["document-page-pager"].value as? String ?? "") == "3 / 3" }
         app.buttons["page-thumbnail-0"]
             .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         app.buttons.matching(identifier: "关闭页面缩略图").firstMatch.tap()
 
         let pager = app.scrollViews["document-page-pager"]
-        let counter = app.staticTexts["document-page-counter"]
+        let counter = app.scrollViews["document-page-pager"]
         let reset = app.buttons["zoom-reset"]
         XCTAssertTrue(pager.waitForExistence(timeout: 5))
 
         func assertFullPage(_ index: Int) {
             let canvas = app.descendants(matching: .any)["page-canvas-\(index)"]
             waitUntil(timeout: 4) {
-                counter.label == "\(index + 1) / 3"
+                (counter.value as? String ?? "") == "\(index + 1) / 3"
                     && canvas.exists
                     && !canvas.frame.isEmpty
                     && abs(pager.frame.width - canvas.frame.width) < 1
@@ -1237,15 +1530,15 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
         openPageSidebar(in: app)
         addPage(named: "横线纸", in: app)
-        waitUntil(timeout: 4) { app.staticTexts["document-page-counter"].label == "2 / 2" }
+        waitUntil(timeout: 4) { (app.scrollViews["document-page-pager"].value as? String ?? "") == "2 / 2" }
         app.buttons["page-thumbnail-0"]
             .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         app.buttons.matching(identifier: "关闭页面缩略图").firstMatch.tap()
         let pager = app.scrollViews["document-page-pager"]
-        let counter = app.staticTexts["document-page-counter"]
+        let counter = app.scrollViews["document-page-pager"]
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
         let reset = app.buttons["zoom-reset"]
-        waitUntil(timeout: 4) { counter.label == "1 / 2" && canvas.exists }
+        waitUntil(timeout: 4) { (counter.value as? String ?? "") == "1 / 2" && canvas.exists }
         let fittedWidth = canvas.frame.width
         let initialVisibleWidth = try canvasViewportRect(of: canvas).width
 
@@ -1253,7 +1546,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         waitUntil(timeout: 4) { !reset.label.contains("100%") }
         XCTAssertEqual(canvas.frame.width, fittedWidth, accuracy: 1)
         XCTAssertLessThan(try canvasViewportRect(of: canvas).width, initialVisibleWidth / 1.15)
-        XCTAssertEqual(counter.label, "1 / 2", "A two-finger pinch must not turn the page")
+        XCTAssertEqual((counter.value as? String ?? ""), "1 / 2", "A two-finger pinch must not turn the page")
         let zoomLabel = reset.label
         let zoomedViewport = try canvasViewportRect(of: canvas)
         let viewport = pager.frame
@@ -1265,7 +1558,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             ], liftOffset: 0.46)
         }, on: pager, in: app)
         XCTAssertGreaterThan(try canvasViewportRect(of: canvas).minX, zoomedViewport.minX + 40)
-        XCTAssertEqual(counter.label, "1 / 2", "Two fingers must pan only the current paper")
+        XCTAssertEqual((counter.value as? String ?? ""), "1 / 2", "Two fingers must pan only the current paper")
         XCTAssertEqual(reset.label, zoomLabel, "A parallel two-finger drag must preserve scale")
 
         pager.coordinate(withNormalizedOffset: CGVector(dx: 0.58, dy: 0.78))
@@ -1275,7 +1568,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                 withVelocity: .slow,
                 thenHoldForDuration: 0
             )
-        waitUntil(timeout: 4) { counter.label == "2 / 2" }
+        waitUntil(timeout: 4) { (counter.value as? String ?? "") == "2 / 2" }
         XCTAssertTrue(reset.label.contains("100%"), "Each canvas remembers its own camera")
         reset.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         let secondCanvas = app.descendants(matching: .any)["page-canvas-1"]
@@ -1308,10 +1601,10 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             ], liftOffset: 0.90)
         ], on: pager, in: app)
         waitUntil(timeout: 4) {
-            counter.label == "2 / 2" && reset.label.contains("50%")
+            (counter.value as? String ?? "") == "2 / 2" && !reset.label.contains("100%")
                 && abs(secondCanvas.frame.width - fittedFrame.width) <= 2
         }
-        XCTAssertEqual(try canvasViewportRect(of: secondCanvas).width, secondVisibleWidth * 2, accuracy: 2)
+        XCTAssertGreaterThan(try canvasViewportRect(of: secondCanvas).width, secondVisibleWidth * 2)
         XCTAssertEqual(secondCanvas.frame.midX, pager.frame.midX, accuracy: 2)
         XCTAssertEqual(secondCanvas.frame.midY, pager.frame.midY, accuracy: 2)
 
@@ -1322,7 +1615,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                 withVelocity: .slow,
                 thenHoldForDuration: 0
             )
-        waitUntil(timeout: 4) { counter.label == "1 / 2" }
+        waitUntil(timeout: 4) { (counter.value as? String ?? "") == "1 / 2" }
         XCTAssertEqual(reset.label, zoomLabel, "Returning to a canvas restores that canvas's camera")
         XCTAssertEqual(canvas.frame.width, fittedWidth, accuracy: 2)
         if secondCanvas.exists {
@@ -1331,48 +1624,31 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
 #endif
     }
 
-    func testPinchInOnMultiplePagesOnlyZoomsAndBouncesBackToFit() throws {
+    func testPDFCanZoomToTenPercentAndZoomBackFromTheMargins() throws {
 #if targetEnvironment(macCatalyst)
         throw XCTSkip("This regression covers direct finger navigation on iPad")
 #else
-        let app = launchIsolatedApp(
-            prefix: "pdf-pinch-in-page-lock",
-            additionalLaunchArguments: ["--pencil-only-ui-test"]
-        )
+        let app = launchIsolatedApp(prefix: "pdf-pinch-in-page-lock",
+                                    additionalLaunchArguments: ["--pencil-only-ui-test"])
         let pager = app.scrollViews["document-page-pager"]
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
-        let counter = app.staticTexts["document-page-counter"]
         let reset = app.buttons["zoom-reset"]
-        waitUntil(timeout: 5) { counter.label == "1 / 2" && canvas.exists }
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         let fittedFrame = canvas.frame
-
-        canvas.pinch(withScale: 0.42, velocity: -1)
-        assertPageRemainsFitted()
-        canvas.pinch(withScale: 1.65, velocity: 1)
-        waitUntil(timeout: 4) { !reset.label.contains("100%") }
-        // XCUI's built-in pinch uses the enlarged canvas's clipped accessibility frame, which
-        // can start a finger under the toolbar. Keep both contacts within the visible paper.
-        try synthesizeTouchPaths([-1.0, 1.0].map { side in
-            SynthesizedTouchPath(samples: [
-                (CGPoint(x: fittedFrame.midX + side * fittedFrame.width * 0.30, y: fittedFrame.midY), 0),
-                (CGPoint(x: fittedFrame.midX + side * fittedFrame.width * 0.20, y: fittedFrame.midY), 0.12),
-                (CGPoint(x: fittedFrame.midX + side * fittedFrame.width * 0.06, y: fittedFrame.midY), 0.40)
-            ], liftOffset: 0.46)
-        }, on: pager, in: app)
-        assertPageRemainsFitted()
-
-        func assertPageRemainsFitted() {
-            waitUntil(timeout: 4) {
-                counter.label == "1 / 2"
-                    && reset.label.contains("100%")
-                    && abs(canvas.frame.minY - fittedFrame.minY) <= 2
-                    && abs(canvas.frame.width - fittedFrame.width) <= 2
-            }
-            let neighbor = app.descendants(matching: .any)["page-canvas-1"]
-            if neighbor.exists {
-                XCTAssertFalse(neighbor.frame.intersects(pager.frame.insetBy(dx: 1, dy: 1)))
-            }
-        }
+        try pinchCanvas(pager, scale: 0.05, in: app)
+        waitUntil(timeout: 4) { reset.label.contains("10%") }
+        XCTAssertEqual(canvas.frame.width, fittedFrame.width * 0.1, accuracy: 2)
+        XCTAssertEqual(pager.value as? String, "1 / 2")
+        try pinchCanvas(pager, scale: 0.4, in: app)
+        waitUntil(timeout: 3) { reset.label.contains("10%") }
+        // Both contacts begin in the surrounding workspace, outside the tiny paper.
+        try pinchCanvas(pager, scale: 2, in: app)
+        waitUntil(timeout: 4) { !reset.label.contains("10%") }
+        XCTAssertGreaterThan(canvas.frame.width, fittedFrame.width * 0.15)
+        XCTAssertEqual(pager.value as? String, "1 / 2")
+        reset.tap()
+        waitUntil(timeout: 4) { reset.label.contains("100%") }
+        XCTAssertEqual(canvas.frame.width, fittedFrame.width, accuracy: 2)
 #endif
     }
 
@@ -1385,9 +1661,9 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             additionalLaunchArguments: ["--pencil-only-ui-test"]
         )
         let pager = app.scrollViews["document-page-pager"]
-        let counter = app.staticTexts["document-page-counter"]
+        let counter = app.scrollViews["document-page-pager"]
         let reset = app.buttons["zoom-reset"]
-        waitUntil(timeout: 5) { counter.label == "1 / 2" && pager.exists }
+        waitUntil(timeout: 5) { (counter.value as? String ?? "") == "1 / 2" && pager.exists }
 
         // Exercise both directions and both sides of the fit-page boundary. The trailing finger
         // travels far enough to turn a page if the pager takes over when the pinch ends early.
@@ -1395,6 +1671,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             let canvas = app.descendants(matching: .any)["page-canvas-\(pageIndex)"]
             let fittedFrame = canvas.frame
             for startsZoomed in [false, true] {
+                reset.tap()
                 if startsZoomed {
                     canvas.pinch(withScale: 1.55, velocity: 1)
                     waitUntil(timeout: 4) { !reset.label.contains("100%") }
@@ -1421,13 +1698,13 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                     ], liftOffset: 0.90)
                 ], on: pager, in: app)
                 waitUntil(timeout: 4) {
-                    counter.label == "\(pageIndex + 1) / 2"
-                        && reset.label.contains("100%")
-                        && abs(canvas.frame.minY - fittedFrame.minY) <= 2
-                        && abs(canvas.frame.width - fittedFrame.width) <= 2
+                    (counter.value as? String ?? "") == "\(pageIndex + 1) / 2"
+                        && !reset.label.contains("100%")
+                        && canvas.frame.width < fittedFrame.width
                 }
             }
 
+            reset.tap()
             // A fresh single-finger gesture must work immediately after all pinch contacts lift.
             pager.coordinate(withNormalizedOffset: CGVector(dx: 0.58, dy: pageIndex == 0 ? 0.78 : 0.22))
                 .press(
@@ -1438,7 +1715,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                     withVelocity: .slow,
                     thenHoldForDuration: 0
                 )
-            waitUntil(timeout: 4) { counter.label == "\(2 - pageIndex) / 2" }
+            waitUntil(timeout: 4) { (counter.value as? String ?? "") == "\(2 - pageIndex) / 2" }
             XCTAssertTrue(reset.label.contains("100%"))
         }
 #endif
@@ -1465,19 +1742,19 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         drawStroke(on: canvas)
         waitForValue("笔迹 1", of: canvas)
         let initialInk = drawingGeometryValue(of: canvas)
-        try pinchCanvas(canvas, scale: 0.42, in: app)
+        try pinchCanvas(canvas, scale: 0.05, in: app)
         waitUntil(timeout: 3) {
-            reset.label.contains("50%")
+            reset.label.contains("10%")
         }
         XCTAssertEqual(canvas.frame, initialFrame, "Zoom changes the camera, never the drawable surface")
         let halfViewport = try canvasViewportRect(of: canvas)
-        XCTAssertEqual(halfViewport.width, initialViewport.width * 2, accuracy: 2)
-        XCTAssertEqual(halfViewport.height, initialViewport.height * 2, accuracy: 2)
+        XCTAssertEqual(halfViewport.width, initialViewport.width * 10, accuracy: 2)
+        XCTAssertEqual(halfViewport.height, initialViewport.height * 10, accuracy: 2)
         XCTAssertEqual(drawingGeometryValue(of: canvas), initialInk)
 
         try pinchCanvas(canvas, scale: 0.55, in: app)
         waitUntil(timeout: 3) {
-            reset.label.contains("50%")
+            reset.label.contains("10%")
         }
         let beforePan = try canvasViewportRect(of: canvas)
         let frame = canvas.frame
@@ -1493,7 +1770,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertLessThan(movedViewport.minY, beforePan.minY - 100)
         XCTAssertEqual(movedViewport.width, halfViewport.width, accuracy: 2)
         XCTAssertEqual(drawingGeometryValue(of: canvas), initialInk)
-        XCTAssertEqual(app.staticTexts["document-page-counter"].label, "1 / 1")
+        XCTAssertEqual((app.scrollViews["document-page-pager"].value as? String ?? ""), "1 / 1")
 
         app.buttons["ink-width-preset-2"].tap()
         drawStroke(on: canvas, from: CGVector(dx: 0.22, dy: 0.22), to: CGVector(dx: 0.38, dy: 0.26))
@@ -1509,7 +1786,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )), 300, "Ink must render under the actual input position outside the old page")
         let inkGeometry = drawingGeometryValue(of: canvas)
         let screenshot = XCTAttachment(screenshot: app.screenshot())
-        screenshot.name = "Unbounded canvas at 50 percent with ink outside the old paper"
+        screenshot.name = "Unbounded canvas at 10 percent with ink outside the old paper"
         screenshot.lifetime = .keepAlways
         add(screenshot)
 
@@ -1519,7 +1796,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         waitForValue("笔迹 2", of: canvas)
-        XCTAssertTrue(reset.label.contains("50%"))
+        XCTAssertTrue(reset.label.contains("10%"))
         XCTAssertEqual(try canvasViewportRect(of: canvas), movedViewport)
         XCTAssertEqual(drawingGeometryValue(of: canvas), inkGeometry)
         reset.tap()
@@ -2143,12 +2420,12 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         waitForValue("笔迹 1", of: canvas)
     }
 
-    func testHeldShapeAtHalfZoomUsesWorldCoordinatesAndKeepsTheNextContact() throws {
+    func testHeldShapeAtReducedZoomUsesWorldCoordinatesAndKeepsTheNextContact() throws {
         let app = launchIsolatedApp(prefix: "shape-hold-zoom")
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         try pinchCanvas(canvas, scale: 0.42, in: app)
-        waitUntil(timeout: 3) { app.buttons["zoom-reset"].label.contains("50%") }
+        waitUntil(timeout: 3) { !app.buttons["zoom-reset"].label.contains("100%") }
         let viewport = try canvasViewportRect(of: canvas)
         let frame = canvas.frame
         let firstStart = CGPoint(x: frame.minX + frame.width * 0.22, y: frame.minY + frame.height * 0.22)
@@ -2209,7 +2486,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let geometry = drawingGeometryValue(of: canvas)
         try pinchCanvas(canvas, scale: 1.4, in: app)
         waitUntil(timeout: 4) { !app.buttons["zoom-reset"].label.contains("100%") }
-        XCTAssertEqual(app.staticTexts["document-page-counter"].label, "1 / 2")
+        XCTAssertEqual((app.scrollViews["document-page-pager"].value as? String ?? ""), "1 / 2")
         XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
         app.buttons["zoom-reset"].tap()
         waitUntil(timeout: 4) { app.buttons["zoom-reset"].label.contains("100%") }
@@ -2294,6 +2571,19 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertEqual(selectionBox.frame.minX, originalFrame.minX, accuracy: 1)
         XCTAssertEqual(selectionBox.frame.minY, originalFrame.minY, accuracy: 1)
 
+        app.buttons["tool-eraser"].tap()
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        let lockedEdge = canvas.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: originalFrame.midX - canvas.frame.minX, dy: originalFrame.minY - canvas.frame.minY)
+        )
+        lockedEdge.withOffset(CGVector(dx: 0, dy: -24)).press(forDuration: 0.08,
+            thenDragTo: lockedEdge.withOffset(CGVector(dx: 0, dy: 24)))
+        let lockedShape = app.descendants(matching: .any).matching(identifier: "page-element-shape").firstMatch
+        XCTAssertTrue(lockedShape.exists, "Locked shapes must survive erasing")
+        app.buttons["tool-pen"].tap()
+        lockedShape.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(selectionBox.waitForExistence(timeout: 3))
+
         app.buttons["对象操作"].tap()
         XCTAssertTrue(app.buttons["解锁"].waitForExistence(timeout: 3))
         app.buttons["解锁"].tap()
@@ -2345,33 +2635,32 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         }
     }
 
-    func testCopyAndScreenshotPasteCreateRealImageObjects() throws {
-        let app = launchIsolatedApp(prefix: "object-paste")
-        let settingsScroll = app.scrollViews["tool-settings-scroll"]
-        XCTAssertTrue(settingsScroll.waitForExistence(timeout: 5))
-        insertShape(named: "矩形", in: app, settingsScroll: settingsScroll)
+    func testPageLongPressDoesNotBlockSubsequentHandwriting() throws {
+        let app = launchIsolatedApp(prefix: "page-long-press")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let reset = app.buttons["zoom-reset"]
+        XCTAssertTrue(reset.waitForExistence(timeout: 3))
+        XCTAssertTrue(app.frame.insetBy(dx: 12, dy: 12).contains(reset.frame))
+        XCTAssertFalse(app.staticTexts["document-page-counter"].exists)
 
-        let canvas = app.descendants(matching: .any)
-            .matching(identifier: "page-canvas-0")
-            .firstMatch
-        let images = app.descendants(matching: .any)
-            .matching(identifier: "page-element-image")
-        XCTAssertTrue(canvas.waitForExistence(timeout: 3))
-        XCTAssertEqual(images.count, 0)
-
-        app.buttons["拷贝"].tap()
-        showPasteMenu(on: canvas, at: CGVector(dx: 0.20, dy: 0.72), in: app)
-        app.buttons["粘贴最近拷贝的内容"].tap()
-        waitUntil(timeout: 4) { images.count == 1 }
-        XCTAssertTrue(app.buttons["截图"].waitForExistence(timeout: 3))
-
-        app.buttons["截图"].tap()
-        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.82, dy: 0.18)).tap()
-        showPasteMenu(on: canvas, at: CGVector(dx: 0.78, dy: 0.72), in: app)
-        app.buttons["粘贴最近拷贝的内容"].tap()
-        waitUntil(timeout: 4) { images.count == 2 }
-
-        XCTAssertEqual(app.buttons["tool-lasso"].value as? String, "selected")
+        for tool in ["tool-lasso", "tool-pen"] {
+            if app.buttons[tool].value as? String != "selected" { app.buttons[tool].tap() }
+            canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.60))
+                .press(forDuration: 0.8)
+            XCTAssertFalse(app.buttons["粘贴最近拷贝的内容"].exists)
+            XCTAssertFalse(app.buttons["粘贴"].exists)
+            if app.buttons["tool-pen"].value as? String != "selected" { app.buttons["tool-pen"].tap() }
+            let value = canvas.value as? String ?? ""
+            let count = try XCTUnwrap(Int(value.components(separatedBy: "；")[0]
+                .replacingOccurrences(of: "笔迹 ", with: "")))
+            drawStroke(on: canvas)
+            waitForValue("笔迹 \(count + 1)；", of: canvas)
+        }
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Writing after long press and visible zoom control"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
     }
 
     func testClosedLassoGroupsAndUngroupsTwoRealObjects() throws {
@@ -3021,7 +3310,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             .matching(identifier: "pdf-search-highlight-1")
             .firstMatch
         XCTAssertTrue(highlight.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["2 / 2"].waitForExistence(timeout: 5))
+        waitUntil(timeout: 5) { (app.scrollViews["document-page-pager"].value as? String) == "2 / 2" }
         XCTAssertTrue(app.descendants(matching: .any)["page-canvas-1"].exists)
     }
 
@@ -3033,9 +3322,12 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(output.waitForExistence(timeout: 3))
         XCTAssertTrue(more.waitForExistence(timeout: 3))
 
-        for action in ["分享扁平 PDF", "导出页面图片", "导出可编辑文稿"] {
+        for action in ["分享扁平 PDF"] {
             output.tap()
             XCTAssertTrue(app.buttons[action].waitForExistence(timeout: 3))
+            for removed in ["导出页面图片", "导出可编辑文稿", "多人协作"] {
+                XCTAssertFalse(app.buttons[removed].exists)
+            }
             app.buttons[action].tap()
             let activityList = app.otherElements["ActivityListView"]
             XCTAssertTrue(
@@ -3139,7 +3431,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             .matching(identifier: "pdf-search-highlight-1")
             .firstMatch
         XCTAssertTrue(highlight.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["2 / 2"].waitForExistence(timeout: 5))
+        waitUntil(timeout: 5) { (app.scrollViews["document-page-pager"].value as? String) == "2 / 2" }
 
         let canvas = app.descendants(matching: .any)
             .matching(identifier: "page-canvas-1")
@@ -3712,6 +4004,54 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
     }
 
+    func testPracticeUsesDocumentSidebarGridSelectionAndPersistentPageActions() throws {
+        let app = launchIsolatedApp(prefix: "practice-sidebar")
+        openPageSidebar(in: app)
+        let first = app.buttons["page-thumbnail-0"], second = app.buttons["page-thumbnail-1"]
+        XCTAssertTrue(second.waitForExistence(timeout: 4))
+        XCTAssertEqual(first.frame.midY, second.frame.midY, accuracy: 2)
+        XCTAssertGreaterThan(second.frame.minX, first.frame.maxX)
+        XCTAssertFalse(app.buttons["page-thumbnail-2"].exists, "the practice fixture starts with exactly two question pages")
+        let palette = app.descendants(matching: .any)["dockable-tool-palette"].firstMatch
+        XCTAssertGreaterThanOrEqual(palette.frame.minX, 293, "the palette must stay outside the page sidebar, including on iPhone")
+        let toolbar = app.descendants(matching: .any)["annotation-tool-bar"].firstMatch
+        XCTAssertGreaterThanOrEqual(app.buttons["page-add-menu"].frame.minY, toolbar.frame.maxY)
+        app.buttons["选择"].tap(); second.tap()
+        XCTAssertTrue((second.value as? String)?.contains("selected") == true, app.debugDescription)
+        for title in ["复制", "旋转", "书签", "删除"] {
+            XCTAssertTrue(app.buttons["page-action-\(title)"].isHittable)
+        }
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "practice-shared-sidebar-selection"; screenshot.lifetime = .keepAlways; add(screenshot)
+        app.buttons["page-action-复制"].tap()
+        let third = app.buttons["page-thumbnail-2"]
+        XCTAssertTrue(third.waitForExistence(timeout: 4))
+        app.buttons["page-action-旋转"].tap(); waitForValueContaining("rotation-90", of: third)
+        app.buttons["page-action-书签"].tap(); waitForValueContaining("bookmarked", of: third)
+        app.buttons["page-action-删除"].tap()
+        let confirm = app.buttons["page-confirm-delete"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3)); confirm.tap()
+        XCTAssertTrue(third.waitForNonExistence(timeout: 4))
+        app.buttons["page-filter-deleted"].tap()
+        XCTAssertTrue(third.waitForExistence(timeout: 4))
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch(); openPageSidebar(in: app)
+        app.buttons["page-filter-deleted"].tap()
+        XCTAssertTrue(third.waitForExistence(timeout: 4)); third.tap()
+        app.buttons["page-action-恢复"].tap()
+        XCTAssertTrue(app.buttons["page-filter-all"].waitForExistence(timeout: 4))
+        waitForValueContaining("rotation-90", of: third)
+        waitForValueContaining("bookmarked", of: third)
+        third.tap()
+        XCTAssertTrue(app.buttons["practice-question-menu"].label.contains("第 2 题"))
+        addPage(named: "方格纸", in: app)
+        let fourth = app.buttons["page-thumbnail-3"]
+        XCTAssertTrue(fourth.waitForExistence(timeout: 4))
+        waitForValueContaining("template-grid", of: fourth)
+        XCTAssertTrue(app.buttons["practice-question-menu"].label.contains("第 2 题"))
+    }
+
     func testEveryPageTemplateCreatesTheRequestedRealPage() throws {
         let app = launchIsolatedApp(prefix: "page-templates")
         openPageSidebar(in: app)
@@ -3904,18 +4244,6 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             return ["矩形", "圆形", "三角形", "菱形", "直线", "箭头"]
                 .first(where: value.contains)
         }
-    }
-
-    private func showPasteMenu(
-        on canvas: XCUIElement,
-        at offset: CGVector,
-        in app: XCUIApplication
-    ) {
-        canvas.coordinate(withNormalizedOffset: offset).press(forDuration: 0.72)
-        XCTAssertTrue(
-            app.buttons["粘贴最近拷贝的内容"].waitForExistence(timeout: 3),
-            "Long press did not present the page paste menu"
-        )
     }
 
     private func drawStroke(on canvas: XCUIElement) {

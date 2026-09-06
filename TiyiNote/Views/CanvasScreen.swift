@@ -7,8 +7,8 @@ struct CanvasScreen: View {
 
     @ObservedObject var documentStore: DrawingDocumentStore
     let canEditActiveDocument: Bool
-    let onCollaborateDocument: (String) -> Void
     let onShowLibrary: () -> Void
+    var practice: TiyiPracticeWorkspace?
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
     @State private var selectedTool = CanvasToolKind.pen
@@ -36,17 +36,26 @@ struct CanvasScreen: View {
     @State private var isPreparingOutput = false
     @State private var workspaceAlert: WorkspaceAlert?
 
+    private var thumbnailVisibility: Binding<Bool> {
+        practice.map { workspace in
+            Binding(get: { workspace.showsPages }, set: { workspace.showsPages = $0 })
+        } ?? $showsThumbnails
+    }
+
     init(
         documentStore: DrawingDocumentStore,
         canEditActiveDocument: Bool = true,
-        onCollaborateDocument: @escaping (String) -> Void = { _ in },
         onShowLibrary: @escaping () -> Void = {},
-        initialPageElementInsertionRequest: PageElementInsertionRequest? = nil
+        initialPageElementInsertionRequest: PageElementInsertionRequest? = nil,
+        practice: TiyiPracticeWorkspace? = nil
     ) {
         self.documentStore = documentStore
         self.canEditActiveDocument = canEditActiveDocument
-        self.onCollaborateDocument = onCollaborateDocument
         self.onShowLibrary = onShowLibrary
+        self.practice = practice
+        if let practice {
+            _activeDocumentID = AppStorage(wrappedValue: practice.documentID, "pdfWorkspace.activeDocumentID", store: practice.defaults)
+        }
         _pageElementInsertionRequest = State(
             initialValue: initialPageElementInsertionRequest
         )
@@ -58,6 +67,9 @@ struct CanvasScreen: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
+                if let practice {
+                    PracticeEditorHeader(workspace: practice, onExit: onShowLibrary)
+                } else {
                 PDFDocumentTabBar(
                     openDocuments: documentStore.openDocuments,
                     activeDocumentID: activeDocumentID,
@@ -71,6 +83,7 @@ struct CanvasScreen: View {
                     },
                     onShowLibrary: onShowLibrary
                 )
+                }
 
                 if annotationEditingEnabled {
                     ToolPaletteView(
@@ -78,24 +91,20 @@ struct CanvasScreen: View {
                         selectedTool: $selectedTool,
                         selectedPenVariant: $selectedPenVariant,
                         eraserMode: $eraserMode,
-                        showsThumbnails: $showsThumbnails,
-                        onSearch: { showsPDFSearch = true },
+                        showsThumbnails: thumbnailVisibility,
+                        onSearch: practice == nil ? { showsPDFSearch = true } : nil,
                         onInsertImage: { showsImageImporter = true },
                         onInsertShape: insertShape,
                         hasActiveDocument: !activeDocumentID.isEmpty,
-                        canImportPDF: PlatformCapabilities.current.canImportPDF,
                         canClearPage: activeController != nil,
-                        onImportPDF: { showsPDFImporter = true },
                         onDocumentAction: handleDocumentOutput,
                         onClearPage: requestClearCurrentPage
                     )
                 } else {
                     ReadOnlyToolPaletteView(
-                        showsThumbnails: $showsThumbnails,
-                        onSearch: { showsPDFSearch = true },
+                        showsThumbnails: thumbnailVisibility,
+                        onSearch: practice == nil ? { showsPDFSearch = true } : nil,
                         hasActiveDocument: !activeDocumentID.isEmpty,
-                        canImportPDF: PlatformCapabilities.current.canImportPDF,
-                        onImportPDF: { showsPDFImporter = true },
                         onDocumentAction: handleDocumentOutput
                     )
                 }
@@ -105,7 +114,7 @@ struct CanvasScreen: View {
                         PDFDocumentReaderView(
                             documentStore: documentStore,
                             documentID: activeDocument.id,
-                            showsThumbnails: $showsThumbnails,
+                            showsThumbnails: thumbnailVisibility,
                             pageElementInsertionRequest: $pageElementInsertionRequest,
                             externalPageRequest: $requestedReaderPageIndex,
                             searchHighlight: $pdfSearchHighlight,
@@ -116,6 +125,7 @@ struct CanvasScreen: View {
                             eraserSize: eraserSize,
                             eraserMode: eraserMode,
                             isAnnotationEditingEnabled: annotationEditingEnabled,
+                            practice: practice,
                             initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
                             onSelectLassoTool: {
                                 selectedTool = .lasso
@@ -132,6 +142,7 @@ struct CanvasScreen: View {
                                 if activePageIndex != pageIndex {
                                     activePageIndex = pageIndex
                                 }
+                                practice?.didView(pageIndex)
                             }
                         )
                         .id(activeDocument.id)
@@ -146,7 +157,7 @@ struct CanvasScreen: View {
                                 eraserSize: $eraserSize,
                                 dockEdge: $toolPaletteDockEdge,
                                 dockProgress: $toolPaletteDockProgress,
-                                leadingContentInset: showsThumbnails ? 293 : 0
+                                leadingContentInset: thumbnailVisibility.wrappedValue ? 293 : 0
                             )
                             .zIndex(20)
                         }
@@ -160,6 +171,9 @@ struct CanvasScreen: View {
             }
         }
         .onAppear(perform: prepareWorkspace)
+        .onChange(of: practice?.requestedPageID) { _, id in
+            if let id { requestedReaderPageIndex = documentStore.pageIndex(for: id, in: activeDocumentID) }
+        }
         .onChange(of: documentStore.documents.map(\.id)) { _, _ in
             reconcileActiveDocument()
         }
@@ -182,6 +196,7 @@ struct CanvasScreen: View {
             // drain from blocking the first Pencil samples when the interruption disappears.
             guard phase == .background else { return }
             flushPendingAnnotations()
+            if let practice { do { try practice.checkpoint() } catch { practice.errorMessage = error.localizedDescription } }
         }
         .fileImporter(
             isPresented: $showsPDFImporter,
@@ -408,10 +423,6 @@ struct CanvasScreen: View {
             showsConflictVersions = true
             return
         }
-        if action == .collaboration {
-            onCollaborateDocument(document.id)
-            return
-        }
         flushPendingAnnotations()
         isPreparingOutput = true
         defer { isPreparingOutput = false }
@@ -421,19 +432,9 @@ struct CanvasScreen: View {
                 sharePayload = DocumentSharePayload(
                     urls: [try documentStore.exportFlattenedPDF(documentID: document.id)]
                 )
-            case .pageImages:
-                sharePayload = DocumentSharePayload(
-                    urls: try documentStore.exportPageImages(documentID: document.id)
-                )
-            case .editablePackage:
-                sharePayload = DocumentSharePayload(
-                    urls: [try documentStore.exportEditableDocumentPackage(documentID: document.id)]
-                )
             case .printDocument:
                 let url = try documentStore.exportFlattenedPDF(documentID: document.id)
                 presentPrintPanel(for: url, title: document.title)
-            case .collaboration:
-                break
             case .conflictVersions:
                 break
             }
@@ -453,7 +454,7 @@ struct CanvasScreen: View {
     }
 
     private var annotationEditingEnabled: Bool {
-        PlatformCapabilities.current.canEditAnnotations && canEditActiveDocument
+        (PlatformCapabilities.current.canEditAnnotations || (practice != nil && UIDevice.current.userInterfaceIdiom == .phone)) && canEditActiveDocument
     }
 }
 

@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		100000000000000000000131 /* CanvasHitGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000234 /* CanvasHitGeometry.swift */; };
+		100000000000000000000130 /* TiyiPracticeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000233 /* TiyiPracticeView.swift */; };
 		100000000000000000000128 /* HeldInkShapeRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000231 /* HeldInkShapeRecognizer.swift */; };
 		100000000000000000000129 /* HeldInkGestureRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000232 /* HeldInkGestureRecognizer.swift */; };
 		100000000000000000000127 /* CanvasViewport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000230 /* CanvasViewport.swift */; };
@@ -49,6 +51,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		100000000000000000000234 /* CanvasHitGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasHitGeometry.swift; sourceTree = "<group>"; };
+		100000000000000000000233 /* TiyiPracticeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiPracticeView.swift; path = PackageSupport/TiyiPracticeView.swift; sourceTree = "<group>"; };
 		100000000000000000000231 /* HeldInkShapeRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeldInkShapeRecognizer.swift; sourceTree = "<group>"; };
 		100000000000000000000232 /* HeldInkGestureRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeldInkGestureRecognizer.swift; sourceTree = "<group>"; };
 		100000000000000000000230 /* CanvasViewport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasViewport.swift; sourceTree = "<group>"; };
@@ -113,6 +117,7 @@
 		100000000000000000000402 /* TiyiNote */ = {
 			isa = PBXGroup;
 			children = (
+				100000000000000000000233 /* TiyiPracticeView.swift */,
 				100000000000000000000403 /* App */,
 				100000000000000000000404 /* Models */,
 				100000000000000000000405 /* Services */,
@@ -165,6 +170,7 @@
 				100000000000000000000220 /* LibraryBrowserView.swift */,
 				100000000000000000000205 /* CanvasScreen.swift */,
 				100000000000000000000230 /* CanvasViewport.swift */,
+				100000000000000000000234 /* CanvasHitGeometry.swift */,
 				100000000000000000000206 /* PencilCanvasView.swift */,
 				100000000000000000000232 /* HeldInkGestureRecognizer.swift */,
 				100000000000000000000207 /* ToolPaletteView.swift */,
@@ -305,6 +311,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				100000000000000000000130 /* TiyiPracticeView.swift in Sources */,
 				100000000000000000000101 /* TiyiNoteApp.swift in Sources */,
 				100000000000000000000102 /* CanvasTool.swift in Sources */,
 				100000000000000000000103 /* CanvasController.swift in Sources */,
@@ -313,6 +320,7 @@
 				100000000000000000000104 /* DrawingDocumentStore.swift in Sources */,
 				100000000000000000000105 /* CanvasScreen.swift in Sources */,
 				100000000000000000000127 /* CanvasViewport.swift in Sources */,
+				100000000000000000000131 /* CanvasHitGeometry.swift in Sources */,
 				100000000000000000000106 /* PencilCanvasView.swift in Sources */,
 				100000000000000000000107 /* ToolPaletteView.swift in Sources */,
 				100000000000000000000109 /* PDFPageView.swift in Sources */,

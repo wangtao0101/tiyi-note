@@ -9,7 +9,6 @@ struct PencilCanvasView: UIViewRepresentable {
     let logicalPageSize: CGSize
     let logicalViewport: CGRect?
     let isCurrentPage: Bool
-    let onFingerLongPress: (CGPoint) -> Void
     let onFingerPinchChanged: (CGFloat) -> Void
     let onFingerPinchEnded: (CGFloat) -> Void
     let onFingerPinchCancelled: () -> Void
@@ -29,10 +28,6 @@ struct PencilCanvasView: UIViewRepresentable {
         view.onNavigationAncestorFound = { [weak coordinator, weak view] pager in
             guard let view else { return }
             coordinator?.configureCanvasNavigation(on: pager, container: view)
-        }
-        context.coordinator.installLongPressGesture(on: view)
-        if logicalViewport == nil {
-            context.coordinator.installFingerPinchGesture(on: view)
         }
         return view
     }
@@ -64,7 +59,7 @@ struct PencilCanvasView: UIViewRepresentable {
         }
 
         func configureCanvasNavigation(on host: UIView, container: UIView) {
-            guard parent.logicalViewport != nil, parent.isCurrentPage else {
+            guard parent.isCurrentPage else {
                 removeCanvasNavigation()
                 return
             }
@@ -77,8 +72,12 @@ struct PencilCanvasView: UIViewRepresentable {
             pan.minimumNumberOfTouches = 2
             pan.maximumNumberOfTouches = 2
             pan.allowedScrollTypesMask = .all
-            let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handleCanvasPinch(_:)))
-            for gesture in [pan, pinch] as [UIGestureRecognizer] {
+            let pinch = UIPinchGestureRecognizer(
+                target: self,
+                action: parent.logicalViewport == nil ? #selector(handleFingerPinch(_:)) : #selector(handleCanvasPinch(_:))
+            )
+            let gestures: [UIGestureRecognizer] = parent.logicalViewport == nil ? [pinch] : [pan, pinch]
+            for gesture in gestures {
                 gesture.allowedTouchTypes = [
                     NSNumber(value: UITouch.TouchType.direct.rawValue),
                     NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
@@ -89,7 +88,7 @@ struct PencilCanvasView: UIViewRepresentable {
                 gesture.delegate = self
                 host.addGestureRecognizer(gesture)
             }
-            canvasPan = pan
+            canvasPan = parent.logicalViewport == nil ? nil : pan
             canvasPinch = pinch
         }
 
@@ -133,52 +132,6 @@ struct PencilCanvasView: UIViewRepresentable {
             return true
         }
 
-
-        func installLongPressGesture(on view: UIView) {
-            let gesture = UILongPressGestureRecognizer(
-                target: self,
-                action: #selector(handleLongPress(_:))
-            )
-            gesture.minimumPressDuration = 0.52
-            gesture.allowableMovement = 12
-            gesture.cancelsTouchesInView = false
-            gesture.delegate = self
-#if targetEnvironment(simulator)
-            gesture.allowedTouchTypes = [
-                NSNumber(value: UITouch.TouchType.direct.rawValue),
-                NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
-            ]
-#else
-            gesture.allowedTouchTypes = [
-                NSNumber(value: UITouch.TouchType.direct.rawValue)
-            ]
-#endif
-            view.addGestureRecognizer(gesture)
-        }
-
-        /// SwiftUI's `MagnificationGesture` participates in gesture arbitration for Apple Pencil
-        /// contacts even though zoom needs two fingers. Installing a UIKit recognizer directly on
-        /// the canvas lets us explicitly accept `.direct` touches only, keeping it completely out
-        /// of PencilKit's low-latency event path.
-        func installFingerPinchGesture(on view: UIView) {
-            let gesture = UIPinchGestureRecognizer(
-                target: self,
-                action: #selector(handleFingerPinch(_:))
-            )
-            gesture.allowedTouchTypes = [
-                NSNumber(value: UITouch.TouchType.direct.rawValue)
-            ]
-            gesture.cancelsTouchesInView = false
-            gesture.delaysTouchesBegan = false
-            gesture.delaysTouchesEnded = false
-            gesture.delegate = self
-            view.addGestureRecognizer(gesture)
-        }
-
-        @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-            guard gesture.state == .began, let view = gesture.view else { return }
-            parent.onFingerLongPress(gesture.location(in: view))
-        }
 
         @objc private func handleFingerPinch(_ gesture: UIPinchGestureRecognizer) {
             switch gesture.state {

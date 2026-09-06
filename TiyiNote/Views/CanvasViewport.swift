@@ -3,6 +3,9 @@ import UIKit
 
 /// A camera over stable document coordinates. Moving or zooming never transforms the drawing.
 struct CanvasViewport: Codable, Equatable {
+    static let minimumZoomScale: CGFloat = 0.1
+    static let maximumZoomScale: CGFloat = 3
+
     var center: CGPoint
     var zoomScale: CGFloat = 1
 
@@ -43,7 +46,7 @@ struct CanvasViewport: Codable, Equatable {
             x: center.x + anchorOffset.x / oldScale,
             y: center.y + anchorOffset.y / oldScale
         )
-        zoomScale = min(max(zoomScale * magnification, 0.5), 3)
+        zoomScale = min(max(zoomScale * magnification, Self.minimumZoomScale), Self.maximumZoomScale)
         let newScale = displayScale(in: size, referenceSize: referenceSize)
         center = CGPoint(
             x: logicalAnchor.x - anchorOffset.x / newScale,

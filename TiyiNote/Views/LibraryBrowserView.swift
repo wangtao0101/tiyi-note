@@ -30,7 +30,6 @@ struct LibraryBrowserView: View {
     let onSyncNow: () async -> Void
     let onOpenDocument: (String) -> Void
     let canEditDocument: (String) -> Bool
-    let onCollaborateDocument: (String) -> Void
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -334,8 +333,6 @@ struct LibraryBrowserView: View {
                 presentMovePicker(folderIDs: [id], documentIDs: [])
             case .moveDocument(let id):
                 presentMovePicker(folderIDs: [], documentIDs: [id])
-            case .collaborateDocument(let id):
-                onCollaborateDocument(id)
             case .toggleFolderFavorite(let id, let isFavorite):
                 try documentStore.setFolderFavorite(id, isFavorite: isFavorite)
             case .toggleDocumentFavorite(let id, let isFavorite):
@@ -1472,11 +1469,7 @@ private struct LibraryDocumentListRow: View {
                 }
             }
         } else {
-            Button { onCommand(.collaborateDocument(document.id)) } label: {
-                Label("多人协作", systemImage: "person.2")
-            }
             if canManage {
-                Divider()
                 Button { onCommand(.toggleDocumentFavorite(document.id, !document.isFavorite)) } label: {
                     Label(document.isFavorite ? "取消收藏" : "收藏", systemImage: document.isFavorite ? "star.slash" : "star")
                 }
@@ -1631,11 +1624,7 @@ private struct LibraryDocumentGridCard: View {
                     }
                 }
             } else {
-                Button { onCommand(.collaborateDocument(document.id)) } label: {
-                    Label("多人协作", systemImage: "person.2")
-                }
                 if canManage {
-                    Divider()
                     Button { onCommand(.toggleDocumentFavorite(document.id, !document.isFavorite)) } label: {
                         Label(document.isFavorite ? "取消收藏" : "收藏", systemImage: "star")
                     }
@@ -2416,7 +2405,6 @@ private enum LibraryItemCommand {
     case renameDocument(String)
     case moveFolder(String)
     case moveDocument(String)
-    case collaborateDocument(String)
     case toggleFolderFavorite(String, Bool)
     case toggleDocumentFavorite(String, Bool)
     case trashFolder(String)

@@ -350,36 +350,15 @@ private final class DocumentTabDragAnchor: UIView {
 /// implements are surfaced here; unfinished placeholders never enter the workspace chrome.
 struct DocumentToolbarActions: View {
     let hasActiveDocument: Bool
-    let canImportPDF: Bool
     let canClearPage: Bool
-    let onImportPDF: () -> Void
     let onDocumentAction: (DocumentOutputAction) -> Void
     let onClearPage: () -> Void
 
     var body: some View {
         HStack(spacing: 1) {
-            if canImportPDF {
-                Button(action: onImportPDF) {
-                    DocumentToolbarIcon(symbol: "doc.badge.plus")
-                }
-                .buttonStyle(DocumentToolbarPressedStyle(isSelected: false))
-                .accessibilityLabel("导入 PDF 或可编辑文稿")
-                .accessibilityIdentifier("document-import-button")
-            }
-
             Menu {
                 Button { onDocumentAction(.flattenedPDF) } label: {
                     Label("分享扁平 PDF", systemImage: "doc.richtext")
-                }
-                Button { onDocumentAction(.pageImages) } label: {
-                    Label("导出页面图片", systemImage: "photo.on.rectangle.angled")
-                }
-                Button { onDocumentAction(.editablePackage) } label: {
-                    Label("导出可编辑文稿", systemImage: "shippingbox")
-                }
-                Divider()
-                Button { onDocumentAction(.collaboration) } label: {
-                    Label("多人协作", systemImage: "person.2.badge.plus")
                 }
             } label: {
                 DocumentToolbarIcon(symbol: "square.and.arrow.up")
