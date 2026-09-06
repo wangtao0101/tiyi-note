@@ -47,6 +47,7 @@ struct PencilCanvasView: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: PageCanvasContainerView, coordinator: Coordinator) {
+        uiView.controller.cancelHeldInkRecognition()
         coordinator.removeCanvasNavigation()
         uiView.onNavigationAncestorFound = nil
     }
@@ -269,6 +270,10 @@ final class PageCanvasContainerView: UIView {
         // adjust those internally while rendering a stroke, and writing zoomScale back at that
         // moment causes an expensive tile/layout transaction under the Pencil.
         canvasView.transform = .identity
+        // The page/container owns all camera gestures. PencilKit's own recognizer can otherwise
+        // apply a second zoom after our viewport layout, especially on an empty drawing.
+        canvasView.pinchGestureRecognizer?.isEnabled = false
+        canvasView.bouncesZoom = false
         canvasView.frame = bounds
         canvasView.minimumZoomScale = min(0.05, targetScale)
         canvasView.maximumZoomScale = max(10, targetScale)

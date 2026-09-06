@@ -1954,7 +1954,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertEqual(drawingGeometryValue(of: relaunchedCanvas), committedGeometry)
     }
 
-    func testNormalWritingDoesNotScheduleHeldInkShapeRecognition() throws {
+    func testShortHoldAndLiftKeepOriginalInkWithoutDeferredRecognition() throws {
         let app = launchIsolatedApp(prefix: "shape-hold-production-path")
         let canvas = app.descendants(matching: .any)
             .matching(identifier: "page-canvas-0")
@@ -1971,42 +1971,43 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             forDuration: 0.08,
             thenDragTo: lineEnd,
             withVelocity: .slow,
-            thenHoldForDuration: 0.92
+            thenHoldForDuration: 0.10
         )
         waitForValue("笔迹 1", of: canvas, timeout: 5)
         let originalGeometry = drawingGeometryValue(of: canvas)
 
-        // Debug's opt-in recognizer would wake after 800 ms. Waiting past that boundary proves a
-        // normal launch neither replaces the ink nor publishes shape-recognition state.
+        // Lifting cancels the hold; waiting afterwards must never turn handwriting into a shape.
         RunLoop.current.run(until: Date().addingTimeInterval(1.2))
         XCTAssertTrue((canvas.value as? String)?.contains("吸附 无") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 0") == true)
         XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+        drawStroke(on: canvas)
+        waitForValue("笔迹 2", of: canvas)
     }
 
-    func testOptInHeldInkShapeRecognitionSupportsUndoPersistence() throws {
-        let app = launchIsolatedApp(
-            prefix: "shape-hold-snap",
-            additionalLaunchArguments: ["--enable-deferred-ink-shape-recognition"]
-        )
+    func testHeldInkFiveShapesPreviewUndoEraserAndPersistence() throws {
+        let app = launchIsolatedApp(prefix: "shape-hold-snap")
         let canvas = app.descendants(matching: .any)
             .matching(identifier: "page-canvas-0")
             .firstMatch
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        // Tool preferences persist outside this isolated document fixture. Pick the default pen
+        // explicitly so a preceding pencil/highlighter test cannot change this regression's ink.
+        app.buttons["tool-pen"].tap()
+        app.buttons["pen-variant-fountainPen"].tap()
+        app.buttons["ink-width-preset-0"].tap()
+        app.buttons["ink-color-graphite"].tap()
 
-        let lineStart = canvas.coordinate(
-            withNormalizedOffset: CGVector(dx: 0.24, dy: 0.30)
-        )
-        let lineEnd = canvas.coordinate(
-            withNormalizedOffset: CGVector(dx: 0.66, dy: 0.34)
-        )
-        lineStart.press(
-            forDuration: 0.08,
-            thenDragTo: lineEnd,
-            withVelocity: .slow,
-            thenHoldForDuration: 0.92
-        )
+        let frame = canvas.frame
+        let line = (0...12).map { index in
+            CGPoint(x: frame.minX + frame.width * (0.24 + CGFloat(index) / 12 * 0.48),
+                    y: frame.minY + frame.height * 0.18 + sin(CGFloat(index) / 12 * .pi * 3) * 3)
+        }
+        try synthesizeTouchPath(line, on: canvas, in: app, holdBeforeLift: 1.15)
         waitForValueContaining("吸附 直线", of: canvas, timeout: 5)
         waitForValue("笔迹 1", of: canvas, timeout: 5)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 1") == true,
+                      "The regular shape must finish rendering while the contact is still down")
         let snappedLineGeometry = drawingGeometryValue(of: canvas)
         RunLoop.current.run(until: Date().addingTimeInterval(3.0))
         XCTAssertTrue(
@@ -2019,48 +2020,34 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
         XCTAssertEqual(drawingGeometryValue(of: canvas), snappedLineGeometry)
 
-        let rectangleFrame = CGRect(
-            x: canvas.frame.minX + canvas.frame.width * 0.30,
-            y: canvas.frame.minY + canvas.frame.height * 0.48,
-            width: canvas.frame.width * 0.34,
-            height: canvas.frame.height * 0.22
-        )
-        try synthesizeClosedTouchPath(
-            around: rectangleFrame,
-            on: canvas,
-            in: app,
-            holdBeforeLift: 0.92
-        )
-        waitForValueContaining("吸附 矩形", of: canvas, timeout: 5)
-        waitForValue("笔迹 2", of: canvas, timeout: 5)
-
-        let ellipseFrame = CGRect(
-            x: canvas.frame.minX + canvas.frame.width * 0.12,
-            y: canvas.frame.minY + canvas.frame.height * 0.70,
-            width: canvas.frame.width * 0.24,
-            height: canvas.frame.height * 0.16
-        )
-        let ellipsePoints = (0...24).map { index in
-            let theta = CGFloat(index) / 24 * 2 * .pi
-            return CGPoint(
-                x: ellipseFrame.midX + cos(theta) * ellipseFrame.width / 2,
-                y: ellipseFrame.midY + sin(theta) * ellipseFrame.height / 2
-            )
+        let radius = min(frame.width, frame.height) * 0.11
+        for (index, name, centerX, radiusX) in [
+            (2, "圆形", CGFloat(0.32), radius),
+            (3, "椭圆", CGFloat(0.68), radius * 1.45)
+        ] {
+            let points = (0...32).map { index in
+                let theta = CGFloat(index) / 32 * 2 * .pi
+                let jitter = 1 + 0.025 * sin(5 * theta)
+                return CGPoint(x: frame.minX + frame.width * centerX + cos(theta) * radiusX * jitter,
+                               y: frame.minY + frame.height * 0.41 + sin(theta) * radius * jitter)
+            }
+            try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 1.15)
+            waitForValueContaining("吸附 \(name)", of: canvas, timeout: 5)
+            waitForValue("笔迹 \(index)", of: canvas, timeout: 5)
+            XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 \(index)") == true)
         }
-        try synthesizeTouchPath(
-            ellipsePoints,
-            on: canvas,
-            in: app,
-            holdBeforeLift: 0.92
-        )
-        waitForValueContaining("吸附 圆形", of: canvas, timeout: 5)
-        waitForValue("笔迹 3", of: canvas, timeout: 5)
 
+        let squareFrame = CGRect(x: frame.minX + frame.width * 0.32 - radius,
+                                 y: frame.minY + frame.height * 0.68 - radius,
+                                 width: radius * 2, height: radius * 2)
+        try synthesizeClosedTouchPath(around: squareFrame, on: canvas, in: app, holdBeforeLift: 1.15)
+        waitForValueContaining("吸附 正方形", of: canvas, timeout: 5)
+        waitForValue("笔迹 4", of: canvas, timeout: 5)
         let triangleFrame = CGRect(
-            x: canvas.frame.minX + canvas.frame.width * 0.62,
-            y: canvas.frame.minY + canvas.frame.height * 0.70,
-            width: canvas.frame.width * 0.24,
-            height: canvas.frame.height * 0.17
+            x: frame.minX + frame.width * 0.68 - radius,
+            y: squareFrame.minY,
+            width: radius * 2.2,
+            height: radius * 2
         )
         let triangleVertices = [
             CGPoint(x: triangleFrame.midX, y: triangleFrame.minY),
@@ -2075,19 +2062,51 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             trianglePoints,
             on: canvas,
             in: app,
-            holdBeforeLift: 0.92
+            holdBeforeLift: 1.15
         )
         waitForValueContaining("吸附 三角形", of: canvas, timeout: 5)
-        waitForValue("笔迹 4", of: canvas, timeout: 5)
+        waitForValue("笔迹 5", of: canvas, timeout: 5)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 5") == true)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Five held ink shapes"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        let finalGeometry = drawingGeometryValue(of: canvas)
+        let renderedInk = canvas.screenshot().pngRepresentation
+        for point in [CGPoint(x: 0.48, y: 0.18),
+                      CGPoint(x: 0.32 + radius / frame.width, y: 0.41),
+                      CGPoint(x: 0.68 + radius * 1.45 / frame.width, y: 0.41),
+                      CGPoint(x: 0.32, y: 0.68 - radius / frame.height),
+                      CGPoint(x: 0.68, y: 0.68 + radius / frame.height)] {
+            XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: renderedInk, around: point, radius: 12)), 500,
+                                 "Each regular shape must have visible ink at its input location")
+        }
 
         let undo = app.buttons["撤销"]
         XCTAssertTrue(undo.isEnabled)
         undo.tap()
-        waitForValue("笔迹 3", of: canvas)
+        waitForValue("笔迹 4", of: canvas)
         let redo = app.buttons["重做"]
         XCTAssertTrue(redo.isEnabled)
         redo.tap()
+        waitForValue("笔迹 5", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), finalGeometry)
+
+        // A new ordinary stroke must neither inherit the preview nor overwrite the shape.
+        drawStroke(on: canvas, from: CGVector(dx: 0.25, dy: 0.85), to: CGVector(dx: 0.6, dy: 0.86))
+        waitForValue("笔迹 6", of: canvas)
+        undo.tap()
+        waitForValue("笔迹 5", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), finalGeometry)
+
+        app.buttons["tool-eraser"].tap()
+        app.buttons["tool-eraser"].tap()
+        app.buttons["eraser-mode-stroke"].tap()
+        drawStroke(on: canvas, from: CGVector(dx: 0.45, dy: 0.13), to: CGVector(dx: 0.45, dy: 0.23))
         waitForValue("笔迹 4", of: canvas)
+        undo.tap()
+        waitForValue("笔迹 5", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), finalGeometry)
 
         RunLoop.current.run(until: Date().addingTimeInterval(2))
         app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
@@ -2097,7 +2116,108 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             .matching(identifier: "page-canvas-0")
             .firstMatch
         XCTAssertTrue(relaunchedCanvas.waitForExistence(timeout: 8))
-        waitForValue("笔迹 4", of: relaunchedCanvas, timeout: 5)
+        waitForValue("笔迹 5", of: relaunchedCanvas, timeout: 5)
+        XCTAssertEqual(drawingGeometryValue(of: relaunchedCanvas), finalGeometry)
+    }
+
+    func testMovingAfterHeldPreviewRestoresTheSameFreehandStroke() throws {
+        let app = launchIsolatedApp(prefix: "shape-hold-resume")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let frame = canvas.frame
+        let points = [CGPoint(x: frame.minX + frame.width * 0.25, y: frame.minY + frame.height * 0.3),
+                      CGPoint(x: frame.minX + frame.width * 0.65, y: frame.minY + frame.height * 0.3),
+                      CGPoint(x: frame.minX + frame.width * 0.45, y: frame.minY + frame.height * 0.5),
+                      CGPoint(x: frame.minX + frame.width * 0.7, y: frame.minY + frame.height * 0.55)]
+        try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 0.1,
+                                pauseAfterPointIndex: 1, pauseDuration: 1.15)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertTrue((canvas.value as? String)?.contains("吸附 无") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 1") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("恢复手绘 1") == true)
+        let viewport = try canvasViewportRect(of: canvas)
+        XCTAssertGreaterThan(try drawingBounds(of: canvas).height, viewport.height * 0.23)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        app.buttons["重做"].tap()
+        waitForValue("笔迹 1", of: canvas)
+    }
+
+    func testHeldShapeAtHalfZoomUsesWorldCoordinatesAndKeepsTheNextContact() throws {
+        let app = launchIsolatedApp(prefix: "shape-hold-zoom")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        try pinchCanvas(canvas, scale: 0.42, in: app)
+        waitUntil(timeout: 3) { app.buttons["zoom-reset"].label.contains("50%") }
+        let viewport = try canvasViewportRect(of: canvas)
+        let frame = canvas.frame
+        let firstStart = CGPoint(x: frame.minX + frame.width * 0.22, y: frame.minY + frame.height * 0.22)
+        let firstEnd = CGPoint(x: frame.minX + frame.width * 0.5, y: firstStart.y)
+        try synthesizeTouchPaths([
+            SynthesizedTouchPath(samples: [(firstStart, 0), (firstEnd, 0.3)], liftOffset: 1.5),
+            SynthesizedTouchPath(samples: [(CGPoint(x: firstEnd.x, y: firstEnd.y + 80), 1.54),
+                                           (CGPoint(x: firstEnd.x + 80, y: firstEnd.y + 100), 1.84)], liftOffset: 1.94)
+        ], on: canvas, in: app)
+        waitForValue("笔迹 2", of: canvas)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 1") == true)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        let bounds = try drawingBounds(of: canvas)
+        XCTAssertEqual(bounds.minX, viewport.minX + viewport.width * 0.22, accuracy: 12)
+        XCTAssertEqual(bounds.midY, viewport.minY + viewport.height * 0.22, accuracy: 12)
+        XCTAssertLessThan(bounds.minY, 0)
+        XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: canvas.screenshot().pngRepresentation,
+                                                     around: CGPoint(x: 0.35, y: 0.22), radius: 10)), 300)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: canvas)
+    }
+
+    func testHeldInkOnPDFKeepsHighlighterPencilAndZoomNavigation() throws {
+        let app = launchIsolatedApp(prefix: "pdf-held-ink")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let frame = canvas.frame
+        app.buttons["ink-color-ocean"].tap()
+        let line = [CGPoint(x: frame.minX + frame.width * 0.28, y: frame.minY + frame.height * 0.35),
+                    CGPoint(x: frame.minX + frame.width * 0.5, y: frame.minY + frame.height * 0.35 + 2),
+                    CGPoint(x: frame.minX + frame.width * 0.72, y: frame.minY + frame.height * 0.35)]
+        try synthesizeTouchPath(line, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertTrue((canvas.value as? String)?.contains("吸附 直线") == true)
+        app.buttons["tool-marker"].tap()
+        let markerLine = line.map { CGPoint(x: $0.x, y: $0.y + frame.height * 0.18) }
+        try synthesizeTouchPath(markerLine, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 2", of: canvas)
+        XCTAssertEqual(app.buttons["tool-marker"].value as? String, "selected")
+        XCTAssertEqual(app.buttons["tool-pen"].value as? String, "selected")
+        XCTAssertTrue((canvas.value as? String)?.contains("吸附 直线") == true)
+        app.buttons["tool-pen"].tap()
+        app.buttons["pen-variant-pencil"].tap()
+        let circle = (0...24).map { index in
+            let theta = CGFloat(index) / 24 * 2 * .pi
+            return CGPoint(x: frame.midX + cos(theta) * 55, y: frame.minY + frame.height * 0.73 + sin(theta) * 55)
+        }
+        try synthesizeTouchPath(circle, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 3", of: canvas)
+        XCTAssertTrue((canvas.value as? String)?.contains("吸附 圆形") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 3") == true)
+        let pixels = canvas.screenshot().pngRepresentation
+        for point in [CGPoint(x: 0.5, y: 0.35), CGPoint(x: 0.5, y: 0.53),
+                      CGPoint(x: 0.5 + 55 / frame.width, y: 0.73)] {
+            XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: pixels, around: point, radius: 12)), 500)
+        }
+        let geometry = drawingGeometryValue(of: canvas)
+        try pinchCanvas(canvas, scale: 1.4, in: app)
+        waitUntil(timeout: 4) { !app.buttons["zoom-reset"].label.contains("100%") }
+        XCTAssertEqual(app.staticTexts["document-page-counter"].label, "1 / 2")
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+        app.buttons["zoom-reset"].tap()
+        waitUntil(timeout: 4) { app.buttons["zoom-reset"].label.contains("100%") }
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["重做"].tap()
+        waitForValue("笔迹 3", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
     }
 
     func testShapeInsertionMoveDuplicateAndDeleteUseTheLassoSelection() throws {
@@ -4020,7 +4140,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
     private func drawingGeometryValue(of element: XCUIElement) -> String? {
         guard let value = element.value as? String,
               let range = value.range(of: "范围 ") else { return nil }
-        return String(value[range.lowerBound...])
+        return value[range.lowerBound...].split(separator: "；").first.map(String.init)
     }
 
     private func canvasViewportRect(of element: XCUIElement) throws -> CGRect {
@@ -4185,6 +4305,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             samples.append((point, lastMoveOffset))
             if pauseAfterPointIndex == pointIndex {
                 lastMoveOffset += max(pauseDuration, 0)
+                samples.append((point, lastMoveOffset))
             }
             if pointIndex < points.count - 1 {
                 lastMoveOffset += 0.06

@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		100000000000000000000128 /* HeldInkShapeRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000231 /* HeldInkShapeRecognizer.swift */; };
+		100000000000000000000129 /* HeldInkGestureRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000232 /* HeldInkGestureRecognizer.swift */; };
 		100000000000000000000127 /* CanvasViewport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000230 /* CanvasViewport.swift */; };
 		100000000000000000000101 /* TiyiNoteApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000201 /* TiyiNoteApp.swift */; };
 		100000000000000000000102 /* CanvasTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000202 /* CanvasTool.swift */; };
@@ -47,6 +49,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		100000000000000000000231 /* HeldInkShapeRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeldInkShapeRecognizer.swift; sourceTree = "<group>"; };
+		100000000000000000000232 /* HeldInkGestureRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeldInkGestureRecognizer.swift; sourceTree = "<group>"; };
 		100000000000000000000230 /* CanvasViewport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasViewport.swift; sourceTree = "<group>"; };
 		100000000000000000000201 /* TiyiNoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteApp.swift; sourceTree = "<group>"; };
 		100000000000000000000202 /* CanvasTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasTool.swift; sourceTree = "<group>"; };
@@ -145,6 +149,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000203 /* CanvasController.swift */,
+				100000000000000000000231 /* HeldInkShapeRecognizer.swift */,
 				100000000000000000000204 /* DrawingDocumentStore.swift */,
 				100000000000000000000222 /* CloudLibrarySyncCoordinator.swift */,
 				100000000000000000000223 /* CloudKitSmokeHarness.swift */,
@@ -161,6 +166,7 @@
 				100000000000000000000205 /* CanvasScreen.swift */,
 				100000000000000000000230 /* CanvasViewport.swift */,
 				100000000000000000000206 /* PencilCanvasView.swift */,
+				100000000000000000000232 /* HeldInkGestureRecognizer.swift */,
 				100000000000000000000207 /* ToolPaletteView.swift */,
 				100000000000000000000211 /* PDFPageView.swift */,
 				100000000000000000000213 /* PDFWorkspaceChrome.swift */,
@@ -302,6 +308,8 @@
 				100000000000000000000101 /* TiyiNoteApp.swift in Sources */,
 				100000000000000000000102 /* CanvasTool.swift in Sources */,
 				100000000000000000000103 /* CanvasController.swift in Sources */,
+				100000000000000000000128 /* HeldInkShapeRecognizer.swift in Sources */,
+				100000000000000000000129 /* HeldInkGestureRecognizer.swift in Sources */,
 				100000000000000000000104 /* DrawingDocumentStore.swift in Sources */,
 				100000000000000000000105 /* CanvasScreen.swift in Sources */,
 				100000000000000000000127 /* CanvasViewport.swift in Sources */,

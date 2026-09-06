@@ -17,30 +17,6 @@ final class CanvasController: NSObject, ObservableObject {
     /// the complete page. Full drawings are kept only for inherently whole-page edits such as an
     /// eraser pass, lasso transform, or Clear.
     private static let maximumUndoDepth = 80
-    /// Automatic fitting is deliberately absent from the production ink path. A timer cannot know
-    /// whether an eight-second pause means "finished writing" or "about to write the next line";
-    /// waking then to materialize the complete PKDrawing is exactly the kind of intermittent work
-    /// that causes a late first Pencil sample. Shapes remain available through the explicit shape
-    /// tool. The old held-ink recognizer is opt-in only for its isolated regression coverage until
-    /// it can be driven by a dedicated interaction instead of an idle timer.
-    private static var allowsDeferredInkShapeRecognition: Bool {
-#if DEBUG
-        ProcessInfo.processInfo.arguments.contains("--enable-deferred-ink-shape-recognition")
-#else
-        false
-#endif
-    }
-
-    private static var shapeRecognitionIdleDelay: UInt64 {
-#if DEBUG
-        // Shape UI tests deliberately exercise the feature in a short-lived isolated workspace.
-        // Keep their wait bounded without weakening the shipping input path.
-        if ProcessInfo.processInfo.arguments.contains("--text-interaction-ui-test") {
-            return 800_000_000
-        }
-#endif
-        return 8_000_000_000
-    }
     let canvasView: PKCanvasView
 
     @Published private(set) var canUndo = false
@@ -48,9 +24,11 @@ final class CanvasController: NSObject, ObservableObject {
     /// Kept out of `ObservableObject` publishing on purpose. Publishing at Pencil-down forces the
     /// complete SwiftUI page hierarchy to recompute exactly when PencilKit needs the main thread.
     private(set) var isUsingTool = false
-    @Published private(set) var lastSnappedShapeKind: PageShapeKind?
+    @Published private(set) var lastSnappedShapeKind: HeldInkShapeKind?
 #if DEBUG
     private(set) var synchronizedDrawingInstallCount = 0
+    private(set) var heldShapePreviewCount = 0
+    private(set) var heldShapeResumeCount = 0
 #endif
 
     /// `true` means every edit since the previous callback only appended ink. The page view uses
@@ -72,10 +50,12 @@ final class CanvasController: NSObject, ObservableObject {
     private var knownStrokeCount = 0
     private var selectedToolKind = CanvasToolKind.pen
     private var shapeGestureOriginStrokeCount: Int?
-    private var shapeGestureEndedAt: Date?
     private var shapeSnapInkStyle: ShapeSnapInkStyle?
-    private var shapeRecognitionTask: Task<Void, Never>?
-    private var shapeGestureRevision: UInt64 = 0
+    private let heldInkRecognizer = HeldInkGestureRecognizer()
+    private var heldShape: (drawing: PKDrawing, kind: HeldInkShapeKind)?
+    private var shapePreview: UIImageView?
+    private var originalCanvasMask: CALayer?
+    private var isShapePreviewVisible = false
     private var authoritativeSnappedDrawing: PKDrawing?
     private var isAnnotationInputEditable = true
 
@@ -85,6 +65,29 @@ final class CanvasController: NSObject, ObservableObject {
         super.init()
 
         canvasView.delegate = self
+        canvasView.addGestureRecognizer(heldInkRecognizer)
+        heldInkRecognizer.canTrack = { [weak self] in
+            guard let self else { return false }
+            return self.isAnnotationInputEditable && self.selectedToolKind.usesInkSettings
+                && self.canvasView.window != nil && self.canvasView.drawingGestureRecognizer.isEnabled
+        }
+        heldInkRecognizer.onContactBegan = { [weak self] in
+            self?.beginToolInteraction()
+            self?.beginShapeTracking()
+        }
+        heldInkRecognizer.onHold = { [weak self] points in self?.previewHeldShape(points) ?? false }
+        heldInkRecognizer.onResume = { [weak self] in
+            guard let self else { return }
+#if DEBUG
+            if self.isShapePreviewVisible { self.heldShapeResumeCount += 1 }
+#endif
+            self.discardShapePreview()
+        }
+        heldInkRecognizer.onContactEnded = { [weak self] cancelled in
+            guard let self else { return }
+            if cancelled { self.discardShapePreview() }
+            self.requestToolInteractionFinish()
+        }
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.alwaysBounceHorizontal = false
@@ -140,10 +143,8 @@ final class CanvasController: NSObject, ObservableObject {
         toolInteractionEndWorkItem = nil
         postLiftDrawingRetryCount = 0
         eraserBaselineDrawing = selectedToolKind == .eraser ? drawing : nil
-        shapeRecognitionTask?.cancel()
-        shapeRecognitionTask = nil
+        cancelHeldInkRecognition()
         authoritativeSnappedDrawing = nil
-        resetShapeTrackingState()
         setToolInteractionActive(false)
         refreshHistoryState()
     }
@@ -187,7 +188,7 @@ final class CanvasController: NSObject, ObservableObject {
             eraserBaselineDrawing = nil
         }
         if !kind.usesInkSettings {
-            cancelShapeTracking()
+            cancelHeldInkRecognition()
         }
         canvasView.drawingGestureRecognizer.isEnabled = kind != .lasso && kind != .text
 
@@ -245,6 +246,12 @@ final class CanvasController: NSObject, ObservableObject {
 
     func configureAnnotationInput(isEditable: Bool = true) {
         isAnnotationInputEditable = isEditable
+        if !isEditable { cancelHeldInkRecognition() }
+        heldInkRecognizer.allowedTouchTypes = Self.allowsFingerDrawing ? [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.pencil.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        ] : [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         guard isEditable else {
             canvasView.drawingGestureRecognizer.isEnabled = false
             canvasView.drawingPolicy = .pencilOnly
@@ -574,11 +581,7 @@ final class CanvasController: NSObject, ObservableObject {
         toolInteractionEndWorkItem = nil
         guard !isUsingTool else { return }
 
-        if Self.allowsDeferredInkShapeRecognition {
-            // Any opt-in shape analysis left by the preceding stroke is speculative. A new Pencil
-            // contact wins immediately and cancels it before the worker reaches the geometry code.
-            cancelShapeTracking()
-        }
+        discardShapePreview()
 
         // A snapped drawing remains authoritative after lift only to reject a late cancellation
         // callback from the gesture that produced it. A genuinely new Pencil contact starts a new
@@ -592,9 +595,6 @@ final class CanvasController: NSObject, ObservableObject {
         toolInteractionDidChangeDrawing = false
         postLiftDrawingRetryCount = 0
         setToolInteractionActive(true)
-        if Self.allowsDeferredInkShapeRecognition {
-            beginShapeTracking()
-        }
         onBecameActive?()
     }
 
@@ -603,12 +603,12 @@ final class CanvasController: NSObject, ObservableObject {
         // has already begun on hardware. Never let that stale end release the new transaction.
         guard !hasActiveDrawingContact else { return }
 
-        // Keep only the lift time. The completed stroke is deliberately not read here: even a
-        // seemingly cheap `drawing.strokes.last` can materialize the complete PencilKit value and
-        // block the first samples of the next stroke. Shape intent and geometry are inspected only
-        // after the editor has remained fully idle.
-        if shapeGestureOriginStrokeCount != nil, shapeGestureEndedAt == nil {
-            shapeGestureEndedAt = Date()
+        // A held shape already has its final value. Close it at PencilKit's end callback, before
+        // a rapid next contact can cancel the queued finish and merge two undo transactions.
+        if heldShape != nil {
+            toolInteractionEndWorkItem?.cancel()
+            finishToolInteractionNow()
+            return
         }
 
         // PencilKit's final drawing callback and its recognizer/delegate end callbacks are not
@@ -628,7 +628,7 @@ final class CanvasController: NSObject, ObservableObject {
         guard isUsingTool,
               !hasActiveDrawingContact else { return }
 
-        let didChangeDrawing = toolInteractionDidChangeDrawing
+        let didChangeDrawing = toolInteractionDidChangeDrawing || heldShape != nil
         if didChangeDrawing {
             if selectedToolKind.usesInkSettings {
                 // One Pencil contact produces one PencilKit stroke. Store the inverse command;
@@ -646,11 +646,21 @@ final class CanvasController: NSObject, ObservableObject {
         toolInteractionOriginDrawing = nil
         toolInteractionDidChangeDrawing = false
 
-        // This is presentation-only state. Clear it after Pencil-up, never at Pencil-down, so a
-        // published accessibility change cannot invalidate SwiftUI while low-latency ink starts.
-        if lastSnappedShapeKind != nil {
-            lastSnappedShapeKind = nil
+        // The original PencilKit contact remained live under a rendering mask. Commit only after
+        // it has ended, as the same single-stroke undo transaction. No gesture is cancelled.
+        if let heldShape {
+            // Keep the ready bitmap over the canvas until PencilKit has rendered the committed
+            // drawing. Removing it at assignment time exposes PencilKit's empty replacement frame.
+            self.heldShape = nil
+            installCanvasDrawing(heldShape.drawing)
+            authoritativeSnappedDrawing = heldShape.drawing
+            lastSnappedShapeKind = heldShape.kind
+        } else {
+            discardShapePreview()
+            if lastSnappedShapeKind != nil { lastSnappedShapeKind = nil }
         }
+        shapeGestureOriginStrokeCount = nil
+        shapeSnapInkStyle = nil
 
         // Mark the page dirty, but do not materialize a complete PKDrawing here. The page captures
         // one immutable snapshot only after a sustained idle interval.
@@ -669,502 +679,134 @@ final class CanvasController: NSObject, ObservableObject {
 
     private var hasActiveDrawingContact: Bool {
         let drawingState = canvasView.drawingGestureRecognizer.state
-        return drawingState == .began || drawingState == .changed
+        return heldInkRecognizer.isTrackingContact || drawingState == .began || drawingState == .changed
     }
 
     private func beginShapeTracking() {
         guard selectedToolKind.usesInkSettings,
               let tool = canvasView.tool as? PKInkingTool else { return }
         shapeGestureOriginStrokeCount = knownStrokeCount
-        shapeGestureEndedAt = nil
-        shapeSnapInkStyle = ShapeSnapInkStyle(
-            inkType: tool.inkType,
-            color: tool.color,
-            width: tool.width
-        )
+        shapeSnapInkStyle = ShapeSnapInkStyle(inkType: tool.inkType, color: tool.color, width: tool.width)
     }
 
     private func finishShapeTrackingAfterPencilLift() {
         toolInteractionEndWorkItem = nil
-        guard Self.allowsDeferredInkShapeRecognition else {
-            // Production completes a normal Pencil transaction here. There is no delayed task,
-            // whole-page read, path interpolation, haptic, or later drawing replacement.
-            finishToolInteractionNow()
-            return
-        }
-        // Real hardware and XCTest can deliver the final drawing delegate callback a few main
-        // turns after both gesture/delegate end notifications. Keep the transaction open briefly
-        // instead of classifying that late final stroke as a new interaction.
-        if isUsingTool,
-           !toolInteractionDidChangeDrawing,
-           postLiftDrawingRetryCount < 4 {
+        guard !hasActiveDrawingContact else { return }
+        // PencilKit may report its final drawing change after the lift callback. Keep the existing
+        // transaction open for a few run-loop turns rather than treating it as another stroke.
+        if isUsingTool, heldShape == nil, !toolInteractionDidChangeDrawing, postLiftDrawingRetryCount < 4 {
             postLiftDrawingRetryCount += 1
-            let workItem = DispatchWorkItem { [weak self] in
-                self?.finishShapeTrackingAfterPencilLift()
-            }
+            let workItem = DispatchWorkItem { [weak self] in self?.finishShapeTrackingAfterPencilLift() }
             toolInteractionEndWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: workItem)
             return
         }
-        postLiftDrawingRetryCount = 0
-        guard let originStrokeCount = shapeGestureOriginStrokeCount,
-              let inkStyle = shapeSnapInkStyle,
-              let gestureEndedAt = shapeGestureEndedAt,
-              toolInteractionDidChangeDrawing else {
-            cancelShapeTracking()
-            finishToolInteractionNow()
-            return
-        }
-
-        toolInteractionEndWorkItem?.cancel()
-        toolInteractionEndWorkItem = nil
-        let revision = shapeGestureRevision
-        resetShapeTrackingState()
-
-        // Commit the handwriting transaction before scheduling optional shape work. The next
-        // stroke can now begin normally and will cancel the deferred recognition task.
         finishToolInteractionNow()
-        shapeRecognitionTask?.cancel()
-        shapeRecognitionTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: Self.shapeRecognitionIdleDelay)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            guard let self,
-                  !self.isUsingTool,
-                  self.shapeGestureRevision == revision,
-                  self.knownStrokeCount == originStrokeCount + 1 else { return }
-
-            // This is the first path read for the completed contact, and it happens only after a
-            // sustained editor-wide idle period. If the user writes another stroke, the task is
-            // cancelled before this MainActor snapshot is captured.
-            let currentStrokes = self.drawing.strokes
-            guard currentStrokes.count == originStrokeCount + 1,
-                  let roughStroke = currentStrokes.last else { return }
-            let worker = Task.detached(priority: .background) {
-                guard Self.stationaryTailDuration(
-                    of: roughStroke,
-                    gestureEndedAt: gestureEndedAt
-                ) >= 0.62 else { return nil as ShapeSnapCandidate? }
-                let points = roughStroke.path
-                    .interpolatedPoints(by: .distance(3.5))
-                    .map(\.location)
-                guard !Task.isCancelled else { return nil as ShapeSnapCandidate? }
-                return Self.recognizedShape(from: points)
-            }
-            let candidate = await withTaskCancellationHandler {
-                await worker.value
-            } onCancel: {
-                worker.cancel()
-            }
-            self.shapeRecognitionTask = nil
-            guard !Task.isCancelled,
-                  !self.isUsingTool,
-                  self.shapeGestureRevision == revision,
-                  let candidate else {
-                return
-            }
-            self.commitSnappedShape(
-                candidate,
-                originStrokeCount: originStrokeCount,
-                inkStyle: inkStyle
-            )
-        }
     }
 
-    private func cancelShapeTracking() {
-        shapeRecognitionTask?.cancel()
-        shapeRecognitionTask = nil
-        shapeGestureRevision &+= 1
-        resetShapeTrackingState()
-    }
-
-    private func resetShapeTrackingState() {
+    func cancelHeldInkRecognition() {
+        heldInkRecognizer.cancelTracking()
+        discardShapePreview()
         shapeGestureOriginStrokeCount = nil
-        shapeGestureEndedAt = nil
         shapeSnapInkStyle = nil
     }
 
-    /// Derives hold intent from PencilKit's completed immutable path. Some devices keep producing
-    /// stationary control points while pressure changes; others stop appending points until lift.
-    /// Measuring from the earliest final-position point to the actual gesture end handles both
-    /// behaviours without observing or polling live Pencil samples.
-    nonisolated private static func stationaryTailDuration(
-        of stroke: PKStroke,
-        gestureEndedAt: Date
-    ) -> TimeInterval {
-        let path = stroke.path
-        guard let finalPoint = path.last else { return 0 }
-        var stationaryStartOffset = finalPoint.timeOffset
-        for point in path.reversed() {
-            guard distance(point.location, finalPoint.location) < 4 else { break }
-            stationaryStartOffset = point.timeOffset
+    private func previewHeldShape(_ localPoints: [CGPoint]) -> Bool {
+        guard isUsingTool, heldInkRecognizer.isTrackingContact,
+              let originCount = shapeGestureOriginStrokeCount,
+              let style = shapeSnapInkStyle, let host = canvasView.superview,
+              let candidate = HeldInkShapeRecognizer.recognize(
+                localPoints, minimumExtent: 24 / max(canvasView.zoomScale, 0.001)
+              ) else { return false }
+        let worldPoints = candidate.points.map {
+            CGPoint(x: $0.x + canvasWorldOrigin.x, y: $0.y + canvasWorldOrigin.y)
         }
-        let stationaryStartedAt = path.creationDate.addingTimeInterval(stationaryStartOffset)
-        return max(0, gestureEndedAt.timeIntervalSince(stationaryStartedAt))
-    }
-
-    private func commitSnappedShape(
-        _ candidate: ShapeSnapCandidate,
-        originStrokeCount: Int,
-        inkStyle: ShapeSnapInkStyle
-    ) {
-        guard let stroke = regularStroke(for: candidate, inkStyle: inkStyle) else {
-            return
-        }
-
-        // PencilKit has already finished the rough stroke, so replacing it no longer requires
-        // disabling its drawing recognizer or racing cancellation callbacks on real hardware.
-        let currentStrokes = self.drawing.strokes
-        guard !isUsingTool,
-              currentStrokes.count == originStrokeCount + 1 else { return }
-        let originStrokes = Array(currentStrokes.prefix(originStrokeCount))
-        toolInteractionEndWorkItem?.cancel()
-        toolInteractionEndWorkItem = nil
-        let snappedDrawing = PKDrawing(strokes: originStrokes + [stroke])
-        installCanvasDrawing(snappedDrawing)
-        authoritativeSnappedDrawing = snappedDrawing
-        lastSnappedShapeKind = candidate.kind
-        knownStrokeCount = snappedDrawing.strokes.count
-        onDrawingChanged?(true)
-        refreshHistoryState()
+        let stroke = regularStroke(points: worldPoints, inkStyle: style)
+        // This is the first whole-page read for this intentional hold. Normal contacts never
+        // materialize a PKDrawing here; the observer only retains bounded current-stroke samples.
+        let existing = drawing.strokes
+        guard existing.count >= originCount, existing.count <= originCount + 1 else { return false }
+        let snapped = PKDrawing(strokes: Array(existing.prefix(originCount)) + [stroke])
+        heldShape = (snapped, candidate.kind)
+        // A second PKCanvasView renders its tiles asynchronously. Its first "finished" callback
+        // can belong to the initial empty drawing, which briefly hides every existing stroke.
+        // Rasterize only the visible ink synchronously, then swap a ready image in one transaction.
+        let zoom = max(canvasView.zoomScale, 0.001)
+        let visibleWorldRect = CGRect(
+            x: canvasView.contentOffset.x / zoom + canvasWorldOrigin.x,
+            y: canvasView.contentOffset.y / zoom + canvasWorldOrigin.y,
+            width: canvasView.bounds.width / zoom,
+            height: canvasView.bounds.height / zoom
+        )
+        let inkImage = snapped.image(from: visibleWorldRect, scale: zoom * canvasView.traitCollection.displayScale)
+        let preview = UIImageView(image: inkImage)
+        preview.frame = canvasView.frame
+        preview.isOpaque = false
+        preview.backgroundColor = .clear
+        preview.overrideUserInterfaceStyle = .light
+        preview.isUserInteractionEnabled = false
+        preview.isAccessibilityElement = true
+        preview.accessibilityIdentifier = "held-ink-shape-preview"
+        preview.accessibilityLabel = "规整预览"
+        preview.accessibilityValue = candidate.kind.title
+        shapePreview = preview
+        originalCanvasMask = canvasView.layer.mask
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        host.insertSubview(preview, aboveSubview: canvasView)
+        canvasView.layer.mask = CALayer()
+        isShapePreviewVisible = true
+        CATransaction.commit()
+#if DEBUG
+        heldShapePreviewCount += 1
+#endif
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        return true
     }
 
-    nonisolated private static func recognizedShape(
-        from rawPoints: [CGPoint]
-    ) -> ShapeSnapCandidate? {
-        let points = deduplicatedPoints(rawPoints, minimumDistance: 1.5)
-        guard points.count >= 2 else { return nil }
-        let bounds = boundingRect(for: points)
-        let diagonal = hypot(bounds.width, bounds.height)
-        let length = pathLength(points)
-        guard diagonal >= 22, length >= 24 else { return nil }
-
-        let chord = distance(points[0], points[points.count - 1])
-        let lineTolerance = max(3, diagonal * 0.045)
-        let maximumLineError = points.map {
-            distanceFromPoint($0, toSegmentFrom: points[0], to: points[points.count - 1])
-        }.max() ?? .greatestFiniteMagnitude
-        if chord >= diagonal * 0.72,
-           length <= chord * 1.16,
-           maximumLineError <= lineTolerance {
-            return ShapeSnapCandidate(kind: .line, pathPoints: [points[0], points[points.count - 1]])
+    private func discardShapePreview() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let shapePreview {
+            if isShapePreviewVisible { canvasView.layer.mask = originalCanvasMask }
+            shapePreview.removeFromSuperview()
         }
-
-        let closureTolerance = max(14, diagonal * 0.22)
-        let tracedMostOfAClosedContour = length >= diagonal * 1.20
-            && chord <= diagonal * 0.88
-        guard chord <= closureTolerance || tracedMostOfAClosedContour,
-              points.count >= 5 else { return nil }
-        var closedPoints = points
-        if distance(closedPoints[0], closedPoints[closedPoints.count - 1]) > 1.5 {
-            closedPoints.append(closedPoints[0])
-        } else {
-            closedPoints[closedPoints.count - 1] = closedPoints[0]
-        }
-
-        let simplificationTolerance = max(4, diagonal * 0.055)
-        var vertices = ramerDouglasPeucker(
-            closedPoints,
-            tolerance: simplificationTolerance
-        )
-        if vertices.count > 1,
-           distance(vertices[0], vertices[vertices.count - 1]) <= closureTolerance {
-            vertices.removeLast()
-        }
-        vertices = removingCollinearVertices(
-            vertices,
-            tolerance: simplificationTolerance * 0.75
-        )
-
-        if vertices.count == 3 {
-            let triangle = interpolatedPolygon(vertices, closed: true, samplesPerEdge: 12)
-            return ShapeSnapCandidate(kind: .triangle, pathPoints: triangle)
-        }
-
-        if vertices.count == 4, isRectangleLike(vertices) {
-            let rectangleCorners = orientedRectangleCorners(
-                for: points,
-                guidedBy: vertices
-            )
-            let rectangle = interpolatedPolygon(
-                rectangleCorners,
-                closed: true,
-                samplesPerEdge: 12
-            )
-            return ShapeSnapCandidate(kind: .rectangle, pathPoints: rectangle)
-        }
-
-        let ellipseError = ellipseFitError(points)
-        if let ellipse = regularEllipsePoints(for: points),
-           ellipseError <= 0.38 {
-            return ShapeSnapCandidate(kind: .ellipse, pathPoints: ellipse)
-        }
-
-        return nil
+        CATransaction.commit()
+        isShapePreviewVisible = false
+        shapePreview = nil
+        originalCanvasMask = nil
+        heldShape = nil
     }
 
-    private func regularStroke(
-        for candidate: ShapeSnapCandidate,
-        inkStyle: ShapeSnapInkStyle
-    ) -> PKStroke? {
-        guard candidate.pathPoints.count >= 2 else { return nil }
-        let pointSize = CGSize(
-            width: max(inkStyle.width, 1),
-            height: max(inkStyle.width, 1)
-        )
-        let controlPoints = candidate.pathPoints.enumerated().map { index, point in
-            PKStrokePoint(
-                location: point,
-                timeOffset: TimeInterval(index) * 0.012,
-                size: pointSize,
-                opacity: 1,
-                force: 1,
-                azimuth: 0,
-                altitude: .pi / 2
-            )
-        }
-        return PKStroke(
-            ink: PKInk(inkStyle.inkType, color: inkStyle.color),
-            path: PKStrokePath(controlPoints: controlPoints, creationDate: Date())
-        )
-    }
-
-    nonisolated private static func regularEllipsePoints(
-        for points: [CGPoint]
-    ) -> [CGPoint]? {
-        guard points.count >= 5 else { return nil }
-        let center = CGPoint(
-            x: points.map(\.x).reduce(0, +) / CGFloat(points.count),
-            y: points.map(\.y).reduce(0, +) / CGFloat(points.count)
-        )
-        let covariance = points.reduce(into: (xx: CGFloat.zero, xy: CGFloat.zero, yy: CGFloat.zero)) {
-            partial, point in
-            let dx = point.x - center.x
-            let dy = point.y - center.y
-            partial.xx += dx * dx
-            partial.xy += dx * dy
-            partial.yy += dy * dy
-        }
-        let angle = 0.5 * atan2(2 * covariance.xy, covariance.xx - covariance.yy)
-        let axis = CGVector(dx: cos(angle), dy: sin(angle))
-        let normal = CGVector(dx: -axis.dy, dy: axis.dx)
-        let projections = points.map { point -> (u: CGFloat, v: CGFloat) in
-            let delta = CGVector(dx: point.x - center.x, dy: point.y - center.y)
-            return (
-                delta.dx * axis.dx + delta.dy * axis.dy,
-                delta.dx * normal.dx + delta.dy * normal.dy
-            )
-        }
-        guard let minU = projections.map(\.u).min(),
-              let maxU = projections.map(\.u).max(),
-              let minV = projections.map(\.v).min(),
-              let maxV = projections.map(\.v).max() else { return nil }
-        let radiusU = max((maxU - minU) / 2, 1)
-        let radiusV = max((maxV - minV) / 2, 1)
-        let adjustedCenter = CGPoint(
-            x: center.x + axis.dx * ((minU + maxU) / 2) + normal.dx * ((minV + maxV) / 2),
-            y: center.y + axis.dy * ((minU + maxU) / 2) + normal.dy * ((minV + maxV) / 2)
-        )
-        return (0...72).map { index in
-            let theta = CGFloat(index) / 72 * 2 * .pi
-            return CGPoint(
-                x: adjustedCenter.x
-                    + axis.dx * cos(theta) * radiusU
-                    + normal.dx * sin(theta) * radiusV,
-                y: adjustedCenter.y
-                    + axis.dy * cos(theta) * radiusU
-                    + normal.dy * sin(theta) * radiusV
-            )
-        }
-    }
-
-    nonisolated private static func ellipseFitError(_ points: [CGPoint]) -> CGFloat {
-        let bounds = boundingRect(for: points)
-        let radiusX = max(bounds.width / 2, 1)
-        let radiusY = max(bounds.height / 2, 1)
-        let center = bounds.center
-        return points.map { point in
-            let dx = (point.x - center.x) / radiusX
-            let dy = (point.y - center.y) / radiusY
-            return abs(sqrt(dx * dx + dy * dy) - 1)
-        }.reduce(0, +) / CGFloat(max(points.count, 1))
-    }
-
-    nonisolated private static func isRectangleLike(_ vertices: [CGPoint]) -> Bool {
-        guard vertices.count == 4 else { return false }
-        var cornerScores: [CGFloat] = []
-        for index in vertices.indices {
-            let previous = vertices[(index + vertices.count - 1) % vertices.count]
-            let current = vertices[index]
-            let next = vertices[(index + 1) % vertices.count]
-            let incoming = CGVector(dx: previous.x - current.x, dy: previous.y - current.y)
-            let outgoing = CGVector(dx: next.x - current.x, dy: next.y - current.y)
-            let denominator = max(
-                hypot(incoming.dx, incoming.dy) * hypot(outgoing.dx, outgoing.dy),
-                0.001
-            )
-            cornerScores.append(abs((incoming.dx * outgoing.dx + incoming.dy * outgoing.dy) / denominator))
-        }
-        return cornerScores.filter { $0 <= 0.42 }.count >= 3
-    }
-
-    nonisolated private static func orientedRectangleCorners(
-        for points: [CGPoint],
-        guidedBy vertices: [CGPoint]
-    ) -> [CGPoint] {
-        let edges = vertices.indices.map { index -> (vector: CGVector, length: CGFloat) in
-            let next = vertices[(index + 1) % vertices.count]
-            let vector = CGVector(
-                dx: next.x - vertices[index].x,
-                dy: next.y - vertices[index].y
-            )
-            return (vector, hypot(vector.dx, vector.dy))
-        }
-        let longest = edges.max(by: { $0.length < $1.length })?.vector
-            ?? CGVector(dx: 1, dy: 0)
-        let magnitude = max(hypot(longest.dx, longest.dy), 0.001)
-        let axis = CGVector(dx: longest.dx / magnitude, dy: longest.dy / magnitude)
-        let normal = CGVector(dx: -axis.dy, dy: axis.dx)
-        let projected = points.map { point in
-            (
-                u: point.x * axis.dx + point.y * axis.dy,
-                v: point.x * normal.dx + point.y * normal.dy
-            )
-        }
-        let minU = projected.map(\.u).min() ?? 0
-        let maxU = projected.map(\.u).max() ?? 0
-        let minV = projected.map(\.v).min() ?? 0
-        let maxV = projected.map(\.v).max() ?? 0
-        func point(u: CGFloat, v: CGFloat) -> CGPoint {
-            CGPoint(
-                x: axis.dx * u + normal.dx * v,
-                y: axis.dy * u + normal.dy * v
-            )
-        }
-        return [
-            point(u: minU, v: minV),
-            point(u: maxU, v: minV),
-            point(u: maxU, v: maxV),
-            point(u: minU, v: maxV)
-        ]
-    }
-
-    nonisolated private static func interpolatedPolygon(
-        _ vertices: [CGPoint],
-        closed: Bool,
-        samplesPerEdge: Int
-    ) -> [CGPoint] {
-        guard vertices.count >= 2 else { return vertices }
-        let edgeCount = closed ? vertices.count : vertices.count - 1
-        var result: [CGPoint] = []
-        for index in 0..<edgeCount {
-            let start = vertices[index]
-            let end = vertices[(index + 1) % vertices.count]
-            for sample in 0..<samplesPerEdge {
-                let progress = CGFloat(sample) / CGFloat(samplesPerEdge)
-                result.append(
-                    CGPoint(
-                        x: start.x + (end.x - start.x) * progress,
-                        y: start.y + (end.y - start.y) * progress
-                    )
-                )
-            }
-        }
-        result.append(closed ? vertices[0] : vertices[vertices.count - 1])
-        return result
-    }
-
-    nonisolated private static func ramerDouglasPeucker(
-        _ points: [CGPoint],
-        tolerance: CGFloat
-    ) -> [CGPoint] {
-        guard points.count > 2 else { return points }
-        let first = points[0]
-        let last = points[points.count - 1]
-        var maximumDistance: CGFloat = 0
-        var splitIndex = 0
-        for index in 1..<(points.count - 1) {
-            let error = distanceFromPoint(points[index], toSegmentFrom: first, to: last)
-            if error > maximumDistance {
-                maximumDistance = error
-                splitIndex = index
-            }
-        }
-        guard maximumDistance > tolerance else { return [first, last] }
-        let left = ramerDouglasPeucker(Array(points[0...splitIndex]), tolerance: tolerance)
-        let right = ramerDouglasPeucker(Array(points[splitIndex...]), tolerance: tolerance)
-        return Array(left.dropLast()) + right
-    }
-
-    nonisolated private static func removingCollinearVertices(
-        _ input: [CGPoint],
-        tolerance: CGFloat
-    ) -> [CGPoint] {
-        var vertices = input
-        var changed = true
-        while changed, vertices.count > 3 {
-            changed = false
-            for index in vertices.indices {
-                let previous = vertices[(index + vertices.count - 1) % vertices.count]
-                let next = vertices[(index + 1) % vertices.count]
-                if distanceFromPoint(vertices[index], toSegmentFrom: previous, to: next) <= tolerance {
-                    vertices.remove(at: index)
-                    changed = true
-                    break
+    private func regularStroke(points: [CGPoint], inkStyle: ShapeSnapInkStyle) -> PKStroke {
+        // Regular pen geometry has a uniform nib. PencilKit's pen control-point footprint
+        // includes a two-point brush border; passing a thin toolbar width directly makes it
+        // transparent. Textured pencil and highlighter strokes keep their original ink.
+        let inkType: PKInk.InkType = inkStyle.inkType == .fountainPen ? .monoline : inkStyle.inkType
+        let pointWidth = inkType == .monoline || inkType == .pen
+            ? 2 + max(inkStyle.width, 1) / 2 : max(inkStyle.width, 1)
+        let size = CGSize(width: pointWidth, height: pointWidth)
+        var renderingPoints: [CGPoint] = []
+        for (index, point) in points.enumerated() {
+            renderingPoints.append(point)
+            if index > 0, index < points.count - 1 {
+                let a = CGPoint(x: point.x - points[index - 1].x, y: point.y - points[index - 1].y)
+                let b = CGPoint(x: points[index + 1].x - point.x, y: points[index + 1].y - point.y)
+                let lengths = hypot(a.x, a.y) * hypot(b.x, b.y)
+                if lengths > 0, (a.x * b.x + a.y * b.y) / lengths < 0.8 {
+                    // Repeated corner knots prevent PencilKit's spline from rounding a polygon.
+                    renderingPoints.append(contentsOf: [point, point])
                 }
             }
         }
-        return vertices
-    }
-
-    nonisolated private static func deduplicatedPoints(
-        _ points: [CGPoint],
-        minimumDistance: CGFloat
-    ) -> [CGPoint] {
-        guard let first = points.first else { return [] }
-        var result = [first]
-        for point in points.dropFirst()
-        where distance(result[result.count - 1], point) >= minimumDistance {
-            result.append(point)
+        let controlPoints = renderingPoints.enumerated().map { index, point in
+            PKStrokePoint(location: point, timeOffset: TimeInterval(index) * 0.012, size: size,
+                          opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
         }
-        return result
+        return PKStroke(ink: PKInk(inkType, color: inkStyle.color),
+                        path: PKStrokePath(controlPoints: controlPoints, creationDate: Date()))
     }
 
-    nonisolated private static func pathLength(_ points: [CGPoint]) -> CGFloat {
-        zip(points, points.dropFirst()).reduce(0) { result, pair in
-            result + distance(pair.0, pair.1)
-        }
-    }
-
-    nonisolated private static func distance(
-        _ first: CGPoint,
-        _ second: CGPoint
-    ) -> CGFloat {
-        hypot(second.x - first.x, second.y - first.y)
-    }
-
-    nonisolated private static func distanceFromPoint(
-        _ point: CGPoint,
-        toSegmentFrom start: CGPoint,
-        to end: CGPoint
-    ) -> CGFloat {
-        let dx = end.x - start.x
-        let dy = end.y - start.y
-        let squaredLength = dx * dx + dy * dy
-        guard squaredLength > 0.0001 else { return distance(point, start) }
-        let projection = min(
-            max(((point.x - start.x) * dx + (point.y - start.y) * dy) / squaredLength, 0),
-            1
-        )
-        return distance(
-            point,
-            CGPoint(x: start.x + projection * dx, y: start.y + projection * dy)
-        )
-    }
 
 }
 
@@ -1174,10 +816,6 @@ private struct ShapeSnapInkStyle {
     let width: CGFloat
 }
 
-private struct ShapeSnapCandidate: Sendable {
-    let kind: PageShapeKind
-    let pathPoints: [CGPoint]
-}
 
 /// PencilKit normally records its own responder-chain history while this controller records a
 /// smaller delta history shared by ink, lasso, and shape replacement. A private, permanently
@@ -1213,12 +851,21 @@ private extension CGRect {
 }
 
 extension CanvasController: PKCanvasViewDelegate {
+    func canvasViewDidFinishRendering(_ canvasView: PKCanvasView) {
+        guard canvasView === self.canvasView, shapePreview != nil, heldShape == nil,
+              !heldInkRecognizer.isTrackingContact else { return }
+        discardShapePreview()
+    }
+
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        guard !isInstallingDrawing else { return }
+        guard canvasView === self.canvasView, !isInstallingDrawing else { return }
 
         // A late PencilKit delegate callback may follow the post-lift straightening transaction.
         // Until the next genuine interaction or synchronized install, the snapped drawing is the
         // authoritative value.
+        if authoritativeSnappedDrawing != nil, hasActiveDrawingContact {
+            beginToolInteraction()
+        }
         if let authoritativeSnappedDrawing {
             if self.drawing != authoritativeSnappedDrawing {
                 installCanvasDrawing(

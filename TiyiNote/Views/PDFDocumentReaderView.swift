@@ -926,6 +926,8 @@ private struct PDFPageAnnotationView: View {
                 + "；"
                 + drawingGeometryAccessibilityValue
                 + "；同步重载 \(controller.synchronizedDrawingInstallCount)"
+                + "；停笔预览 \(controller.heldShapePreviewCount)"
+                + "；恢复手绘 \(controller.heldShapeResumeCount)"
         }
         return value
 #else
