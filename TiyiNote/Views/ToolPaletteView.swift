@@ -34,6 +34,7 @@ struct ToolPaletteView: View {
     @Binding var selectedTool: CanvasToolKind
     @Binding var selectedPenVariant: CanvasToolKind
     @Binding var eraserMode: CanvasEraserMode
+    @Binding var isScribbleEraseEnabled: Bool
     @Binding var showsThumbnails: Bool
 
     @State private var secondarySettings: SecondarySettings?
@@ -122,6 +123,7 @@ struct ToolPaletteView: View {
                             ) {
                                 PenVariantSettingsPopover(
                                     selection: resolvedPenVariant,
+                                    isScribbleEraseEnabled: $isScribbleEraseEnabled,
                                     onSelect: selectPenVariant
                                 )
                                 .presentationCompactAdaptation(.popover)
@@ -267,6 +269,7 @@ private struct PenVariantSettingsPopover: View {
     private static let variants: [CanvasToolKind] = [.pen, .fountainPen, .pencil]
 
     let selection: CanvasToolKind
+    @Binding var isScribbleEraseEnabled: Bool
     let onSelect: (CanvasToolKind) -> Void
 
     var body: some View {
@@ -302,6 +305,20 @@ private struct PenVariantSettingsPopover: View {
                     )
                 }
             }
+
+            Divider().overlay(Color.black.opacity(0.04))
+
+            Toggle(isOn: $isScribbleEraseEnabled) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("涂抹删除")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("用笔连续来回划或绕圈涂抹，抬笔删除")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.black.opacity(0.52))
+                }
+            }
+            .tint(TiyiNoteTheme.selectionBlue)
+            .accessibilityIdentifier("scribble-erase-toggle")
         }
         .padding(16)
         .frame(width: 334)

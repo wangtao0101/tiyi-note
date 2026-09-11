@@ -7,7 +7,7 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
     var onContactBegan: (() -> Void)?
     var onHold: (([CGPoint]) -> Bool)?
     var onResume: (() -> Void)?
-    var onContactEnded: ((Bool) -> Void)?
+    var onContactEnded: (([CGPoint], Bool) -> Void)?
 
     private(set) var isTrackingContact = false
     private weak var trackedTouch: UITouch?
@@ -64,6 +64,7 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = trackedTouch, touches.contains(touch) else { return }
+        append(touch)
         endContact(cancelled: false)
         state = .failed
     }
@@ -92,9 +93,10 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
         holdWorkItem = nil
         isTrackingContact = false
         trackedTouch = nil
+        let completedPoints = points
         points.removeAll(keepingCapacity: true)
         isPreviewing = false
-        onContactEnded?(cancelled)
+        onContactEnded?(completedPoints, cancelled)
     }
 
     private func append(_ touch: UITouch) {

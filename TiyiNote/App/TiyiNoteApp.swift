@@ -161,6 +161,7 @@ private struct TextInteractionUITestHost: View {
                 "canvas.markerWidth",
                 "canvas.eraserSize",
                 "canvas.eraserMode",
+                "canvas.scribbleToErase",
                 "canvas.toolPaletteDockEdge",
                 "canvas.toolPaletteDockProgress",
                 "pdfWorkspace.showsThumbnails"

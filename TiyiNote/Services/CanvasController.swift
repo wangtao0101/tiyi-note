@@ -54,6 +54,10 @@ final class CanvasController: NSObject, ObservableObject {
     private var selectedToolKind = CanvasToolKind.pen
     private var shapeGestureOriginStrokeCount: Int?
     private var shapeSnapInkStyle: ShapeSnapInkStyle?
+    private var scribbleAllowedForContact = false
+    private var pendingScribbles: [PendingScribbleErase] = []
+    private var completedInkContactCount = 0
+    var isScribbleEraseEnabled = true
     private let heldInkRecognizer = HeldInkGestureRecognizer()
     private let shapeEraserRecognizer = ShapeEraserGestureRecognizer()
     private let fingerSelectionRecognizer = FingerContentTapGestureRecognizer()
@@ -131,9 +135,22 @@ final class CanvasController: NSObject, ObservableObject {
 #endif
             self.discardShapePreview()
         }
-        heldInkRecognizer.onContactEnded = { [weak self] cancelled in
+        heldInkRecognizer.onContactEnded = { [weak self] points, cancelled in
             guard let self else { return }
-            if cancelled { self.discardShapePreview() }
+            self.completedInkContactCount += 1
+            if cancelled {
+                self.pendingScribbles.removeAll()
+                self.discardShapePreview()
+            } else if self.scribbleAllowedForContact, self.isScribbleEraseEnabled,
+                      self.selectedToolKind.isPenVariant, let index = self.shapeGestureOriginStrokeCount {
+                let scale = max(self.canvasView.zoomScale, 0.0001)
+                let worldPoints = points.map { CGPoint(x: $0.x + self.canvasWorldOrigin.x,
+                                                       y: $0.y + self.canvasWorldOrigin.y) }
+                if let gesture = ScribbleEraseRecognizer.recognize(worldPoints, displayScale: scale) {
+                    self.pendingScribbles.append(PendingScribbleErase(gesture: gesture, strokeIndex: index, scale: scale))
+                    self.discardShapePreview()
+                }
+            }
             self.requestToolInteractionFinish()
         }
         canvasView.backgroundColor = .clear
@@ -193,6 +210,7 @@ final class CanvasController: NSObject, ObservableObject {
         postLiftDrawingRetryCount = 0
         eraserBaselineDrawing = selectedToolKind == .eraser ? drawing : nil
         cancelHeldInkRecognition()
+        completedInkContactCount = 0
         authoritativeSnappedDrawing = nil
         setToolInteractionActive(false)
         refreshHistoryState()
@@ -674,6 +692,71 @@ final class CanvasController: NSObject, ObservableObject {
         onPageElementsUpdated?(elements.filter { !ids.contains($0.id) }, false)
     }
 
+    private func commitPendingInkContacts(_ finalDrawing: PKDrawing, committingHeldShape: Bool) {
+        let nativeStrokes = finalDrawing.strokes
+        // Count and physical stroke positions must agree before interpreting any contact as a
+        // deletion. Cancelled or unexpected PencilKit mutations retain ordinary ink instead.
+        let canErase = isAnnotationInputEditable && isScribbleEraseEnabled && selectedToolKind.isPenVariant
+            && nativeStrokes.count == knownStrokeCount + completedInkContactCount
+        let candidates = canErase ? Dictionary(pendingScribbles.map { ($0.strokeIndex, $0) },
+                                                uniquingKeysWith: { first, _ in first }) : [:]
+        var strokes = Array(nativeStrokes.prefix(knownStrokeCount))
+        var elements = pageElementsProvider?() ?? []
+        var didErase = false
+        var didEraseElements = false
+        // Native callbacks can batch several quick contacts. Replay their logical edits in order,
+        // so a scribble cannot eat the next stroke and every contact keeps its own Undo step.
+        for index in min(knownStrokeCount, nativeStrokes.count)..<nativeStrokes.count {
+            var removedIndices: Set<Int> = []
+            var removedElements: [CanvasPageElement] = []
+            if let candidate = candidates[index] {
+                let gesture = candidate.gesture, scale = candidate.scale
+                removedIndices = Set(strokes.indices.filter { index in
+                    let stroke = strokes[index]
+                    guard gesture.bounds.intersects(stroke.renderBounds) else { return false }
+                    let transformScale = max(hypot(stroke.transform.a, stroke.transform.b),
+                                             hypot(stroke.transform.c, stroke.transform.d), 0.001)
+                    let contours = CanvasHitGeometry.visiblePoints(in: stroke, spacing: 3 / (scale * transformScale))
+                        .map { $0.map { $0.location.applying(stroke.transform) } }
+                    return gesture.covers(contours)
+                })
+                removedElements = elements.filter { element in
+                    guard !element.isLocked, case .shape = element.payload else { return false }
+                    let path = element.interactionPath(displayScale: scale)
+                    guard gesture.bounds.intersects(path.boundingBoxOfPath.insetBy(dx: -1 / scale, dy: -1 / scale)) else { return false }
+                    return gesture.covers(CanvasHitGeometry.contours(in: path, spacing: 3 / scale), minimumCoverage: 0.70)
+                }
+            }
+            if removedIndices.isEmpty && removedElements.isEmpty {
+                strokes.append(nativeStrokes[index])
+                recordUndoAction(.removeTrailingStrokes(1))
+                continue
+            }
+            didErase = true
+            let originalDrawing = PKDrawing(strokes: strokes)
+            let removedIDs = Set(removedElements.map(\.id))
+            if removedElements.isEmpty {
+                recordUndoAction(.restoreDrawing(originalDrawing))
+            } else {
+                didEraseElements = true
+                recordUndoAction(.restorePageContent(drawing: originalDrawing,
+                                                    elements: removedElements, replacingIDs: removedIDs))
+                elements.removeAll { removedIDs.contains($0.id) }
+            }
+            strokes = strokes.enumerated().compactMap { removedIndices.contains($0.offset) ? nil : $0.element }
+        }
+        if didErase || committingHeldShape {
+            let remainingDrawing = PKDrawing(strokes: strokes)
+            installCanvasDrawing(remainingDrawing)
+            // A late PencilKit callback must not resurrect either erased content or the gesture.
+            authoritativeSnappedDrawing = remainingDrawing
+        } else {
+            knownStrokeCount = nativeStrokes.count
+        }
+        if didEraseElements { onPageElementsUpdated?(elements, true) }
+        onDrawingChanged?(!didErase)
+    }
+
     private func beginToolInteraction() {
         toolInteractionEndWorkItem?.cancel()
         toolInteractionEndWorkItem = nil
@@ -691,6 +774,8 @@ final class CanvasController: NSObject, ObservableObject {
             toolInteractionOriginDrawing = nil
         }
         toolInteractionDidChangeDrawing = false
+        completedInkContactCount = 0
+        pendingScribbles.removeAll(keepingCapacity: true)
         erasedElements.removeAll(keepingCapacity: true)
         postLiftDrawingRetryCount = 0
         setToolInteractionActive(true)
@@ -728,12 +813,45 @@ final class CanvasController: NSObject, ObservableObject {
               !hasActiveDrawingContact else { return }
 
         let didChangeDrawing = toolInteractionDidChangeDrawing || heldShape != nil
+        if !pendingScribbles.isEmpty {
+            // Ordinary writing never snapshots the complete drawing here. A geometric candidate
+            // waits until all live contacts finish, then evaluates only their nearby content.
+            let expectedCount = knownStrokeCount + completedInkContactCount
+            let snappedShape = heldShape.flatMap { $0.drawing.strokes.count == expectedCount ? $0 : nil }
+            let finalDrawing = snappedShape?.drawing ?? self.drawing
+            if finalDrawing.strokes.count < knownStrokeCount + completedInkContactCount, postLiftDrawingRetryCount < 4 {
+                postLiftDrawingRetryCount += 1
+                let work = DispatchWorkItem { [weak self] in self?.finishShapeTrackingAfterPencilLift() }
+                toolInteractionEndWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
+                return
+            }
+            if snappedShape != nil {
+                // Keep the bitmap until the final ink renders, just like an isolated held shape.
+                heldShape = nil
+            } else {
+                discardShapePreview()
+            }
+            commitPendingInkContacts(finalDrawing, committingHeldShape: snappedShape != nil)
+            pendingScribbles.removeAll(keepingCapacity: true)
+            completedInkContactCount = 0
+            toolInteractionOriginDrawing = nil
+            toolInteractionDidChangeDrawing = false
+            shapeGestureOriginStrokeCount = nil
+            shapeSnapInkStyle = nil
+            scribbleAllowedForContact = false
+            lastSnappedShapeKind = snappedShape?.kind
+            setToolInteractionActive(false)
+            refreshHistoryState()
+            return
+        }
         if didChangeDrawing {
             if selectedToolKind.usesInkSettings {
                 // One Pencil contact produces one PencilKit stroke. Store the inverse command;
                 // the stroke itself is captured only if the user actually asks for Undo.
-                recordUndoAction(.removeTrailingStrokes(1))
-                knownStrokeCount += 1
+                let count = max(1, completedInkContactCount)
+                for _ in 0..<count { recordUndoAction(.removeTrailingStrokes(1)) }
+                knownStrokeCount += count
             } else if selectedToolKind == .eraser, erasedElements.isEmpty,
                       let originDrawing = toolInteractionOriginDrawing {
                 recordUndoAction(.restoreDrawing(originDrawing))
@@ -797,9 +915,10 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     private func beginShapeTracking() {
+        scribbleAllowedForContact = isScribbleEraseEnabled && selectedToolKind.isPenVariant
         guard selectedToolKind.usesInkSettings,
               let tool = canvasView.tool as? PKInkingTool else { return }
-        shapeGestureOriginStrokeCount = knownStrokeCount
+        shapeGestureOriginStrokeCount = knownStrokeCount + completedInkContactCount
         shapeSnapInkStyle = ShapeSnapInkStyle(inkType: tool.inkType, color: tool.color, width: tool.width)
     }
 
@@ -828,6 +947,8 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     func cancelHeldInkRecognition() {
+        pendingScribbles.removeAll()
+        scribbleAllowedForContact = false
         heldInkRecognizer.cancelTracking()
         discardShapePreview()
         shapeGestureOriginStrokeCount = nil
@@ -835,6 +956,10 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     private func previewHeldShape(_ localPoints: [CGPoint]) -> Bool {
+        if scribbleAllowedForContact, isScribbleEraseEnabled,
+           ScribbleEraseRecognizer.recognize(localPoints, displayScale: canvasView.zoomScale) != nil {
+            return false
+        }
         guard isUsingTool, heldInkRecognizer.isTrackingContact,
               let originCount = shapeGestureOriginStrokeCount,
               let style = shapeSnapInkStyle, let host = canvasView.superview,
@@ -1013,6 +1138,12 @@ private final class TiyiPencilCanvasView: PKCanvasView {
             if gesture.isEnabled { gesture.isEnabled = false }
         }
     }
+}
+
+private struct PendingScribbleErase {
+    let gesture: ScribbleEraseGesture
+    let strokeIndex: Int
+    let scale: CGFloat
 }
 
 private enum DrawingHistoryAction {

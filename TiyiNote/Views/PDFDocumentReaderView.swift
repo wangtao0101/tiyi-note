@@ -18,6 +18,7 @@ struct PDFDocumentReaderView: View {
     let markerWidth: Double
     let eraserSize: CanvasEraserSize
     let eraserMode: CanvasEraserMode
+    let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
     let practice: TiyiPracticeWorkspace?
     let onSelectLassoTool: () -> Void
@@ -51,6 +52,7 @@ struct PDFDocumentReaderView: View {
         markerWidth: Double,
         eraserSize: CanvasEraserSize,
         eraserMode: CanvasEraserMode,
+        isScribbleEraseEnabled: Bool = true,
         isAnnotationEditingEnabled: Bool = true,
         practice: TiyiPracticeWorkspace? = nil,
         initialPageIndex: Int,
@@ -70,6 +72,7 @@ struct PDFDocumentReaderView: View {
         self.markerWidth = markerWidth
         self.eraserSize = eraserSize
         self.eraserMode = eraserMode
+        self.isScribbleEraseEnabled = isScribbleEraseEnabled
         self.isAnnotationEditingEnabled = isAnnotationEditingEnabled
         self.practice = practice
         self.onSelectLassoTool = onSelectLassoTool
@@ -234,6 +237,7 @@ struct PDFDocumentReaderView: View {
             markerWidth: markerWidth,
             eraserSize: eraserSize,
             eraserMode: eraserMode,
+            isScribbleEraseEnabled: isScribbleEraseEnabled,
             isAnnotationEditingEnabled: isAnnotationEditingEnabled,
             onSelectLassoTool: onSelectLassoTool,
             onSelectTextTool: onSelectTextTool,
@@ -532,6 +536,7 @@ private struct PDFPageAnnotationView: View {
     let markerWidth: Double
     let eraserSize: CanvasEraserSize
     let eraserMode: CanvasEraserMode
+    let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
     let onSelectLassoTool: () -> Void
     let onSelectTextTool: () -> Void
@@ -591,7 +596,7 @@ private struct PDFPageAnnotationView: View {
         documentStore.pageIndex(for: pageID, in: documentID) ?? pageIndex
     }
 
-    var body: some View {
+    private var pageCanvas: some View {
         GeometryReader { geometry in
             ZStack {
                 if let logicalViewport, let canvasBackground {
@@ -705,6 +710,10 @@ private struct PDFPageAnnotationView: View {
 
             }
         }
+    }
+
+    private var interactivePageCanvas: some View {
+        pageCanvas
         .background(Color.white)
         .onAppear(perform: preparePageCanvas)
         .onDisappear(perform: releasePageCanvas)
@@ -723,12 +732,25 @@ private struct PDFPageAnnotationView: View {
                 commitTextEdit()
             }
         }
+        .onChange(of: isScribbleEraseEnabled) { _, enabled in
+            controller.isScribbleEraseEnabled = enabled
+        }
         .onChange(of: selectedColor) { _, _ in applySelectedTool() }
         .onChange(of: penWidth) { _, _ in applySelectedTool() }
         .onChange(of: markerWidth) { _, _ in applySelectedTool() }
         .onChange(of: eraserSize) { _, _ in applySelectedTool() }
         .onChange(of: eraserMode) { _, _ in applySelectedTool() }
         .onChange(of: isAnnotationEditingEnabled) { _, _ in applySelectedTool() }
+    }
+
+    private var shapeEditorPresented: Binding<Bool> {
+        Binding(get: { editingShapeElementID != nil }, set: { shown in
+            if !shown { cancelShapeEdit() }
+        })
+    }
+
+    var body: some View {
+        interactivePageCanvas
         .onChange(of: pageIndex) { oldIndex, newIndex in
             onRelease(controller, oldIndex)
             onReady(controller, newIndex)
@@ -770,12 +792,7 @@ private struct PDFPageAnnotationView: View {
                 )
             }
         }
-        .sheet(
-            isPresented: Binding(
-                get: { editingShapeElementID != nil },
-                set: { if !$0 { cancelShapeEdit() } }
-            )
-        ) {
+        .sheet(isPresented: shapeEditorPresented) {
             PageShapeEditorSheet(
                 strokeColor: $shapeStrokeColorDraft,
                 fillEnabled: $shapeFillEnabledDraft,
@@ -956,6 +973,7 @@ private struct PDFPageAnnotationView: View {
     }
 
     private func applySelectedTool() {
+        controller.isScribbleEraseEnabled = isScribbleEraseEnabled
         guard isAnnotationEditingEnabled else {
             controller.configureAnnotationInput(isEditable: false)
             return

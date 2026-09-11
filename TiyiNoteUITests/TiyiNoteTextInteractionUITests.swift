@@ -3,6 +3,323 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+    func testRecordedRoundedPencilScribblesEraseAndPersistInNoteAndPractice() throws {
+        struct PencilSample: Decodable { let name: String; let points: [[Double]] }
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScribbleErasePencilSamples", withExtension: "json"))
+        let samples = try JSONDecoder().decode([PencilSample].self, from: Data(contentsOf: url))
+        for prefix in ["scribble-rounded-pencil", "practice-sidebar-scribble-rounded-pencil"] {
+            let app = launchIsolatedApp(prefix: prefix)
+            let canvas = app.descendants(matching: .any)["page-canvas-0"]
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            // Default-enabled, with the same compact looping strokes which failed on the iPad.
+            let center = CGPoint(x: canvas.frame.midX, y: canvas.frame.minY + canvas.frame.height * 0.3)
+            let word = [CGPoint(x: center.x - 8, y: center.y - 5),
+                        CGPoint(x: center.x, y: center.y + 5), CGPoint(x: center.x + 8, y: center.y - 5)]
+            for sample in [samples[4], samples[7]] {
+                try synthesizeTouchPath(word, on: canvas, in: app, holdBeforeLift: 0.04)
+                waitForValue("笔迹 1", of: canvas)
+                let originalGeometry = drawingGeometryValue(of: canvas)
+                let maxX = sample.points.map { $0[0] }.max()!
+                let maxY = sample.points.map { $0[1] }.max()!
+                let scratch = sample.points.enumerated().map { index, pair in
+                    (point: CGPoint(x: center.x + (pair[0] - maxX / 2) * 0.65,
+                                    y: center.y + (pair[1] - maxY / 2) * 0.65),
+                     offset: Double(index) / Double(sample.points.count - 1) * 1.2)
+                }
+                try synthesizeTouchPaths([SynthesizedTouchPath(samples: scratch, liftOffset: 1.24)], on: canvas, in: app)
+                waitForValue("笔迹 0", of: canvas)
+                app.buttons["撤销"].tap()
+                waitForValue("笔迹 1", of: canvas)
+                XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry, sample.name)
+                app.buttons["重做"].tap()
+                waitForValue("笔迹 0", of: canvas)
+            }
+            // A single oval over old ink is still an ordinary drawing, even when the paths touch.
+            try synthesizeTouchPath(word, on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 1", of: canvas)
+            let circle = (0...48).map { index in
+                let angle = CGFloat(index) / 48 * .pi * 2
+                return (point: CGPoint(x: center.x + 14 * cos(angle), y: center.y + 10 * sin(angle)),
+                        offset: Double(index) / 48 * 0.6)
+            }
+            try synthesizeTouchPaths([SynthesizedTouchPath(samples: circle, liftOffset: 0.64)], on: canvas, in: app)
+            waitForValue("笔迹 2", of: canvas)
+            let geometry = drawingGeometryValue(of: canvas)
+            app.buttons[prefix.hasPrefix("practice") ? "practice-exit" : "home-button"].tap()
+            app.terminate()
+            app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+            app.launch()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            waitForValue("笔迹 2", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+            app.terminate()
+        }
+    }
+
+    func testScribbleEraseIsOneUndoAndPersistsInNoteAndPractice() throws {
+        for prefix in ["scribble-ink", "practice-sidebar-scribble-ink"] {
+            let app = launchIsolatedApp(prefix: prefix)
+            let canvas = app.descendants(matching: .any)["page-canvas-0"]
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            setScribbleErase(true, in: app)
+            let center = CGPoint(x: canvas.frame.midX, y: canvas.frame.minY + canvas.frame.height * 0.3)
+            let word = [CGPoint(x: center.x - 28, y: center.y - 5),
+                        CGPoint(x: center.x, y: center.y + 6),
+                        CGPoint(x: center.x + 28, y: center.y - 5)]
+            try synthesizeTouchPath(word, on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 1", of: canvas)
+            let originalGeometry = drawingGeometryValue(of: canvas)
+            let scratch = scribblePoints(in: CGRect(x: center.x - 80, y: center.y - 18, width: 160, height: 36))
+            try synthesizeTouchPath(scratch, on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 0", of: canvas)
+            XCTAssertEqual(app.buttons["tool-pen"].value as? String, "selected")
+            app.buttons["撤销"].tap()
+            waitForValue("笔迹 1", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry, "Undo must restore old ink without the scribble")
+            app.buttons["重做"].tap()
+            waitForValue("笔迹 0", of: canvas)
+            // A new contact releases the late-callback guard and remains editable after erasing.
+            try synthesizeTouchPath(word.map { CGPoint(x: $0.x, y: $0.y + 100) }, on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 1", of: canvas)
+            let nextGeometry = drawingGeometryValue(of: canvas)
+            app.buttons[prefix.hasPrefix("practice") ? "practice-exit" : "home-button"].tap()
+            app.terminate()
+            app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+            app.launch()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            waitForValue("笔迹 1", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), nextGeometry)
+            app.terminate()
+        }
+    }
+
+    func testScribbleSettingHighlighterAndOrdinaryDrawingNeverErase() throws {
+        let isPhone = UIDevice.current.userInterfaceIdiom == .phone
+        // Note is read-only on iPhone; practice is the supported phone handwriting surface.
+        let app = launchIsolatedApp(prefix: isPhone ? "practice-sidebar-scribble-settings" : "scribble-settings")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        setScribbleErase(false, in: app)
+        let center = CGPoint(x: canvas.frame.midX, y: canvas.frame.minY + canvas.frame.height * 0.28)
+        let line = [CGPoint(x: center.x - 35, y: center.y), CGPoint(x: center.x + 35, y: center.y)]
+        let scratch = scribblePoints(in: CGRect(x: center.x - 80, y: center.y - 18, width: 160, height: 36))
+        try synthesizeTouchPath(line, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 1", of: canvas)
+        try synthesizeTouchPath(scratch, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        setScribbleErase(true, in: app)
+        app.buttons["tool-marker"].tap()
+        try synthesizeTouchPath(scratch, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        setScribbleErase(true, in: app)
+        let wave = (0...32).map { i in
+            CGPoint(x: center.x - 100 + CGFloat(i) * 6.25, y: center.y + 25 * sin(CGFloat(i) / 32 * .pi * 6))
+        }
+        try synthesizeTouchPath(wave, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        try synthesizeTouchPath(scratch.map { CGPoint(x: $0.x, y: $0.y + 140) }, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        setScribbleErase(false, in: app)
+        app.buttons[isPhone ? "practice-exit" : "home-button"].tap()
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-pen"].tap()
+        let toggle = app.switches["scribble-erase-toggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 3))
+        XCTAssertEqual(toggle.value as? String, "0")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Scribble to erase in pen settings"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        app.buttons["pen-variant-pen"].tap()
+    }
+
+    func testScribbleEraseProtectsLockedAndPartlyCoveredShapesAndGroupsInkUndo() throws {
+        let app = launchIsolatedApp(prefix: "scribble-shapes")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        setScribbleErase(true, in: app)
+        insertShape(named: "矩形", in: app, settingsScroll: app.scrollViews["tool-settings-scroll"])
+        let shapes = app.descendants(matching: .any).matching(identifier: "page-element-shape")
+        let frame = shapes.firstMatch.frame
+        app.buttons["对象操作"].tap()
+        app.buttons["锁定"].tap()
+        app.buttons["tool-pen"].tap()
+        let wholeShape = scribblePoints(in: frame.insetBy(dx: -12, dy: -8))
+        try synthesizeTouchPath(wholeShape, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(shapes.count, 1)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        app.buttons["tool-lasso"].tap()
+        shapes.firstMatch.tap()
+        app.buttons["对象操作"].tap()
+        app.buttons["解锁"].tap()
+        app.buttons["tool-pen"].tap()
+        let edge = scribblePoints(in: CGRect(x: frame.midX - 60, y: frame.minY - 16, width: 120, height: 32))
+        try synthesizeTouchPath(edge, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(shapes.count, 1, "A small scribble must not erase a whole large shape")
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        let heldLine = (0...8).map { index in
+            CGPoint(x: frame.minX + 30 + (frame.width - 60) * CGFloat(index) / 8, y: frame.midY)
+        }
+        try synthesizeTouchPath(heldLine, on: canvas, in: app, holdBeforeLift: 1.1)
+        waitForValue("笔迹 1", of: canvas)
+        waitForValueContaining("吸附 直线", of: canvas)
+        let originalGeometry = drawingGeometryValue(of: canvas)
+        try synthesizeTouchPath(wholeShape, on: canvas, in: app, holdBeforeLift: 0.8)
+        waitForValue("笔迹 0", of: canvas)
+        waitUntil(timeout: 3) { shapes.count == 0 }
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(shapes.count, 1)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+        app.buttons["重做"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        XCTAssertEqual(shapes.count, 0)
+        insertShape(named: "直线", in: app, settingsScroll: app.scrollViews["tool-settings-scroll"])
+        let lineFrame = shapes.firstMatch.frame
+        app.buttons["tool-pen"].tap()
+        let lineScratch = scribblePoints(in: CGRect(x: lineFrame.minX - 12, y: lineFrame.midY - 18,
+                                                    width: lineFrame.width + 24, height: 36))
+        try synthesizeTouchPath(lineScratch, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitUntil(timeout: 3) { shapes.count == 0 }
+        waitForValue("笔迹 0", of: canvas)
+    }
+
+    func testScribbleEraseAtTenPercentOutsideTheQuestionKeepsTheBackground() throws {
+        let app = launchIsolatedApp(prefix: "practice-sidebar-scribble-zoom")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        setScribbleErase(true, in: app)
+        try pinchCanvas(canvas, scale: 0.05, in: app)
+        waitUntil(timeout: 3) { app.buttons["zoom-reset"].label.contains("10%") }
+        let center = CGPoint(x: canvas.frame.minX + canvas.frame.width * 0.3,
+                             y: canvas.frame.minY + canvas.frame.height * 0.25)
+        let line = [CGPoint(x: center.x - 35, y: center.y), CGPoint(x: center.x + 35, y: center.y)]
+        try synthesizeTouchPath(line, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertLessThan(try drawingBounds(of: canvas).minX, 0)
+        XCTAssertLessThan(try drawingBounds(of: canvas).minY, 0)
+        let geometry = drawingGeometryValue(of: canvas)
+        let scratch = scribblePoints(in: CGRect(x: center.x - 80, y: center.y - 18, width: 160, height: 36))
+        try synthesizeTouchPath(scratch, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 0", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+        app.buttons["重做"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Practice after scribble erasure at 10 percent"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        XCTAssertTrue(app.buttons["practice-question-menu"].label.contains("第 1 题"))
+    }
+
+    private func setScribbleErase(_ enabled: Bool, in app: XCUIApplication) {
+        let toggle = app.switches["scribble-erase-toggle"]
+        if !toggle.exists {
+            app.buttons["tool-pen"].tap()
+            if !toggle.waitForExistence(timeout: 1) { app.buttons["tool-pen"].tap() }
+        }
+        XCTAssertTrue(toggle.waitForExistence(timeout: 3))
+        if (toggle.value as? String == "1") != enabled {
+            toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        }
+        XCTAssertEqual(toggle.value as? String, enabled ? "1" : "0")
+        app.buttons["pen-variant-pen"].tap()
+    }
+
+    func testScribbleEraseImmediatelyFollowedByWritingKeepsSeparateUndoSteps() throws {
+        let app = launchIsolatedApp(prefix: "scribble-rapid-next-contact")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        setScribbleErase(true, in: app)
+        let center = CGPoint(x: canvas.frame.midX, y: canvas.frame.minY + canvas.frame.height * 0.3)
+        let original = [CGPoint(x: center.x - 30, y: center.y - 5),
+                        CGPoint(x: center.x, y: center.y + 5), CGPoint(x: center.x + 30, y: center.y - 5)]
+        try synthesizeTouchPath(original, on: canvas, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 1", of: canvas)
+        let originalGeometry = drawingGeometryValue(of: canvas)
+        let scratch = scribblePoints(in: CGRect(x: center.x - 80, y: center.y - 18, width: 160, height: 36))
+        let samples = scratch.enumerated().map { (point: $0.element, offset: Double($0.offset) * 0.06) }
+        let lift = samples.last!.offset + 0.04
+        let next = original.enumerated().map {
+            (point: CGPoint(x: $0.element.x, y: $0.element.y + 120), offset: lift + 0.04 + Double($0.offset) * 0.06)
+        }
+        try synthesizeTouchPaths([SynthesizedTouchPath(samples: samples, liftOffset: lift),
+                                  SynthesizedTouchPath(samples: next, liftOffset: next.last!.offset + 0.04)],
+                                 on: canvas, in: app)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertNotEqual(drawingGeometryValue(of: canvas), originalGeometry)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+
+        // Two erasures interleaved with two new strokes can share one native callback batch too.
+        let secondEraseStart = next.last!.offset + 0.08
+        let secondErase = scratch.enumerated().map {
+            (point: CGPoint(x: $0.element.x, y: $0.element.y + 120), offset: secondEraseStart + Double($0.offset) * 0.06)
+        }
+        let finalStart = secondErase.last!.offset + 0.08
+        let finalWord = original.enumerated().map {
+            (point: CGPoint(x: $0.element.x, y: $0.element.y + 240), offset: finalStart + Double($0.offset) * 0.06)
+        }
+        try synthesizeTouchPaths([
+            SynthesizedTouchPath(samples: samples, liftOffset: lift),
+            SynthesizedTouchPath(samples: next, liftOffset: next.last!.offset + 0.04),
+            SynthesizedTouchPath(samples: secondErase, liftOffset: secondErase.last!.offset + 0.04),
+            SynthesizedTouchPath(samples: finalWord, liftOffset: finalWord.last!.offset + 0.04)
+        ], on: canvas, in: app)
+        waitForValue("笔迹 1", of: canvas)
+        for count in [0, 1, 0, 1] {
+            app.buttons["撤销"].tap()
+            waitForValue("笔迹 \(count)", of: canvas)
+        }
+        XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+
+        // A held shape in the next contact still snaps, even if the earlier erase is pending.
+        let heldSamples = (0...8).map { index in
+            (point: CGPoint(x: center.x - 60 + CGFloat(index) * 15, y: center.y + 120),
+             offset: lift + 0.04 + Double(index) * 0.06)
+        }
+        try synthesizeTouchPaths([
+            SynthesizedTouchPath(samples: samples, liftOffset: lift),
+            SynthesizedTouchPath(samples: heldSamples, liftOffset: heldSamples.last!.offset + 1.1)
+        ], on: canvas, in: app)
+        waitForValue("笔迹 1", of: canvas)
+        waitForValueContaining("吸附 直线", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+    }
+
+    private func scribblePoints(in rect: CGRect) -> [CGPoint] {
+        let passes = max(8, Int(ceil(rect.height / 6)))
+        return (0...passes).map { index in
+            CGPoint(x: index.isMultiple(of: 2) ? rect.minX : rect.maxX,
+                    y: rect.minY + rect.height * CGFloat(index) / CGFloat(passes))
+        }
+    }
+
     func testPracticeQuestionAndSupplementUseUnboundedCanvasAndKeepOutsideInk() throws {
         let app = launchIsolatedApp(prefix: "practice-sidebar-unbounded")
         let canvas = app.descendants(matching: .any)["page-canvas-0"]

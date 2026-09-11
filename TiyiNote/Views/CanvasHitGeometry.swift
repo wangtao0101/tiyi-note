@@ -103,11 +103,56 @@ enum CanvasHitGeometry {
         }
     }
 
-    static func visiblePoints(in stroke: PKStroke) -> [[PKStrokePoint]] {
+    static func visiblePoints(in stroke: PKStroke, spacing: CGFloat = 3) -> [[PKStrokePoint]] {
         guard !stroke.path.isEmpty else { return [] }
         let ranges = stroke.mask == nil
             ? [CGFloat(0)...CGFloat(stroke.path.count - 1)] : stroke.maskedPathRanges
-        return ranges.map { Array(stroke.path.interpolatedPoints(in: $0, by: .distance(3))) }
+        return ranges.map { Array(stroke.path.interpolatedPoints(in: $0, by: .distance(max(spacing, 0.1)))) }
+    }
+
+    /// Flatten the actual transformed outline for coverage tests. Treating a shape's bounding box
+    /// or filled interior as its contour would erase an entire diagram when shading its centre.
+    static func contours(in path: CGPath, spacing: CGFloat) -> [[CGPoint]] {
+        var result: [[CGPoint]] = []
+        var current: [CGPoint] = []
+        func finish() {
+            if !current.isEmpty { result.append(current) }
+            current = []
+        }
+        path.applyWithBlock { pointer in
+            let element = pointer.pointee
+            switch element.type {
+            case .moveToPoint:
+                finish()
+                current = [element.points[0]]
+            case .addLineToPoint:
+                current.append(element.points[0])
+            case .addQuadCurveToPoint, .addCurveToPoint:
+                guard let start = current.last else { return }
+                let a = element.points[0]
+                let b = element.points[1]
+                let end = element.type == .addCurveToPoint ? element.points[2] : b
+                let polygonLength = hypot(a.x - start.x, a.y - start.y)
+                    + hypot(b.x - a.x, b.y - a.y) + hypot(end.x - b.x, end.y - b.y)
+                let count = max(4, min(256, Int(ceil(polygonLength / max(spacing, 0.1)))))
+                for index in 1...count {
+                    let t = CGFloat(index) / CGFloat(count), u = 1 - t
+                    if element.type == .addQuadCurveToPoint {
+                        current.append(CGPoint(x: u * u * start.x + 2 * u * t * a.x + t * t * end.x,
+                                               y: u * u * start.y + 2 * u * t * a.y + t * t * end.y))
+                    } else {
+                        current.append(CGPoint(x: u * u * u * start.x + 3 * u * u * t * a.x + 3 * u * t * t * b.x + t * t * t * end.x,
+                                               y: u * u * u * start.y + 3 * u * u * t * a.y + 3 * u * t * t * b.y + t * t * t * end.y))
+                    }
+                }
+            case .closeSubpath:
+                if let first = current.first { current.append(first) }
+                finish()
+            @unknown default: break
+            }
+        }
+        finish()
+        return result
     }
 
     static func distance(to point: CGPoint, stroke: PKStroke, tolerance: CGFloat) -> CGFloat? {

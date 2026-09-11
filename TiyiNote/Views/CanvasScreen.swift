@@ -18,6 +18,7 @@ struct CanvasScreen: View {
     @AppStorage("canvas.markerWidth") private var markerWidth = 16.0
     @AppStorage("canvas.eraserSize") private var eraserSize = CanvasEraserSize.medium
     @AppStorage("canvas.eraserMode") private var eraserMode = CanvasEraserMode.precision
+    @AppStorage("canvas.scribbleToErase") private var isScribbleEraseEnabled = true
     @AppStorage("pdfWorkspace.showsThumbnails") private var showsThumbnails = false
     @AppStorage("canvas.toolPaletteDockEdge") private var toolPaletteDockEdge =
         ToolPaletteDockEdge.leading
@@ -91,6 +92,7 @@ struct CanvasScreen: View {
                         selectedTool: $selectedTool,
                         selectedPenVariant: $selectedPenVariant,
                         eraserMode: $eraserMode,
+                        isScribbleEraseEnabled: $isScribbleEraseEnabled,
                         showsThumbnails: thumbnailVisibility,
                         onSearch: practice == nil ? { showsPDFSearch = true } : nil,
                         onInsertImage: { showsImageImporter = true },
@@ -124,6 +126,7 @@ struct CanvasScreen: View {
                             markerWidth: markerWidth,
                             eraserSize: eraserSize,
                             eraserMode: eraserMode,
+                            isScribbleEraseEnabled: isScribbleEraseEnabled,
                             isAnnotationEditingEnabled: annotationEditingEnabled,
                             practice: practice,
                             initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
