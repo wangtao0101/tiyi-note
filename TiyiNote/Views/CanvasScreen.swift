@@ -36,6 +36,8 @@ struct CanvasScreen: View {
     @State private var sharePayload: DocumentSharePayload?
     @State private var isPreparingOutput = false
     @State private var workspaceAlert: WorkspaceAlert?
+    @State private var questionSession: DocumentQuestionSession?
+    @State private var closingQuestionSession: DocumentQuestionSession?
 
     private var thumbnailVisibility: Binding<Bool> {
         practice.map { workspace in
@@ -100,7 +102,8 @@ struct CanvasScreen: View {
                         hasActiveDocument: !activeDocumentID.isEmpty,
                         canClearPage: activeController != nil,
                         onDocumentAction: handleDocumentOutput,
-                        onClearPage: requestClearCurrentPage
+                        onClearPage: requestClearCurrentPage,
+                        allowsQuestionCapture: practice == nil
                     )
                 } else {
                     ReadOnlyToolPaletteView(
@@ -130,6 +133,10 @@ struct CanvasScreen: View {
                             isAnnotationEditingEnabled: annotationEditingEnabled,
                             practice: practice,
                             initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
+                            onOpenQuestionSession: { session in
+                                guard practice == nil else { return }
+                                questionSession = session
+                            },
                             onSelectLassoTool: {
                                 selectedTool = .lasso
                             },
@@ -150,7 +157,7 @@ struct CanvasScreen: View {
                         )
                         .id(activeDocument.id)
 
-                        if annotationEditingEnabled {
+                        if annotationEditingEnabled && selectedTool != .question {
                             DockableToolPaletteView(
                                 selectedTool: $selectedTool,
                                 selectedPenVariant: selectedPenVariant,
@@ -172,6 +179,18 @@ struct CanvasScreen: View {
                     }
                 }
             }
+        }
+        .accessibilityHidden(questionSession != nil)
+        .fullScreenCover(item: $questionSession, onDismiss: {
+            NotificationCenter.default.post(name: .documentQuestionDismissed, object: documentStore)
+            closingQuestionSession?.discardWorkingCopy()
+            closingQuestionSession = nil
+        }) { session in
+            TiyiPracticeEditor(workspace: session.workspace) {
+                closingQuestionSession = session
+                questionSession = nil
+            }
+            .interactiveDismissDisabled()
         }
         .onAppear(perform: prepareWorkspace)
         .onChange(of: practice?.requestedPageID) { _, id in
@@ -322,6 +341,14 @@ struct CanvasScreen: View {
         }
 
         documentStore.closeDocument(documentID)
+
+        if documentStore.openDocuments.isEmpty {
+            activeDocumentID = ""
+            activeController = nil
+            activePageIndex = 0
+            onShowLibrary()
+            return
+        }
 
         if isClosingActiveDocument, let nextDocument = documentStore.openDocuments.first {
             activeDocumentID = nextDocument.id

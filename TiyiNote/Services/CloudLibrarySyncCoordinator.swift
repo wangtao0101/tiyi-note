@@ -105,6 +105,7 @@ actor CloudLibrarySyncCoordinator {
         static let pageID = "pageID"
         static let operationStamp = "operationStamp"
         static let operationPayload = "operationPayload"
+        static let operationPayloadAsset = "operationPayloadAsset"
         static let referencePayload = "referencePayload"
         static let participantID = "participantID"
         static let acknowledgementPayload = "acknowledgementPayload"
@@ -639,7 +640,14 @@ actor CloudLibrarySyncCoordinator {
                     + page.deletions.count
             )
             for result in page.modificationResultsByID.values {
-                guard let decoded = decodeRemoteRecord(try result.get().record) else { continue }
+                let record = try result.get().record
+                guard let decoded = decodeRemoteRecord(record) else {
+                    // Never advance a zone token past an unreadable answer attachment.
+                    if record.recordType == RecordType.operation {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    continue
+                }
                 // CKAsset file URLs are callback-scoped. Materialize every page before asking
                 // CloudKit for the next one, otherwise cross-page accumulation can lose bytes.
                 accumulatedChanges.append(
@@ -757,7 +765,10 @@ actor CloudLibrarySyncCoordinator {
 
     private func uploadPendingChanges() async throws {
         var manifest = loadUploadManifest()
-        let allCandidates = try await makeUploadCandidates(manifest: &manifest)
+        let assetDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("question-sync-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: assetDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: assetDirectory) }
+        let allCandidates = try await makeUploadCandidates(manifest: &manifest, assetDirectory: assetDirectory)
         let candidates = Array(allCandidates.prefix(uploadBatchSize))
         guard !candidates.isEmpty else {
             // makeUploadCandidates may have retired stale immutable-operation entries even when
@@ -809,7 +820,8 @@ actor CloudLibrarySyncCoordinator {
     }
 
     private func makeUploadCandidates(
-        manifest: inout UploadManifest
+        manifest: inout UploadManifest,
+        assetDirectory: URL
     ) async throws -> [UploadCandidate] {
         guard let dataSource else { throw SyncError.noDataSource }
         var fullSnapshot = await dataSource.exportLibrarySnapshot()
@@ -1047,7 +1059,10 @@ actor CloudLibrarySyncCoordinator {
             record[Field.documentID] = operation.documentID as CKRecordValue
             record[Field.pageID] = operation.pageID as CKRecordValue
             record[Field.operationStamp] = stampData as CKRecordValue
-            record[Field.operationPayload] = payloadData as CKRecordValue
+            if manifest.entriesByKey[manifestKey(reference)]?.fingerprint != fingerprint
+                || manifest.entriesByKey[manifestKey(reference)]?.isTombstone != false {
+                try CloudOperationPayloadTransport.write(payloadData, to: record, directory: assetDirectory)
+            }
             currentCandidates[manifestKey(reference)] = UploadCandidate(
                 reference: reference,
                 fingerprint: fingerprint,
@@ -2091,7 +2106,7 @@ actor CloudLibrarySyncCoordinator {
                 let documentID = record[Field.documentID] as? String,
                 let pageID = record[Field.pageID] as? String,
                 let stampData = record[Field.operationStamp] as? Data,
-                let payloadData = record[Field.operationPayload] as? Data,
+                let payloadData = try? CloudOperationPayloadTransport.read(from: record),
                 let stamp = try? JSONDecoder().decode(CollaborationStamp.self, from: stampData),
                 let payload = try? JSONDecoder().decode(
                     CollaborationOperationPayload.self,
@@ -2332,7 +2347,7 @@ actor CloudLibrarySyncCoordinator {
         case RecordType.operation:
             return common + [
                 Field.workspaceID, Field.documentID, Field.pageID,
-                Field.operationStamp, Field.operationPayload
+                Field.operationStamp, Field.operationPayload, Field.operationPayloadAsset
             ]
         case RecordType.acknowledgement:
             return common + [

@@ -109,7 +109,6 @@ struct PDFDocumentTabBar: View {
         let tab = PDFDocumentTab(
             document: document,
             isActive: document.id == activeDocumentID,
-            canClose: openDocuments.count > 1,
             width: width,
             onSelect: {
                 guard draggedDocumentID == nil else { return }
@@ -391,7 +390,6 @@ struct DocumentToolbarActions: View {
 private struct PDFDocumentTab: View {
     let document: PDFWorkspaceDocument
     let isActive: Bool
-    let canClose: Bool
     let width: CGFloat
     let onSelect: () -> Void
     let onClose: () -> Void
@@ -423,21 +421,19 @@ private struct PDFDocumentTab: View {
             .accessibilityIdentifier("document-tab-\(document.title)")
             .accessibilityValue(isActive ? "active" : "inactive")
 
-            if canClose {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(
-                            isActive
-                                ? TiyiNoteTheme.documentChromeForeground.opacity(0.76)
-                                : TiyiNoteTheme.documentChromeMuted.opacity(0.74)
-                        )
-                        .frame(width: 28, height: 32)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("关闭 \(document.title)")
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(
+                        isActive
+                            ? TiyiNoteTheme.documentChromeForeground.opacity(0.76)
+                            : TiyiNoteTheme.documentChromeMuted.opacity(0.74)
+                    )
+                    .frame(width: 28, height: 32)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭 \(document.title)")
         }
         .padding(.leading, 16)
         .padding(.trailing, 10)
@@ -666,6 +662,8 @@ struct CollaborationConflictSheet: View {
                         .frame(maxHeight: 120)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+            case .question(let question):
+                Label(question.isCompleted ? "圈题作答（已完成）" : "圈题作答", systemImage: "questionmark.square.dashed")
             case .shape(let shape):
                 Label(shape.kind.title, systemImage: shape.kind.symbolName)
             }

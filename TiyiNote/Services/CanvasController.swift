@@ -65,7 +65,7 @@ final class CanvasController: NSObject, ObservableObject {
     private var erasedElements: [CanvasPageElement] = []
     private var eraserRadius: CGFloat = 9
     private var usesStrokeEraser = false
-    private var heldShape: (drawing: PKDrawing, kind: HeldInkShapeKind)?
+    private var heldShape: (drawing: PKDrawing, kind: HeldInkShapeKind, points: [CGPoint])?
     private var shapePreview: UIImageView?
     private var originalCanvasMask: CALayer?
     private var isShapePreviewVisible = false
@@ -88,7 +88,10 @@ final class CanvasController: NSObject, ObservableObject {
                                      y: point.y / scale + self.canvasWorldOrigin.y)
             if let element = self.pageElementsProvider?()
                 .filter({ element in
-                    guard case .shape = element.payload else { return false }
+                    switch element.payload {
+                    case .shape, .question: break
+                    default: return false
+                    }
                     return element.hitArea(tolerance: 14 / scale, displayScale: scale, includesInterior: true).contains(worldPoint)
                 })
                 .sorted(by: { $0.zIndex == $1.zIndex ? $0.id.uuidString < $1.id.uuidString : $0.zIndex < $1.zIndex }).last {
@@ -259,7 +262,7 @@ final class CanvasController: NSObject, ObservableObject {
         if !kind.usesInkSettings {
             cancelHeldInkRecognition()
         }
-        canvasView.drawingGestureRecognizer.isEnabled = kind != .lasso && kind != .text
+        canvasView.drawingGestureRecognizer.isEnabled = kind != .lasso && kind != .question && kind != .text
 
         switch kind {
         case .pen:
@@ -303,12 +306,13 @@ final class CanvasController: NSObject, ObservableObject {
             canvasView.tool = eraserMode == .stroke
                 ? PKEraserTool(.vector)
                 : PKEraserTool(.fixedWidthBitmap, width: eraserSize.width)
-        case .lasso, .text:
+        case .lasso, .question, .text:
             // Both modes belong to our object interaction layer. Installing PKLassoTool also
             // activates PencilKit's separate selection recognizers and its Select All / Insert
             // Space menu, even with drawingGestureRecognizer disabled and responder actions off.
             canvasView.tool = PKInkingTool(.monoline, color: .clear, width: 1)
         }
+        if kind == .question { canvasView.drawingGestureRecognizer.isEnabled = false }
         (canvasView as? TiyiPencilCanvasView)?.disableSystemEditingInteractions()
     }
 
@@ -812,6 +816,26 @@ final class CanvasController: NSObject, ObservableObject {
         guard isUsingTool,
               !hasActiveDrawingContact else { return }
 
+        if let shape = heldShape, shape.kind == .line,
+           let originCount = shapeGestureOriginStrokeCount {
+            // The public drawing excludes the live Pencil stroke. Once PencilKit has delivered
+            // it, straighten its locations only: native nib size, pressure, texture and color
+            // are the authority, not a conversion from the toolbar's base width.
+            let nativeStrokes = drawing.strokes
+            if nativeStrokes.count == originCount + 1,
+               let source = nativeStrokes.last {
+                let line = Self.straightenedStroke(source, endpoints: shape.points)
+                heldShape = (PKDrawing(strokes: Array(nativeStrokes.prefix(originCount)) + [line]),
+                             shape.kind, shape.points)
+            } else if postLiftDrawingRetryCount < 4 {
+                postLiftDrawingRetryCount += 1
+                let work = DispatchWorkItem { [weak self] in self?.finishShapeTrackingAfterPencilLift() }
+                toolInteractionEndWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
+                return
+            }
+        }
+
         let didChangeDrawing = toolInteractionDidChangeDrawing || heldShape != nil
         if !pendingScribbles.isEmpty {
             // Ordinary writing never snapshots the complete drawing here. A geometric candidate
@@ -919,7 +943,7 @@ final class CanvasController: NSObject, ObservableObject {
         guard selectedToolKind.usesInkSettings,
               let tool = canvasView.tool as? PKInkingTool else { return }
         shapeGestureOriginStrokeCount = knownStrokeCount + completedInkContactCount
-        shapeSnapInkStyle = ShapeSnapInkStyle(inkType: tool.inkType, color: tool.color, width: tool.width)
+        shapeSnapInkStyle = ShapeSnapInkStyle(ink: tool.ink, width: tool.width, azimuth: tool.azimuth)
     }
 
     private func finishShapeTrackingAfterPencilLift() {
@@ -975,7 +999,7 @@ final class CanvasController: NSObject, ObservableObject {
         let existing = drawing.strokes
         guard existing.count >= originCount, existing.count <= originCount + 1 else { return false }
         let snapped = PKDrawing(strokes: Array(existing.prefix(originCount)) + [stroke])
-        heldShape = (snapped, candidate.kind)
+        heldShape = (snapped, candidate.kind, worldPoints)
         // A second PKCanvasView renders its tiles asynchronously. Its first "finished" callback
         // can belong to the initial empty drawing, which briefly hides every existing stroke.
         // Rasterize only the visible ink synchronously, then swap a ready image in one transaction.
@@ -1027,12 +1051,16 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     private func regularStroke(points: [CGPoint], inkStyle: ShapeSnapInkStyle) -> PKStroke {
-        // Regular pen geometry has a uniform nib. PencilKit's pen control-point footprint
-        // includes a two-point brush border; passing a thin toolbar width directly makes it
-        // transparent. Textured pencil and highlighter strokes keep their original ink.
-        let inkType: PKInk.InkType = inkStyle.inkType == .fountainPen ? .monoline : inkStyle.inkType
-        let pointWidth = inkType == .monoline || inkType == .pen
-            ? 2 + max(inkStyle.width, 1) / 2 : max(inkStyle.width, 1)
+        // PencilKit's control-point footprint is not its tool width. Keep the selected ink
+        // throughout the hold; the completed native stroke supplies the final line's appearance.
+        let inkType = inkStyle.ink.inkType
+        let pointWidth: CGFloat
+        switch inkType {
+        case .monoline, .pen, .fountainPen: pointWidth = 2 + inkStyle.width
+        case .pencil: pointWidth = inkStyle.width / 2
+        case .marker: pointWidth = inkStyle.width * 2 / 3
+        default: pointWidth = inkStyle.width
+        }
         let size = CGSize(width: pointWidth, height: pointWidth)
         var renderingPoints: [CGPoint] = []
         for (index, point) in points.enumerated() {
@@ -1049,19 +1077,46 @@ final class CanvasController: NSObject, ObservableObject {
         }
         let controlPoints = renderingPoints.enumerated().map { index, point in
             PKStrokePoint(location: point, timeOffset: TimeInterval(index) * 0.012, size: size,
-                          opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+                          opacity: 1, force: 1,
+                          azimuth: inkType == .fountainPen ? inkStyle.azimuth : .pi / 2, altitude: .pi / 2)
         }
-        return PKStroke(ink: PKInk(inkType, color: inkStyle.color),
+        return PKStroke(ink: inkStyle.ink,
                         path: PKStrokePath(controlPoints: controlPoints, creationDate: Date()))
+    }
+
+    static func straightenedStroke(_ source: PKStroke, endpoints: [CGPoint]) -> PKStroke {
+        guard endpoints.count == 2, source.path.count >= 2 else { return source }
+        let samples = Array(source.path)
+        var distances = [CGFloat](repeating: 0, count: samples.count)
+        for index in 1..<samples.count {
+            let before = samples[index - 1].location.applying(source.transform)
+            let point = samples[index].location.applying(source.transform)
+            distances[index] = distances[index - 1] + hypot(point.x - before.x, point.y - before.y)
+        }
+        guard let length = distances.last, length > 0 else { return source }
+        let inverse = source.transform.inverted()
+        let start = endpoints[0], end = endpoints[1]
+        let points = samples.enumerated().map { index, sample in
+            let amount = distances[index] / length
+            let location = CGPoint(x: start.x + (end.x - start.x) * amount,
+                                   y: start.y + (end.y - start.y) * amount).applying(inverse)
+            return PKStrokePoint(location: location, timeOffset: sample.timeOffset, size: sample.size,
+                                 opacity: sample.opacity, force: sample.force, azimuth: sample.azimuth,
+                                 altitude: sample.altitude, secondaryScale: sample.secondaryScale,
+                                 threshold: sample.threshold)
+        }
+        return PKStroke(ink: source.ink,
+                        path: PKStrokePath(controlPoints: points, creationDate: source.path.creationDate),
+                        transform: source.transform, mask: source.mask, randomSeed: source.randomSeed)
     }
 
 
 }
 
 private struct ShapeSnapInkStyle {
-    let inkType: PKInk.InkType
-    let color: UIColor
+    let ink: PKInk
     let width: CGFloat
+    let azimuth: CGFloat
 }
 
 

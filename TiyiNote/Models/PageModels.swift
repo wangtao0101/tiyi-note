@@ -341,6 +341,7 @@ enum PageElementPayload: Codable, Hashable, Sendable {
     case text(PageTextPayload)
     case image(PageImagePayload)
     case shape(PageShapePayload)
+    case question(PageQuestionPayload)
 }
 
 /// Editable, object-level content stored next to the page's PencilKit drawing.

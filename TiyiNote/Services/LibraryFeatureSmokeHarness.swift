@@ -66,6 +66,8 @@ private enum LibraryFeatureSmokeHarness {
         defaults.removePersistentDomain(forName: defaultsName)
 
         do {
+            try validateHeldLineInkPreservation()
+            logger.info("TIYI_HELD_LINE_INK_PASS token=\(token, privacy: .public) cases=12")
             try validateCollaborationMerge()
             try validateConflictResolution(token: token)
             try validateDocumentReferenceMerge()
@@ -1288,6 +1290,76 @@ private enum LibraryFeatureSmokeHarness {
         guard !(controller.canvasView.tool is PKLassoTool),
               !controller.canvasView.drawingGestureRecognizer.isEnabled else {
             throw SmokeError.validationFailed("自定义套索未独占交互，或仍启用了系统套索")
+        }
+    }
+
+    private static func validateHeldLineInkPreservation() throws {
+        let kinds: [PKInk.InkType] = [.monoline, .fountainPen, .pencil, .marker]
+        for kind in kinds {
+            for width: CGFloat in [0.7, 2.2, 5] {
+                let ink = PKInk(kind, color: UIColor(red: 0.12, green: 0.35, blue: 0.72, alpha: 0.58))
+                let samples = (0..<9).map { index in
+                    let amount = CGFloat(index) / 8
+                    return PKStrokePoint(
+                        location: CGPoint(x: CGFloat(index) * 20, y: sin(amount * .pi * 3) * 2),
+                        timeOffset: Double(index) * 0.02,
+                        size: CGSize(width: width + amount, height: width + amount * 0.5),
+                        opacity: 0.3 + amount * 0.6, force: 0.2 + amount * 1.7,
+                        azimuth: amount * .pi, altitude: .pi / 3 + amount * 0.2,
+                        secondaryScale: 0.6 + amount * 0.4, threshold: amount * 0.15
+                    )
+                }
+                let transform = CGAffineTransform(a: 0.5, b: 0, c: 0, d: 0.5, tx: -6000, ty: -4000)
+                let source = PKStroke(ink: ink,
+                                      path: PKStrokePath(controlPoints: samples, creationDate: Date()),
+                                      transform: transform, mask: nil, randomSeed: 1234)
+                let endpoints = [CGPoint(x: -6000, y: -4010), CGPoint(x: -5920, y: -4010)]
+                let result = CanvasController.straightenedStroke(source, endpoints: endpoints)
+                guard result.ink.inkType == source.ink.inkType, result.ink.color == source.ink.color,
+                      result.transform == source.transform,
+                      result.randomSeed == source.randomSeed,
+                      result.path.creationDate == source.path.creationDate,
+                      result.path.count == source.path.count else {
+                    throw SmokeError.validationFailed("拉直改写了原生笔型、颜色、缩放或纹理")
+                }
+                for index in source.path.indices {
+                    let before = source.path[index], after = result.path[index]
+                    let worldPoint = after.location.applying(result.transform)
+                    guard abs(worldPoint.y - endpoints[0].y) < 0.001,
+                          worldPoint.x >= endpoints[0].x, worldPoint.x <= endpoints[1].x,
+                          abs(before.size.width - after.size.width) < 0.0001,
+                          // Rebuilding a noncircular nib can round its encoded aspect ratio
+                          // by one thousandth; this is independent of the selected tool width.
+                          abs(before.size.height - after.size.height) <= before.size.width * 0.0011,
+                          before.timeOffset == after.timeOffset,
+                          abs(before.opacity - after.opacity) < 0.0001,
+                          abs(before.force - after.force) < 0.0001,
+                          abs(before.azimuth - after.azimuth) < 0.0001,
+                          abs(before.altitude - after.altitude) < 0.0001,
+                          abs(before.secondaryScale - after.secondaryScale) < 0.0001,
+                          abs(before.threshold - after.threshold) < 0.0001 else {
+                        throw SmokeError.validationFailed("\(kind.rawValue) 拉直没有保留线宽、压感或颜色深浅")
+                    }
+                }
+                let decoded = try PKDrawing(data: PKDrawing(strokes: [result]).dataRepresentation())
+                let nativeArchive = try PKDrawing(data: PKDrawing(strokes: [source]).dataRepresentation())
+                // PencilKit may encode monoline under its legacy pen identifier. The snapped
+                // stroke must round-trip in exactly the same way as the untouched native ink.
+                guard let restored = decoded.strokes.first,
+                      let nativeRestored = nativeArchive.strokes.first,
+                      restored.ink.inkType == nativeRestored.ink.inkType,
+                      restored.path.count == result.path.count else {
+                    throw SmokeError.validationFailed("拉直后的笔型与采样点没有保留到保存数据")
+                }
+                var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+                // PencilKit quantizes color components in its archive. Compare the displayed
+                // RGBA values within one encoding step, rather than UIColor object equality.
+                guard restored.ink.color.getRed(&red, green: &green, blue: &blue, alpha: &alpha),
+                      zip([red, green, blue, alpha], [CGFloat(0.12), 0.35, 0.72, 0.58])
+                        .allSatisfy({ abs($0 - $1) <= 1 / 255 }) else {
+                    throw SmokeError.validationFailed("拉直后的颜色没有保留到保存数据")
+                }
+            }
         }
     }
 

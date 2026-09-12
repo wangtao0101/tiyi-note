@@ -67,7 +67,9 @@ struct TiyiNoteApp: App {
     var body: some Scene {
         WindowGroup {
 #if DEBUG
-            if let interactionConfiguration = TextInteractionUITestConfiguration() {
+            if ProcessInfo.processInfo.arguments.contains("--document-question-checks") {
+                DocumentQuestionChecksView()
+            } else if let interactionConfiguration = TextInteractionUITestConfiguration() {
                 if interactionConfiguration.token.hasPrefix("practice-sidebar") {
                     PracticeSidebarUITestHost(configuration: interactionConfiguration)
                 } else {

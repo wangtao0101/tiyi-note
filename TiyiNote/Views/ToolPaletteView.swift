@@ -46,6 +46,7 @@ struct ToolPaletteView: View {
     let canClearPage: Bool
     let onDocumentAction: (DocumentOutputAction) -> Void
     let onClearPage: () -> Void
+    var allowsQuestionCapture = false
 
     var body: some View {
         ZStack {
@@ -146,6 +147,12 @@ struct ToolPaletteView: View {
                                     onSelect: selectEraserMode
                                 )
                                 .presentationCompactAdaptation(.popover)
+                            }
+
+                            if allowsQuestionCapture {
+                                ToolButton(tool: .question, isSelected: selectedTool == .question) {
+                                    selectFirstLevelTool(.question)
+                                }
                             }
 
                             ToolButton(tool: .text, isSelected: selectedTool == .text) {

@@ -1897,7 +1897,7 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     func closeDocument(_ documentID: String) {
-        guard openDocumentIDs.count > 1 else { return }
+        guard openDocumentIDs.contains(documentID) else { return }
         openDocumentIDs.removeAll(where: { $0 == documentID })
         persistOpenDocuments()
     }
@@ -2147,7 +2147,7 @@ final class DrawingDocumentStore: ObservableObject {
     /// Produces one self-contained native document snapshot without leaving a temporary export
     /// behind. Automatic backup uses this entry point so a long-running library does not slowly
     /// fill its private Exports directory.
-    func editableDocumentPackageData(documentID: String) throws -> Data {
+    func editableDocumentPackageData(documentID: String, exportedAt: Date = Date()) throws -> Data {
         guard document(withID: documentID) != nil,
               let metadata = documentMetadata.first(where: { $0.id == documentID }),
               let sourceURL = fileURL(for: metadata) else {
@@ -2174,6 +2174,7 @@ final class DrawingDocumentStore: ObservableObject {
             )
         }
         let package = EditableDocumentPackage(
+            exportedAt: exportedAt,
             document: metadata,
             pages: documentPages,
             deletedPages: archivedPages,
@@ -2540,6 +2541,8 @@ final class DrawingDocumentStore: ObservableObject {
               bounds.height > 0,
               element.rotationRadians.isFinite else { return false }
         switch element.payload {
+        case .question(let question):
+            return question.isValid
         case .text(let text):
             return text.fontSize.isFinite && text.fontSize > 0 && text.fontSize <= 1_000
         case .image(let image):
@@ -4378,8 +4381,9 @@ final class DrawingDocumentStore: ObservableObject {
 
         let availableIDs = Set(documentMetadata.filter { $0.trashedAt == nil }.map(\.id))
         cancelPendingSaves(forDocumentsNotIn: availableIDs)
+        let hadOpenDocuments = !openDocumentIDs.isEmpty
         openDocumentIDs = uniqueAvailableDocumentIDs(openDocumentIDs, availableIDs: availableIDs)
-        if openDocumentIDs.isEmpty, let firstDocumentID = documents.first?.id {
+        if hadOpenDocuments, openDocumentIDs.isEmpty, let firstDocumentID = documents.first?.id {
             openDocumentIDs = [firstDocumentID]
         }
         pdfCache = pdfCache.filter { availableIDs.contains($0.key) }
@@ -4675,18 +4679,10 @@ final class DrawingDocumentStore: ObservableObject {
             try? applyRemoteDocumentReferences(Array(pendingDocumentReferences.values))
         }
 
-        let savedOpenIDs = userDefaults.stringArray(forKey: "pdfWorkspace.openDocumentIDs") ?? []
+        let savedOpenIDs = userDefaults.stringArray(forKey: "pdfWorkspace.openDocumentIDs")
         let availableIDs = Set(documents.filter { $0.trashedAt == nil }.map(\.id))
-        openDocumentIDs = uniqueAvailableDocumentIDs(savedOpenIDs, availableIDs: availableIDs)
-        if openDocumentIDs.isEmpty {
-            openDocumentIDs = documents.map(\.id)
-        } else {
-            for bundledDocument in documents where bundledDocument.isBundled {
-                if !openDocumentIDs.contains(bundledDocument.id) {
-                    openDocumentIDs.append(bundledDocument.id)
-                }
-            }
-        }
+        // A saved empty list means the user closed every tab; only a fresh workspace opens defaults.
+        openDocumentIDs = uniqueAvailableDocumentIDs(savedOpenIDs ?? documents.map(\.id), availableIDs: availableIDs)
         persistOpenDocuments()
     }
 
@@ -7762,6 +7758,8 @@ final class DrawingDocumentStore: ObservableObject {
             NSAttributedString(string: payload.text, attributes: attributes).draw(in: localRect)
         case .image(let payload):
             UIImage(data: payload.pngData)?.draw(in: localRect, blendMode: .normal, alpha: payload.opacity)
+        case .question:
+            break // Navigation markers and attached answers are not flattened into the source PDF.
         case .shape(let payload):
             drawExportShape(payload, in: localRect, context: context)
         }

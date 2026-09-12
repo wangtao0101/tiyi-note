@@ -8,6 +8,7 @@ enum CanvasToolKind: String, CaseIterable, Identifiable {
     case marker
     case eraser
     case lasso
+    case question
     case text
 
     var id: String { rawValue }
@@ -20,6 +21,7 @@ enum CanvasToolKind: String, CaseIterable, Identifiable {
         case .marker: "荧光笔"
         case .eraser: "橡皮擦"
         case .lasso: "套索"
+        case .question: "圈题"
         case .text: "文本"
         }
     }
@@ -31,6 +33,7 @@ enum CanvasToolKind: String, CaseIterable, Identifiable {
         case .pencil: "pencil"
         case .eraser: "eraser.fill"
         case .lasso: "lasso"
+        case .question: "questionmark.square.dashed"
         case .marker: "highlighter"
         case .text: "textformat"
         }
@@ -39,7 +42,7 @@ enum CanvasToolKind: String, CaseIterable, Identifiable {
     var usesInkSettings: Bool {
         switch self {
         case .pen, .fountainPen, .pencil, .marker: true
-        case .eraser, .lasso, .text: false
+        case .eraser, .lasso, .question, .text: false
         }
     }
 
@@ -48,7 +51,7 @@ enum CanvasToolKind: String, CaseIterable, Identifiable {
     var isPenVariant: Bool {
         switch self {
         case .pen, .fountainPen, .pencil: true
-        case .marker, .eraser, .lasso, .text: false
+        case .marker, .eraser, .lasso, .question, .text: false
         }
     }
 }

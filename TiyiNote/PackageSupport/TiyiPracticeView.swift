@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 import PDFKit
 
-public struct TiyiPracticeSection: Codable, Equatable, Identifiable, Sendable {
+public struct TiyiPracticeSection: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var label: String
     public var pageIDs: [String]
@@ -29,8 +29,8 @@ public struct TiyiPracticePageSeed {
 
 extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.Name("tiyi.practice.checkpoint") }
 
-/// An account-owned workspace with an unbounded canvas per answer page. This entry point has no CloudKit
-/// coordinator: the host owns account authentication and durable database synchronization.
+/// Reusable answer editor with an unbounded canvas per page. The caller owns persistence:
+/// either the account practice service or the originating iCloud document attachment.
 @MainActor public final class TiyiPracticeWorkspace: ObservableObject {
     let store: DrawingDocumentStore
     let defaults: UserDefaults
@@ -46,6 +46,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     public var onAnswer: ((String) -> Void)?
     @Published public var isCompleted = false
     public var onToggleCompleted: (() throws -> Void)?
+    var packageExportDate: Date?
     private let layoutURL: URL
 
     public init(directory: URL, title: String, sections: [TiyiPracticeSection], packageData: Data? = nil,
@@ -73,9 +74,8 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
                 for seed in seeds {
                     context.beginPage()
                     UIColor.white.setFill(); context.fill(bounds)
-                    let width: CGFloat = 696
-                    let height = seed.image.size.height * width / seed.image.size.width
-                    seed.image.draw(in: CGRect(x: 36, y: 36, width: width, height: min(1014, height)))
+                    let scale = min(696 / max(seed.image.size.width, 1), 1014 / max(seed.image.size.height, 1))
+                    seed.image.draw(in: CGRect(x: 36, y: 36, width: seed.image.size.width * scale, height: seed.image.size.height * scale))
                 }
             }
             defer { try? FileManager.default.removeItem(at: temporary) }
@@ -104,7 +104,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         NotificationCenter.default.post(name: .tiyiPracticeCheckpoint, object: store)
         guard store.flushAllPendingSaves() else { throw CocoaError(.fileWriteUnknown) }
         try reconcilePages()
-        let data = try store.editableDocumentPackageData(documentID: documentID)
+        let data = try store.editableDocumentPackageData(documentID: documentID, exportedAt: packageExportDate ?? Date())
         try onCheckpoint?(data, sections, currentPageID)
     }
 
@@ -204,18 +204,26 @@ struct PracticeEditorHeader: View {
     var body: some View {
         HStack(spacing: 8) {
             Button(action: onExit) { Image(systemName: "chevron.left").frame(width: 36, height: 44) }.accessibilityLabel("保存并返回").accessibilityIdentifier("practice-exit")
+            if workspace.sections.count == 1 {
+                Text(workspace.currentSection?.label ?? "作答").font(.system(size: 15, weight: .semibold))
+            } else {
             Menu {
                 ForEach(workspace.sections) { section in
                     Button(section.label) { if let id = section.pageIDs.first { workspace.selectPage(id) } }
                         .disabled(section.pageIDs.isEmpty)
                 }
             } label: { HStack(spacing: 4) { Text(workspace.currentSection?.label ?? "作答").font(.system(size: 15, weight: .semibold)); Image(systemName: "chevron.down").font(.caption2) } }.accessibilityIdentifier("practice-question-menu")
+            }
             Spacer(minLength: 0)
+            if workspace.sections.count > 1 {
             Button { workspace.step(-1) } label: { Image(systemName: "chevron.up").frame(width: 28, height: 44) }.accessibilityLabel("上一题")
             Button { workspace.step(1) } label: { Image(systemName: "chevron.down").frame(width: 28, height: 44) }.accessibilityLabel("下一题")
+            }
             Menu {
                 Button("插入作答页", systemImage: "doc.badge.plus") { do { try workspace.appendPage() } catch { workspace.errorMessage = error.localizedDescription } }.accessibilityIdentifier("practice-add-page")
-                Button("答案与解析", systemImage: "text.book.closed") { if let id = workspace.currentSection?.id { workspace.onAnswer?(id) } }
+                if workspace.onAnswer != nil {
+                    Button("答案与解析", systemImage: "text.book.closed") { if let id = workspace.currentSection?.id { workspace.onAnswer?(id) } }
+                }
                 Button(workspace.isCompleted ? "标记为未完成" : "标记完成", systemImage: "checkmark.circle") { do { try workspace.onToggleCompleted?() } catch { workspace.errorMessage = error.localizedDescription } }
             } label: { Image(systemName: "ellipsis").frame(width: 36, height: 44) }.accessibilityLabel("作答操作")
         }.padding(.horizontal, 6).frame(height: 44).background(TiyiNoteTheme.chrome)

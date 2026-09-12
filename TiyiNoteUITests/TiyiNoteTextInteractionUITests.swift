@@ -3,6 +3,77 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+    func testHeldInkPreservesSelectedInkStyle() throws {
+        let app = launchIsolatedApp(prefix: "shape-hold-style")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        func style() throws -> [String] {
+            let value = try XCTUnwrap(canvas.value as? String)
+            let field = try XCTUnwrap(value.components(separatedBy: "；").first { $0.hasPrefix("墨迹 ") })
+            let parts = String(field.dropFirst(3)).components(separatedBy: ",")
+            XCTAssertEqual(parts.count, 8)
+            return parts
+        }
+        let variants = [("pen", "com.apple.ink.monoline"),
+                        ("fountainPen", "com.apple.ink.fountainpen"),
+                        ("pencil", "com.apple.ink.pencil"), ("marker", "com.apple.ink.marker")]
+        var finalStyle: [String] = []
+        for (variant, inkType) in variants {
+            for preset in variant == "marker" ? [0] : [0, 1, 2] {
+                if variant == "marker" { app.buttons["tool-marker"].tap() }
+                else {
+                    app.buttons["tool-pen"].tap()
+                    app.buttons["pen-variant-\(variant)"].tap()
+                    app.buttons["ink-width-preset-\(preset)"].tap()
+                }
+                app.buttons[preset == 1 ? "ink-color-coral" : "ink-color-ocean"].tap()
+                var native: [String] = []
+                for held in [false, true] {
+                    let frame = canvas.frame
+                    let y = frame.minY + frame.height * (held ? 0.5 : 0.3)
+                    let points = (0...12).map { i in
+                        CGPoint(x: frame.minX + frame.width * (0.25 + CGFloat(i) / 12 * 0.45), y: y)
+                    }
+                    try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: held ? 1.15 : 0.04)
+                    waitForValue("笔迹 \(held ? 2 : 1)", of: canvas)
+                    let actual = try style()
+                    XCTAssertEqual(actual[0], inkType)
+                    if !held { native = actual; continue }
+                    waitForValueContaining("吸附 直线", of: canvas)
+                    // Compare real PencilKit freehand and held strokes at the same settings.
+                    // The old implementation changed the steel nib, scaled point sizes, and
+                    // replaced the pencil's native opacity with 1.
+                    XCTAssertEqual(Array(actual.prefix(5)), Array(native.prefix(5)), "\(variant) color/type")
+                    for index in 5...7 {
+                        XCTAssertEqual(try XCTUnwrap(Double(actual[index])),
+                                       try XCTUnwrap(Double(native[index])), accuracy: 0.05,
+                                       "\(variant) preset \(preset), nib component \(index)")
+                    }
+                    finalStyle = actual
+                    if preset == 0 {
+                        let image = XCTAttachment(screenshot: canvas.screenshot())
+                        image.name = "\(variant): native above, straightened below"
+                        image.lifetime = .keepAlways
+                        add(image)
+                    }
+                }
+                if variant != "marker" {
+                    app.buttons["撤销"].tap()
+                    waitForValue("笔迹 1", of: canvas)
+                    app.buttons["撤销"].tap()
+                    waitForValue("笔迹 0", of: canvas)
+                }
+            }
+        }
+        app.buttons["home-button"].tap()
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 2", of: canvas)
+        XCTAssertEqual(try style(), finalStyle, "Saved held ink must retain its appearance")
+    }
+
     func testRecordedRoundedPencilScribblesEraseAndPersistInNoteAndPractice() throws {
         struct PencilSample: Decodable { let name: String; let points: [[Double]] }
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "ScribbleErasePencilSamples", withExtension: "json"))
@@ -1557,6 +1628,30 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             "Simulator drag never reached the lasso recognizer"
         )
         XCTAssertEqual(feedback.label, "未选中内容")
+    }
+
+    func testPDFQuestionMarkerClosedLassoSelection() throws {
+        let app = launchIsolatedApp(prefix: "pdf-question-lasso")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 10))
+        app.buttons["tool-question"].tap()
+        let area = app.descendants(matching: .any)["question-capture-area"]
+        XCTAssertTrue(area.waitForExistence(timeout: 3))
+        area.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.2)).press(forDuration: 0.05,
+            thenDragTo: area.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.4)))
+        app.buttons["question-confirm"].tap()
+        XCTAssertTrue(app.buttons["practice-exit"].waitForExistence(timeout: 15))
+        app.buttons["practice-exit"].tap()
+        let marker = app.descendants(matching: .any)["question-marker"]
+        XCTAssertTrue(marker.waitForExistence(timeout: 10))
+        app.buttons["tool-lasso"].tap()
+        try synthesizeClosedTouchPath(around: marker.frame.insetBy(dx: -22, dy: -22), on: canvas, in: app)
+        let selection = app.descendants(matching: .any)["lasso-selection-box"]
+        XCTAssertTrue(selection.waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["question-selection-open"].exists)
+        XCTAssertTrue(app.buttons["删除"].isEnabled)
+        app.buttons["删除"].tap()
+        XCTAssertTrue(marker.waitForNonExistence(timeout: 3))
     }
 
     func testSimulatorClosedLassoSelectsAnExistingObject() throws {
@@ -3867,6 +3962,19 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         closeSecond.tap()
         XCTAssertTrue(secondTab.waitForNonExistence(timeout: 3))
         XCTAssertTrue(firstTab.exists)
+
+        let closeLast = app.buttons["关闭 UITest One"]
+        XCTAssertTrue(closeLast.waitForExistence(timeout: 3))
+        closeLast.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["document-library"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.descendants(matching: .any)["document-tab-bar"].exists)
+        // Closing a tab keeps the document in the library and it can be opened again.
+        let document = app.staticTexts["UITest One"].firstMatch
+        XCTAssertTrue(document.waitForExistence(timeout: 3))
+        document.tap()
+        XCTAssertTrue(firstTab.waitForExistence(timeout: 5))
+        XCTAssertFalse(secondTab.exists)
+        XCTAssertTrue(closeLast.exists)
 
         let home = app.buttons["home-button"]
         XCTAssertTrue(home.waitForExistence(timeout: 3))

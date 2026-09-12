@@ -21,6 +21,7 @@ struct PDFDocumentReaderView: View {
     let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
     let practice: TiyiPracticeWorkspace?
+    let onOpenQuestionSession: (DocumentQuestionSession) -> Void
     let onSelectLassoTool: () -> Void
     let onSelectTextTool: () -> Void
     let onActiveCanvasChanged: (CanvasController, Int) -> Void
@@ -56,6 +57,7 @@ struct PDFDocumentReaderView: View {
         isAnnotationEditingEnabled: Bool = true,
         practice: TiyiPracticeWorkspace? = nil,
         initialPageIndex: Int,
+        onOpenQuestionSession: @escaping (DocumentQuestionSession) -> Void,
         onSelectLassoTool: @escaping () -> Void,
         onSelectTextTool: @escaping () -> Void,
         onActiveCanvasChanged: @escaping (CanvasController, Int) -> Void
@@ -75,6 +77,7 @@ struct PDFDocumentReaderView: View {
         self.isScribbleEraseEnabled = isScribbleEraseEnabled
         self.isAnnotationEditingEnabled = isAnnotationEditingEnabled
         self.practice = practice
+        self.onOpenQuestionSession = onOpenQuestionSession
         self.onSelectLassoTool = onSelectLassoTool
         self.onSelectTextTool = onSelectTextTool
         self.onActiveCanvasChanged = onActiveCanvasChanged
@@ -239,6 +242,8 @@ struct PDFDocumentReaderView: View {
             eraserMode: eraserMode,
             isScribbleEraseEnabled: isScribbleEraseEnabled,
             isAnnotationEditingEnabled: isAnnotationEditingEnabled,
+            allowsQuestionCapture: practice == nil,
+            onOpenQuestionSession: onOpenQuestionSession,
             onSelectLassoTool: onSelectLassoTool,
             onSelectTextTool: onSelectTextTool,
             onFingerPinchChanged: updateFingerPinch,
@@ -538,6 +543,8 @@ private struct PDFPageAnnotationView: View {
     let eraserMode: CanvasEraserMode
     let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
+    let allowsQuestionCapture: Bool
+    let onOpenQuestionSession: (DocumentQuestionSession) -> Void
     let onSelectLassoTool: () -> Void
     let onSelectTextTool: () -> Void
     let onFingerPinchChanged: (CGFloat) -> Void
@@ -580,6 +587,7 @@ private struct PDFPageAnnotationView: View {
     @State private var shapeFillColorDraft = InkPaletteColor.ocean
     @State private var shapeLineWidthDraft = 3.0
     @State private var shapeDashedDraft = false
+    @State private var questionError: String?
 
     private var controller: CanvasController {
         controllerHolder.controller
@@ -668,7 +676,17 @@ private struct PDFPageAnnotationView: View {
                 .accessibilityLabel("第 \(pageIndex + 1) 页批注画布")
                 .accessibilityIdentifier("page-canvas-\(pageIndex)")
                 .accessibilityValue(canvasAccessibilityValue)
-                .allowsHitTesting(isAnnotationEditingEnabled)
+                .allowsHitTesting(isAnnotationEditingEnabled && selectedTool != .question)
+
+                if allowsQuestionCapture && isAnnotationEditingEnabled && selectedTool != .question {
+                    ForEach(pageElements.filter { $0.question != nil }.sorted(by: pageElementSort)) { element in
+                        let rect = projection.displayRect(element.logicalBounds, displaySize: geometry.size)
+                        QuestionMarkerView(isCompleted: element.question?.isCompleted == true)
+                            .frame(width: rect.width, height: rect.height)
+                            .rotationEffect(.radians(element.rotationRadians))
+                            .position(x: rect.midX, y: rect.midY)
+                    }
+                }
 
                 LassoSelectionOverlay(
                     controller: controller,
@@ -692,13 +710,21 @@ private struct PDFPageAnnotationView: View {
                     onSelectTextTool: onSelectTextTool,
                     onEditTextElement: beginEditingText,
                     onCropImageElement: beginCroppingImage,
-                    onEditShapeElement: beginEditingShape
+                    onEditShapeElement: beginEditingShape,
+                    onOpenQuestion: openQuestion
                 )
                 // Text editing and lasso selection are two different interaction
                 // modes. Recreate the overlay when the tool changes so gesture and
                 // selection state from the previous mode cannot survive invisibly
                 // and reappear after a later tap.
                 .id("page-interaction-\(pageID)-\(selectedTool.rawValue)")
+
+                if allowsQuestionCapture && isAnnotationEditingEnabled {
+                    if selectedTool == .question && allowsInitialPDFRenderDuringHandwriting {
+                        QuestionCaptureOverlay(projection: projection, onConfirm: captureQuestion)
+                            .id("question-capture-\(pageID)")
+                    }
+                }
 
                 if editingTextElementID != nil {
                     Color.black.opacity(0.001)
@@ -751,6 +777,13 @@ private struct PDFPageAnnotationView: View {
 
     var body: some View {
         interactivePageCanvas
+        .onReceive(NotificationCenter.default.publisher(for: .documentQuestionDismissed)) { notification in
+            guard let store = notification.object as? DrawingDocumentStore, store === documentStore else { return }
+            reloadQuestionElements()
+        }
+        .alert("圈题", isPresented: Binding(get: { questionError != nil }, set: { if !$0 { questionError = nil } })) {
+            Button("好", role: .cancel) { questionError = nil }
+        } message: { Text(questionError ?? "") }
         .onChange(of: pageIndex) { oldIndex, newIndex in
             onRelease(controller, oldIndex)
             onReady(controller, newIndex)
@@ -834,6 +867,7 @@ private struct PDFPageAnnotationView: View {
             drawingPersistence.needsSnapshotCompaction = false
             arePageElementsDirty = false
             drawingPersistence.hasLoadedDrawing = true
+            normalizeQuestionMarkers()
         }
 
         controller.pageElementsProvider = { pageElements }
@@ -935,7 +969,8 @@ private struct PDFPageAnnotationView: View {
     }
 
     private var drawingGeometryAccessibilityValue: String {
-        let bounds = controller.drawing.bounds
+        let drawing = controller.drawing
+        let bounds = drawing.bounds
         guard !bounds.isNull, !bounds.isInfinite else { return "范围 空" }
         return String(
             format: "范围 %.2f,%.2f,%.2f,%.2f",
@@ -943,7 +978,16 @@ private struct PDFPageAnnotationView: View {
             bounds.minY,
             bounds.width,
             bounds.height
-        )
+        ) + (drawing.strokes.last.flatMap { stroke -> String? in
+            guard !stroke.path.isEmpty else { return nil }
+            let point = stroke.path[stroke.path.count / 2]
+            var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+            stroke.ink.color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+            return "；墨迹 \(stroke.ink.inkType.rawValue)," + String(
+                format: "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                red, green, blue, alpha, point.size.width, point.size.height, point.opacity
+            )
+        } ?? "")
     }
 
     private func releasePageCanvas() {
@@ -986,6 +1030,55 @@ private struct PDFPageAnnotationView: View {
             eraserSize: eraserSize,
             eraserMode: eraserMode
         )
+    }
+
+    private func captureQuestion(_ rect: CGRect) {
+        guard allowsQuestionCapture, isAnnotationEditingEnabled,
+              let page = documentStore.page(at: resolvedPageIndex, in: documentID) else { return }
+        controller.finishEndedInteractionForCheckpoint()
+        persistPendingPageChanges()
+        guard documentStore.flushAllPendingSaves(),
+              let snapshot = LassoSnapshotRenderer.render(page: page, drawing: controller.drawing,
+                pageElements: pageElements, cropRect: rect, logicalPageSize: logicalPageSize,
+                canvasBackground: canvasBackground),
+              let png = snapshot.image.pngData() else {
+            questionError = "无法保存当前页面或截取题目，请重试。"
+            return
+        }
+        let element = CanvasPageElement(logicalBounds: CGRect(x: rect.midX - 16, y: rect.midY - 16, width: 32, height: 32), isLocked: false,
+                                        payload: .question(PageQuestionPayload(snapshotPNG: png, sourceBounds: rect, markerUsesLasso: true)))
+        do {
+            let session = try DocumentQuestionSession(store: documentStore, documentID: documentID,
+                                                       pageID: pageID, element: element, isNew: true)
+            reloadQuestionElements()
+            onSelectLassoTool()
+            onOpenQuestionSession(session)
+        } catch { questionError = error.localizedDescription }
+    }
+
+    private func openQuestion(_ element: CanvasPageElement) {
+        guard allowsQuestionCapture, isAnnotationEditingEnabled else { return }
+        persistPendingPageChanges()
+        do {
+            let session = try DocumentQuestionSession(store: documentStore, documentID: documentID,
+                                                       pageID: pageID, element: element)
+            onOpenQuestionSession(session)
+        } catch { questionError = error.localizedDescription }
+    }
+
+    private func reloadQuestionElements() {
+        pageElements = documentStore.loadPageElements(forPage: resolvedPageIndex, in: documentID)
+        submittedPageElements = pageElements
+        elementCollaborationContext = documentStore.collaborationFrontier(forPage: resolvedPageIndex, in: documentID)
+        normalizeQuestionMarkers()
+    }
+
+    private func normalizeQuestionMarkers() {
+        guard allowsQuestionCapture, isAnnotationEditingEnabled else { return }
+        let normalized = pageElements.map { $0.normalizedQuestionMarker }
+        guard normalized != pageElements else { return }
+        pageElements = normalized
+        markPageElementsChanged()
     }
 
     private func markPageElementsChanged(
@@ -1775,6 +1868,7 @@ private struct PDFPageAnnotationView: View {
                 in: documentID
             )
             arePageElementsDirty = false
+            normalizeQuestionMarkers()
         }
 
         drawingPersistence.loadedPageAssetRevision = revision
@@ -2403,6 +2497,8 @@ private struct PageElementView: View {
     @ViewBuilder
     var body: some View {
         switch element.payload {
+        case .question:
+            EmptyView()
         case .text(let payload):
             Text(payload.text)
                 .font(
@@ -2481,6 +2577,8 @@ private extension PageTextPayload {
 private extension CanvasPageElement {
     var accessibilityIdentifier: String {
         switch payload {
+        case .question:
+            "page-element-question"
         case .text:
             "page-element-text"
         case .image:
@@ -2492,6 +2590,8 @@ private extension CanvasPageElement {
 
     var accessibilityValue: String {
         switch payload {
+        case .question(let payload):
+            payload.isCompleted ? "圈题；已完成" : "圈题；未完成"
         case .text(let payload):
             [
                 "字体 \(payload.fontName)",
@@ -2609,6 +2709,7 @@ private struct LassoSelectionOverlay: View {
     let onEditTextElement: (UUID) -> Void
     let onCropImageElement: (UUID) -> Void
     let onEditShapeElement: (UUID) -> Void
+    let onOpenQuestion: (CanvasPageElement) -> Void
 
     @State private var liveLassoPath: [CGPoint] = []
     @State private var selection: LassoStrokeSelection?
@@ -2666,6 +2767,9 @@ private struct LassoSelectionOverlay: View {
 
                     if allowsLassoCreation, let selection, !isEditingText {
                         LassoActionBar(
+                            canOpenQuestion: selectedQuestionElement != nil,
+                            showsObjectActions: !selectionContainsQuestionElement,
+                            onOpenQuestion: { if let element = selectedQuestionElement { onOpenQuestion(element) } },
                             canEditText: selectedEditableTextID != nil,
                             canCropImage: selectedCroppableImageID != nil,
                             canEditShape: selectedEditableShapeID != nil,
@@ -2805,6 +2909,17 @@ private struct LassoSelectionOverlay: View {
         clearSelection()
     }
 
+    private var selectionContainsQuestionElement: Bool {
+        guard let selection else { return false }
+        return pageElements.contains { selection.content.elementIDs.contains($0.id) && $0.question != nil }
+    }
+
+    private var selectedQuestionElement: CanvasPageElement? {
+        guard let selection, selection.content.strokeIndices.isEmpty,
+              selection.content.elementIDs.count == 1 else { return nil }
+        return pageElements.first { selection.content.elementIDs.contains($0.id) && $0.question != nil }
+    }
+
     private var selectedEditableTextID: UUID? {
         guard let selection,
               selection.content.strokeIndices.isEmpty,
@@ -2841,7 +2956,7 @@ private struct LassoSelectionOverlay: View {
     private var selectionContainsLockedElement: Bool {
         guard let selection else { return false }
         return pageElements.contains {
-            selection.content.elementIDs.contains($0.id) && $0.isLocked
+            selection.content.elementIDs.contains($0.id) && $0.isLocked && $0.question == nil
         }
     }
 
@@ -2931,14 +3046,16 @@ private struct LassoSelectionOverlay: View {
                 .allowsHitTesting(false)
         }
 
-        Path { path in
-            path.move(to: boxBottom)
-            path.addLine(to: rotationAnchor)
+        if !selectionContainsQuestionElement {
+            Path { path in
+                path.move(to: boxBottom)
+                path.addLine(to: rotationAnchor)
+            }
+            .stroke(TiyiNoteTheme.lassoBlue.opacity(0.78), lineWidth: 1)
+            .allowsHitTesting(false)
         }
-        .stroke(TiyiNoteTheme.lassoBlue.opacity(0.78), lineWidth: 1)
-        .allowsHitTesting(false)
 
-        if !selectionContainsLockedElement {
+        if !selectionContainsLockedElement && !selectionContainsQuestionElement {
             ForEach(LassoResizeHandle.allCases) { handle in
                 Circle()
                     .fill(Color.white)
@@ -3456,7 +3573,8 @@ private struct LassoSelectionOverlay: View {
                   pageElements: pageElements,
                   cropRect: selection.axisAlignedBounds.insetBy(dx: -4, dy: -4),
                   logicalPageSize: logicalPageSize,
-                  canvasBackground: canvasBackground
+                  canvasBackground: canvasBackground,
+                  includesQuestionMarkers: true
               ) else { return }
         TiyiAnnotationPasteboard.copy(snapshot.image, logicalSize: snapshot.logicalSize)
     }
@@ -3846,32 +3964,12 @@ private struct LassoSelectionOverlay: View {
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
     ) -> CGPoint {
-        let rawBounds = displayRect(for: selection.axisAlignedBounds, in: displaySize)
-        let bounds = rawBounds.insetBy(dx: -max(0, (44 - rawBounds.width) / 2),
-                                      dy: -max(0, (44 - rawBounds.height) / 2))
-        let halfToolbarWidth: CGFloat = selectedEditableTextID != nil
-            || selectedCroppableImageID != nil
-            || selectedEditableShapeID != nil
-            ? 150
-            : 128
-        let x = min(
-            max(bounds.midX, halfToolbarWidth + 8),
-            displaySize.width - halfToolbarWidth - 8
+        SelectionActionBarLayout.position(
+            bounds: displayRect(for: selection.axisAlignedBounds, in: displaySize),
+            displaySize: displaySize,
+            halfWidth: selectionContainsQuestionElement ? (selectedQuestionElement != nil ? 39 : 21)
+                : (selectedEditableTextID != nil || selectedCroppableImageID != nil || selectedEditableShapeID != nil ? 150 : 128)
         )
-        let toolbarHalfHeight: CGFloat = 22
-        let gap: CGFloat = 8
-        let y: CGFloat
-        if bounds.minY >= toolbarHalfHeight * 2 + gap * 2 {
-            y = bounds.minY - toolbarHalfHeight - gap
-        } else if displaySize.height - bounds.maxY >= toolbarHalfHeight * 2 + gap * 2 {
-            y = bounds.maxY + toolbarHalfHeight + gap
-        } else {
-            y = min(
-                max(bounds.midY, toolbarHalfHeight + gap),
-                displaySize.height - toolbarHalfHeight - gap
-            )
-        }
-        return CGPoint(x: x, y: y)
     }
 
     private func feedbackPosition(
@@ -3992,6 +4090,9 @@ private enum LassoResizeHandle: String, CaseIterable, Identifiable {
 }
 
 private struct LassoActionBar: View {
+    let canOpenQuestion: Bool
+    let showsObjectActions: Bool
+    let onOpenQuestion: () -> Void
     let canEditText: Bool
     let canCropImage: Bool
     let canEditShape: Bool
@@ -4015,6 +4116,10 @@ private struct LassoActionBar: View {
 
     var body: some View {
         HStack(spacing: 2) {
+            if canOpenQuestion {
+                actionButton(title: "进入作答", symbol: "pencil.circle", tint: TiyiNoteTheme.textPrimary, action: onOpenQuestion)
+                    .accessibilityIdentifier("question-selection-open")
+            }
             if canEditText {
                 actionButton(
                     title: "编辑",
@@ -4046,63 +4151,85 @@ private struct LassoActionBar: View {
                 isEnabled: canModifySelection,
                 action: onDelete
             )
-            actionButton(
-                title: "复制",
-                symbol: "doc.on.doc",
-                tint: canModifySelection ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textTertiary,
-                isEnabled: canModifySelection,
-                action: onDuplicate
-            )
-            actionButton(
-                title: "拷贝",
-                symbol: "doc.on.clipboard",
-                tint: TiyiNoteTheme.textPrimary,
-                action: onCopy
-            )
-            actionButton(
-                title: "截图",
-                symbol: "camera.viewfinder",
-                tint: TiyiNoteTheme.textPrimary,
-                action: onScreenshot
-            )
-            if hasSelectedElements {
-                Menu {
-                    Button(action: onToggleLock) {
-                        Label(isLocked ? "解锁" : "锁定", systemImage: isLocked ? "lock.open" : "lock")
+            if showsObjectActions {
+                actionButton(
+                    title: "复制",
+                    symbol: "doc.on.doc",
+                    tint: canModifySelection ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textTertiary,
+                    isEnabled: canModifySelection,
+                    action: onDuplicate
+                )
+                actionButton(
+                    title: "拷贝",
+                    symbol: "doc.on.clipboard",
+                    tint: TiyiNoteTheme.textPrimary,
+                    action: onCopy
+                )
+                actionButton(
+                    title: "截图",
+                    symbol: "camera.viewfinder",
+                    tint: TiyiNoteTheme.textPrimary,
+                    action: onScreenshot
+                )
+                if hasSelectedElements {
+                    Menu {
+                        Button(action: onToggleLock) {
+                            Label(isLocked ? "解锁" : "锁定", systemImage: isLocked ? "lock.open" : "lock")
+                        }
+                        Button(action: onBringToFront) {
+                            Label("移到最前", systemImage: "square.3.layers.3d.top.filled")
+                        }
+                        .disabled(!canModifySelection)
+                        Button(action: onSendToBack) {
+                            Label("移到最后", systemImage: "square.3.layers.3d.bottom.filled")
+                        }
+                        .disabled(!canModifySelection)
+                        Divider()
+                        Button(action: onGroup) {
+                            Label("组合", systemImage: "square.3.layers.3d")
+                        }
+                        .disabled(!canGroup)
+                        Button(action: onUngroup) {
+                            Label("取消组合", systemImage: "square.2.layers.3d")
+                        }
+                        .disabled(!canUngroup)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: isLocked ? "lock.fill" : "ellipsis.circle")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("对象")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundStyle(TiyiNoteTheme.textPrimary)
+                        .padding(.horizontal, 9)
+                        .frame(height: 34)
+                        .contentShape(Rectangle())
                     }
-                    Button(action: onBringToFront) {
-                        Label("移到最前", systemImage: "square.3.layers.3d.top.filled")
-                    }
-                    .disabled(!canModifySelection)
-                    Button(action: onSendToBack) {
-                        Label("移到最后", systemImage: "square.3.layers.3d.bottom.filled")
-                    }
-                    .disabled(!canModifySelection)
-                    Divider()
-                    Button(action: onGroup) {
-                        Label("组合", systemImage: "square.3.layers.3d")
-                    }
-                    .disabled(!canGroup)
-                    Button(action: onUngroup) {
-                        Label("取消组合", systemImage: "square.2.layers.3d")
-                    }
-                    .disabled(!canUngroup)
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: isLocked ? "lock.fill" : "ellipsis.circle")
-                            .font(.system(size: 12, weight: .semibold))
-                        Text("对象")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .foregroundStyle(TiyiNoteTheme.textPrimary)
-                    .padding(.horizontal, 9)
-                    .frame(height: 34)
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("对象操作")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("对象操作")
             }
         }
+        .modifier(SelectionActionBarChrome())
+    }
+
+    private func actionButton(
+        title: String,
+        symbol: String,
+        tint: Color,
+        isEnabled: Bool = true,
+        action: @escaping () -> Void
+    ) -> some View {
+        SelectionActionButton(title: title, symbol: symbol, tint: tint, isEnabled: isEnabled, action: action)
+    }
+}
+
+
+/// Shared presentation for object selections and region capture.
+struct SelectionActionBarChrome: ViewModifier {
+    var identifier = "selection-action-bar"
+    func body(content: Content) -> some View {
+        content
         .padding(4)
         .background(
             TiyiNoteTheme.chrome.opacity(0.97),
@@ -4114,18 +4241,19 @@ private struct LassoActionBar: View {
                 .allowsHitTesting(false)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("对象操作栏")
-                .accessibilityIdentifier("selection-action-bar")
+                .accessibilityIdentifier(identifier)
         }
         .shadow(color: Color.black.opacity(0.28), radius: 7, y: 3)
     }
+}
 
-    private func actionButton(
-        title: String,
-        symbol: String,
-        tint: Color,
-        isEnabled: Bool = true,
-        action: @escaping () -> Void
-    ) -> some View {
+struct SelectionActionButton: View {
+    let title: String
+    let symbol: String
+    let tint: Color
+    var isEnabled = true
+    let action: () -> Void
+    var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 13, weight: .semibold))
@@ -4139,7 +4267,26 @@ private struct LassoActionBar: View {
     }
 }
 
-private struct LassoInputView: UIViewRepresentable {
+enum SelectionActionBarLayout {
+    static func position(bounds rawBounds: CGRect, displaySize: CGSize, halfWidth: CGFloat) -> CGPoint {
+        let bounds = rawBounds.insetBy(dx: -max(0, (44 - rawBounds.width) / 2),
+                                      dy: -max(0, (44 - rawBounds.height) / 2))
+        let x = min(max(bounds.midX, halfWidth + 8), displaySize.width - halfWidth - 8)
+        let halfHeight: CGFloat = 22
+        let gap: CGFloat = 8
+        let y: CGFloat
+        if bounds.minY >= halfHeight * 2 + gap * 2 {
+            y = bounds.minY - halfHeight - gap
+        } else if displaySize.height - bounds.maxY >= halfHeight * 2 + gap * 2 {
+            y = bounds.maxY + halfHeight + gap
+        } else {
+            y = min(max(bounds.midY, halfHeight + gap), displaySize.height - halfHeight - gap)
+        }
+        return CGPoint(x: x, y: y)
+    }
+}
+
+struct LassoInputView: UIViewRepresentable {
     let shouldBeginDrag: (CGPoint, UITouch.TouchType) -> Bool
     let onBegan: (CGPoint) -> Void
     let onMoved: (CGPoint) -> Void
@@ -4340,26 +4487,27 @@ private enum TiyiAnnotationPasteboard {
     }
 }
 
-private struct LassoSnapshot {
+struct LassoSnapshot {
     let image: UIImage
     let logicalSize: CGSize
 }
 
-private enum LassoSnapshotRenderer {
+enum LassoSnapshotRenderer {
     static func render(
         page: PDFPage,
         drawing: PKDrawing,
         pageElements: [CanvasPageElement],
         cropRect: CGRect,
         logicalPageSize: CGSize,
-        canvasBackground: LibraryPage? = nil
+        canvasBackground: LibraryPage? = nil,
+        includesQuestionMarkers: Bool = false
     ) -> LassoSnapshot? {
         let pageRect = CGRect(origin: .zero, size: logicalPageSize)
         let cropRect = (canvasBackground == nil ? cropRect.intersection(pageRect) : cropRect).integral
         guard !cropRect.isNull, cropRect.width > 1, cropRect.height > 1 else { return nil }
 
         let format = UIGraphicsImageRendererFormat()
-        format.scale = canvasBackground == nil ? 2 : min(2, 4096 / max(cropRect.width, cropRect.height))
+        format.scale = min(2, 4096 / max(cropRect.width, cropRect.height))
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: cropRect.size, format: format)
         let image = renderer.image { rendererContext in
@@ -4412,7 +4560,7 @@ private enum LassoSnapshotRenderer {
                     y: element.logicalBounds.midY - cropRect.minY
                 )
                 context.rotate(by: CGFloat(element.rotationRadians))
-                draw(element, in: context)
+                if includesQuestionMarkers || element.question == nil { draw(element, in: context) }
                 context.restoreGState()
             }
 
@@ -4430,6 +4578,11 @@ private enum LassoSnapshotRenderer {
             height: element.logicalBounds.height
         )
         switch element.payload {
+        case .question(let payload):
+            let inset = (1 - QuestionMarkerView.visualScale) / 2
+            UIImage(systemName: payload.isCompleted ? "checkmark.circle.fill" : "pencil.circle.fill")?
+                .withTintColor(.systemBlue, renderingMode: .alwaysOriginal)
+                .draw(in: rect.insetBy(dx: rect.width * inset, dy: rect.height * inset))
         case .image(let payload):
             guard let image = UIImage(data: payload.pngData) else { return }
             image.draw(in: rect, blendMode: .normal, alpha: payload.opacity)
