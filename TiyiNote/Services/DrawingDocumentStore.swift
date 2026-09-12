@@ -7688,11 +7688,13 @@ final class DrawingDocumentStore: ObservableObject {
         return paper.contains(content) ? paper : paper.union(content.insetBy(dx: -24, dy: -24)).integral
     }
 
-    private func renderFlattenedPage(
+    func renderFlattenedPage(
         documentID: String,
         pageIndex: Int,
         bounds: CGRect,
-        context: CGContext
+        context: CGContext,
+        includesAnnotations: Bool = true,
+        preservesPageElements: Bool = false
     ) {
         let size = pageSize(at: pageIndex, in: documentID)
         let isCanvas = document(withID: documentID)?.kind == .canvas
@@ -7733,12 +7735,15 @@ final class DrawingDocumentStore: ObservableObject {
             context.restoreGState()
         }
 
-        for element in loadPageElements(forPage: pageIndex, in: documentID).sorted(by: {
-            if $0.zIndex != $1.zIndex { return $0.zIndex < $1.zIndex }
-            return $0.id.uuidString < $1.id.uuidString
-        }) {
-            drawExportElement(element, in: context)
+        if includesAnnotations || preservesPageElements {
+            for element in loadPageElements(forPage: pageIndex, in: documentID).sorted(by: {
+                if $0.zIndex != $1.zIndex { return $0.zIndex < $1.zIndex }
+                return $0.id.uuidString < $1.id.uuidString
+            }) {
+                drawExportElement(element, in: context)
+            }
         }
+        guard includesAnnotations else { return }
 
         let drawing = loadDrawing(forPage: pageIndex, in: documentID)
         guard !drawing.strokes.isEmpty else { return }

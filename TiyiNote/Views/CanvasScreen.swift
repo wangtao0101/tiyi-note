@@ -1,8 +1,14 @@
 import SwiftUI
 import UIKit
+import Combine
 import UniformTypeIdentifiers
 
 struct CanvasScreen: View {
+    @Environment(\.tiyiAssistant) private var assistantIntegration
+    @State private var showsAssistant = false
+    @State private var assistantPageID: String?
+    @State private var assistantQuestionID: String?
+    @State private var assistantSelections: [TiyiAssistantSelectionEvent] = []
     @Environment(\.scenePhase) private var scenePhase
 
     @ObservedObject var documentStore: DrawingDocumentStore
@@ -73,67 +79,153 @@ struct CanvasScreen: View {
         )
     }
 
+    private var assistantContext: TiyiAssistantContext {
+        _ = assistantPageID
+        if var context = practice?.assistantContext?() {
+            context.selections += assistantSelections.map(\.image)
+            return context
+        }
+        let documentID = activeDocumentID
+        let pageIndex = activePageIndex
+        return TiyiAssistantContext(scope: .init(kind: "document", sourceId: documentID),
+            title: documentStore.document(withID: documentID)?.title ?? "文稿",
+            prompt: "当前文稿第 \(pageIndex + 1) 页。用户可在同一文稿讨论不同题目；当前问题以本轮附图为准，不要将历史题目的条件当作当前题目。",
+            selections: assistantSelections.map(\.image),
+            captureQuestion: {
+                if !assistantSelections.isEmpty {
+                    return try assistantSelections.map { selection in
+                        guard let index = documentStore.pageIndex(for: selection.pageID, in: documentID) else { throw CocoaError(.fileNoSuchFile) }
+                        return .init(id: selection.image.id, label: "题面",
+                            data: try documentStore.assistantImage(documentID: documentID, pageIndex: index, crop: selection.bounds, includesAnswer: false, preservesPageElements: true))
+                    }
+                }
+                return [.init(id: "page-\(pageIndex)", label: "题面", data: try documentStore.assistantImage(documentID: documentID, pageIndex: pageIndex, includesAnswer: false, preservesPageElements: true))]
+            },
+            capture: {
+                NotificationCenter.default.post(name: .tiyiPracticeCheckpoint, object: documentStore)
+                if !assistantSelections.isEmpty {
+                    return try assistantSelections.map { selection in
+                        guard let index = documentStore.pageIndex(for: selection.pageID, in: documentID) else { throw CocoaError(.fileNoSuchFile) }
+                        return .init(id: selection.image.id, label: selection.image.label,
+                            data: try documentStore.assistantImage(documentID: documentID, pageIndex: index, crop: selection.bounds))
+                    }
+                }
+                return [.init(id: "page-\(pageIndex)", label: "第 \(pageIndex + 1) 页", data: try documentStore.assistantImage(documentID: documentID, pageIndex: pageIndex))]
+            })
+    }
+
+    private var onAssistant: (() -> Void)? {
+        guard assistantIntegration != nil else { return nil }
+        return { showsAssistant.toggle() }
+    }
+
     var body: some View {
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                workspaceHeader
+                workspaceToolbar
+                AssistantSplitView(
+                    maximumWidth: min(480, geometry.size.width * 0.48),
+                    assistant: showsAssistant && geometry.size.width >= 900 ? assistantPanel : nil,
+                    canvas: canvasContent
+                )
+            }
+            .sheet(isPresented: Binding(get: { showsAssistant && geometry.size.width < 900 }, set: { if !$0 { showsAssistant = false } })) {
+                if let integration = assistantIntegration {
+                    integration.panel(assistantContext, { showsAssistant = false }).id(assistantContext.scope.key)
+                        .presentationDetents([.large])
+                        .presentationDragIndicator(.visible)
+                }
+            }
+        }
+        .ignoresSafeArea(.container, edges: .bottom)
+        .onReceive(practice?.$currentPageID.eraseToAnyPublisher() ?? Just(nil).eraseToAnyPublisher()) { pageID in
+            let questionID = practice?.sections.first { $0.pageIDs.contains(pageID ?? "") }?.id
+            if assistantQuestionID != questionID { assistantSelections = []; assistantQuestionID = questionID }
+            assistantPageID = pageID
+        }
+        .onChange(of: activeDocumentID) { _, _ in assistantSelections = []; showsAssistant = false }
+        .onReceive(NotificationCenter.default.publisher(for: .tiyiAssistantSelection)) { notification in
+            guard let value = notification.object as? TiyiAssistantSelectionEvent,
+                  value.documentID == activeDocumentID else { return }
+            assistantSelections.append(value)
+            assistantSelections = Array(assistantSelections.suffix(6))
+            showsAssistant = true
+        }
+    }
+
+    private var assistantPanel: AnyView? {
+        guard let integration = assistantIntegration else { return nil }
+        let context = assistantContext
+        return AnyView(integration.panel(context, { showsAssistant = false }).id(context.scope.key))
+    }
+
+    @ViewBuilder private var workspaceHeader: some View {
+        if let navigation {
+            PDFDocumentTabBar(openDocuments: navigation.tabs, activeDocumentID: navigation.selectedID,
+                onSelectDocument: navigation.onSelect, onCloseDocument: navigation.onClose,
+                onMoveDocument: navigation.onMove, onShowLibrary: onShowLibrary, libraryLabel: "返回讲义库",
+                onInteract: handout.map { workspace in { workspace.interact(at: activePageIndex) } },
+                actions: AnyView(HStack(spacing: 0) {
+                    navigation.actions
+                    if let practice { TiyiPracticeActions(workspace: practice) }
+                }))
+        } else if let practice {
+            PracticeEditorHeader(workspace: practice, onExit: onShowLibrary)
+        } else {
+            PDFDocumentTabBar(
+                openDocuments: documentStore.openDocuments.map { TiyiWorkspaceTab(id: $0.id, title: $0.title) },
+                activeDocumentID: activeDocumentID,
+                onSelectDocument: selectDocument,
+                onCloseDocument: closeDocument,
+                onMoveDocument: { sourceDocumentID, destinationDocumentID in
+                    documentStore.moveOpenDocument(sourceDocumentID, relativeTo: destinationDocumentID)
+                },
+                onShowLibrary: onShowLibrary,
+                libraryLabel: handout == nil ? "返回文稿" : "返回讲义库",
+                onInteract: handout.map { workspace in { workspace.interact(at: activePageIndex) } }
+            )
+        }
+    }
+
+    @ViewBuilder private var workspaceToolbar: some View {
+        if annotationEditingEnabled {
+            ToolPaletteView(
+                activeController: activeController,
+                selectedTool: $selectedTool,
+                selectedPenVariant: $selectedPenVariant,
+                eraserMode: $eraserMode,
+                isScribbleEraseEnabled: $isScribbleEraseEnabled,
+                showsThumbnails: thumbnailVisibility,
+                onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
+                onInsertImage: { showsImageImporter = true },
+                onInsertShape: insertShape,
+                hasActiveDocument: !activeDocumentID.isEmpty,
+                canClearPage: activeController != nil,
+                onDocumentAction: handleDocumentOutput,
+                onClearPage: requestClearCurrentPage,
+                allowsQuestionCapture: practice == nil && handout == nil,
+                onAssistant: onAssistant,
+                isAssistantOpen: showsAssistant
+            )
+        } else {
+            ReadOnlyToolPaletteView(
+                showsThumbnails: thumbnailVisibility,
+                onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
+                hasActiveDocument: !activeDocumentID.isEmpty,
+                onDocumentAction: handleDocumentOutput,
+                onAssistant: onAssistant,
+                isAssistantOpen: showsAssistant
+            )
+        }
+    }
+
+    private var canvasContent: some View {
         ZStack {
             TiyiNoteTheme.documentWorkspace
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                if let navigation {
-                    PDFDocumentTabBar(openDocuments: navigation.tabs, activeDocumentID: navigation.selectedID,
-                        onSelectDocument: navigation.onSelect, onCloseDocument: navigation.onClose,
-                        onMoveDocument: navigation.onMove, onShowLibrary: onShowLibrary, libraryLabel: "返回讲义库",
-                        onInteract: handout.map { workspace in { workspace.interact(at: activePageIndex) } },
-                        actions: AnyView(HStack(spacing: 0) {
-                            navigation.actions
-                            if let practice { TiyiPracticeActions(workspace: practice) }
-                        }))
-                } else if let practice {
-                    PracticeEditorHeader(workspace: practice, onExit: onShowLibrary)
-                } else {
-                PDFDocumentTabBar(
-                    openDocuments: documentStore.openDocuments.map { TiyiWorkspaceTab(id: $0.id, title: $0.title) },
-                    activeDocumentID: activeDocumentID,
-                    onSelectDocument: selectDocument,
-                    onCloseDocument: closeDocument,
-                    onMoveDocument: { sourceDocumentID, destinationDocumentID in
-                        documentStore.moveOpenDocument(
-                            sourceDocumentID,
-                            relativeTo: destinationDocumentID
-                        )
-                    },
-                    onShowLibrary: onShowLibrary,
-                    libraryLabel: handout == nil ? "返回文稿" : "返回讲义库",
-                    onInteract: handout.map { workspace in { workspace.interact(at: activePageIndex) } }
-                )
-                }
-
-                if annotationEditingEnabled {
-                    ToolPaletteView(
-                        activeController: activeController,
-                        selectedTool: $selectedTool,
-                        selectedPenVariant: $selectedPenVariant,
-                        eraserMode: $eraserMode,
-                        isScribbleEraseEnabled: $isScribbleEraseEnabled,
-                        showsThumbnails: thumbnailVisibility,
-                        onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
-                        onInsertImage: { showsImageImporter = true },
-                        onInsertShape: insertShape,
-                        hasActiveDocument: !activeDocumentID.isEmpty,
-                        canClearPage: activeController != nil,
-                        onDocumentAction: handleDocumentOutput,
-                        onClearPage: requestClearCurrentPage,
-                        allowsQuestionCapture: practice == nil && handout == nil
-                    )
-                } else {
-                    ReadOnlyToolPaletteView(
-                        showsThumbnails: thumbnailVisibility,
-                        onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
-                        hasActiveDocument: !activeDocumentID.isEmpty,
-                        onDocumentAction: handleDocumentOutput
-                    )
-                }
-
                 ZStack {
                     if let activeDocument = documentStore.document(withID: activeDocumentID) {
                         PDFDocumentReaderView(
@@ -570,5 +662,73 @@ private struct EmptyPDFWorkspaceView: View {
         }
         .foregroundStyle(TiyiNoteTheme.textPrimary)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Resize state stays here so pointer samples do not rebuild the document toolbar or resolve chat context.
+private struct AssistantSplitView<Canvas: View>: View {
+    let maximumWidth: CGFloat
+    let assistant: AnyView?
+    let canvas: Canvas
+    @State private var width: CGFloat = 390
+    @GestureState private var dragTranslation: CGFloat = 0
+    @Namespace private var coordinateSpace
+
+    private func clampedWidth(_ proposed: CGFloat) -> CGFloat {
+        min(maximumWidth, max(320, proposed))
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let assistant {
+                divider.zIndex(1)
+                assistant.frame(width: clampedWidth(clampedWidth(width) - dragTranslation))
+            }
+        }
+        .coordinateSpace(name: coordinateSpace)
+        // The divider tracks the finger immediately, including when inherited UI animations are active.
+        .transaction(value: dragTranslation) { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(TiyiNoteTheme.textTertiary.opacity(0.18))
+            .frame(width: 0.5)
+            .overlay {
+                Capsule()
+                    .fill(TiyiNoteTheme.documentWorkspace)
+                    .frame(width: 12, height: 44)
+                    .overlay {
+                        Capsule().fill(TiyiNoteTheme.textTertiary.opacity(0.55))
+                            .frame(width: 3, height: 22)
+                    }
+                    .overlay { Capsule().strokeBorder(TiyiNoteTheme.textTertiary.opacity(0.2), lineWidth: 0.5) }
+            }
+            .overlay {
+                Color.clear.frame(width: 28).contentShape(Rectangle())
+                    // The divider moves during resize; measuring in its local coordinates creates feedback jitter.
+                    .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named(coordinateSpace))
+                        .updating($dragTranslation) { value, translation, transaction in
+                            transaction.animation = nil
+                            translation = value.translation.width
+                        }
+                        .onEnded { value in
+                            width = clampedWidth(clampedWidth(width) - value.translation.width)
+                        })
+                    .accessibilityLabel("调整对话宽度")
+                    .accessibilityValue("\(Int(clampedWidth(clampedWidth(width) - dragTranslation)))")
+                    .accessibilityAdjustableAction { direction in
+                        switch direction {
+                        case .increment: width = clampedWidth(width + 20)
+                        case .decrement: width = clampedWidth(width - 20)
+                        @unknown default: break
+                        }
+                    }
+                    .accessibilityIdentifier("tiyi-assistant-resize")
+            }
     }
 }

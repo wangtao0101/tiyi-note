@@ -753,7 +753,12 @@ private struct PDFPageAnnotationView: View {
                     onEditTextElement: beginEditingText,
                     onCropImageElement: beginCroppingImage,
                     onEditShapeElement: beginEditingShape,
-                    onOpenQuestion: openQuestion
+                    onOpenQuestion: openQuestion,
+                    onAskAssistant: { data, bounds in
+                        NotificationCenter.default.post(name: .tiyiAssistantSelection,
+                            object: TiyiAssistantSelectionEvent(documentID: documentID,
+                                image: .init(id: UUID().uuidString, label: "第 \(pageIndex + 1) 页选区", data: data), pageID: pageID, bounds: bounds))
+                    }
                 )
                 // Text editing and lasso selection are two different interaction
                 // modes. Recreate the overlay when the tool changes so gesture and
@@ -2732,6 +2737,7 @@ private struct LassoSelectionRequest: Identifiable {
 }
 
 private struct LassoSelectionOverlay: View {
+    @Environment(\.tiyiAssistant) private var assistantIntegration
     /// Selection mutations drive this overlay through its own state and bindings. Controller
     /// history publications are consumed by the toolbar's history controls, not by this layer.
     let controller: CanvasController
@@ -2752,7 +2758,9 @@ private struct LassoSelectionOverlay: View {
     let onCropImageElement: (UUID) -> Void
     let onEditShapeElement: (UUID) -> Void
     let onOpenQuestion: (CanvasPageElement) -> Void
+    let onAskAssistant: (Data, CGRect) -> Void
 
+    @State private var assistantSelectionBounds: CGRect?
     @State private var liveLassoPath: [CGPoint] = []
     @State private var selection: LassoStrokeSelection?
     @State private var transformOriginSelection: LassoStrokeSelection?
@@ -2810,8 +2818,16 @@ private struct LassoSelectionOverlay: View {
                     if allowsLassoCreation, let selection, !isEditingText {
                         LassoActionBar(
                             canOpenQuestion: selectedQuestionElement != nil,
-                            showsObjectActions: !selectionContainsQuestionElement,
+                            showsObjectActions: !selectionContainsQuestionElement && !selection.content.isEmpty,
                             onOpenQuestion: { if let element = selectedQuestionElement { onOpenQuestion(element) } },
+                            onAskAssistant: assistantIntegration == nil ? nil : {
+                                guard let page, let image = LassoSnapshotRenderer.render(page: page,
+                                    drawing: controller.drawing, pageElements: pageElements,
+                                    cropRect: (assistantSelectionBounds ?? selection.axisAlignedBounds).insetBy(dx: -4, dy: -4),
+                                    logicalPageSize: logicalPageSize, canvasBackground: canvasBackground)?.image,
+                                    let data = image.jpegData(compressionQuality: 0.85) else { return }
+                                onAskAssistant(data, (assistantSelectionBounds ?? selection.axisAlignedBounds).insetBy(dx: -4, dy: -4))
+                            },
                             canEditText: selectedEditableTextID != nil,
                             canCropImage: selectedCroppableImageID != nil,
                             canEditShape: selectedEditableShapeID != nil,
@@ -3254,6 +3270,9 @@ private struct LassoSelectionOverlay: View {
             return
         }
 
+        let xs = completedPath.map(\.x), ys = completedPath.map(\.y)
+        assistantSelectionBounds = CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
+            width: (xs.max() ?? 0) - (xs.min() ?? 0), height: (ys.max() ?? 0) - (ys.min() ?? 0))
         let strokeIndices = controller.strokeIndices(inside: completedPath, tolerance: 3 / displayScale(in: displaySize))
         let directlySelectedElementIDs = Set(pageElements.compactMap { element in
             element.intersectsLasso(completedPath, tolerance: 3 / displayScale(in: displaySize),
@@ -3265,9 +3284,13 @@ private struct LassoSelectionOverlay: View {
             strokeIndices: strokeIndices,
             elementIDs: directlySelectedElementIDs
         ))
-        guard !content.isEmpty else {
-            selection = nil
-            showTransientFeedback("未选中内容")
+        if content.isEmpty {
+            guard assistantIntegration != nil else { selection = nil; showTransientFeedback("未选中内容"); return }
+            let xs = completedPath.map(\.x), ys = completedPath.map(\.y)
+            let region = CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
+                width: (xs.max() ?? 0) - (xs.min() ?? 0), height: (ys.max() ?? 0) - (ys.min() ?? 0))
+            guard region.width > 4, region.height > 4 else { selection = nil; return }
+            selection = LassoStrokeSelection(content: content, logicalBounds: region, rotationRadians: 0)
             return
         }
 
@@ -3627,6 +3650,7 @@ private struct LassoSelectionOverlay: View {
     }
 
     private func clearSelection() {
+        assistantSelectionBounds = nil
         controller.cancelStrokeTransform()
         liveLassoPath = []
         selection = nil
@@ -3830,6 +3854,7 @@ private struct LassoSelectionOverlay: View {
     }
 
     private func updateSelection(_ selection: LassoStrokeSelection) {
+        assistantSelectionBounds = nil
         self.selection = selection
     }
 
@@ -4135,6 +4160,7 @@ private struct LassoActionBar: View {
     let canOpenQuestion: Bool
     let showsObjectActions: Bool
     let onOpenQuestion: () -> Void
+    let onAskAssistant: (() -> Void)?
     let canEditText: Bool
     let canCropImage: Bool
     let canEditShape: Bool
@@ -4158,6 +4184,10 @@ private struct LassoActionBar: View {
 
     var body: some View {
         HStack(spacing: 2) {
+            if let onAskAssistant {
+                actionButton(title: "问 TIYI", symbol: "sparkles", tint: TiyiNoteTheme.textPrimary, action: onAskAssistant)
+                    .accessibilityIdentifier("lasso-ask-assistant")
+            }
             if canOpenQuestion {
                 actionButton(title: "进入作答", symbol: "pencil.circle", tint: TiyiNoteTheme.textPrimary, action: onOpenQuestion)
                     .accessibilityIdentifier("question-selection-open")
@@ -4186,6 +4216,7 @@ private struct LassoActionBar: View {
                     action: onEditShape
                 )
             }
+            if showsObjectActions || canOpenQuestion {
             actionButton(
                 title: "删除",
                 symbol: "trash",
@@ -4193,6 +4224,7 @@ private struct LassoActionBar: View {
                 isEnabled: canModifySelection,
                 action: onDelete
             )
+            }
             if showsObjectActions {
                 actionButton(
                     title: "复制",

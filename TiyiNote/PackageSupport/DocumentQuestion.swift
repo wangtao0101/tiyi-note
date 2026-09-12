@@ -103,6 +103,12 @@ enum CloudOperationPayloadTransport {
             packageData: payload.answerPackage,
             seeds: payload.answerPackage == nil ? [.init(questionID: sectionID, image: image)] : [],
             lastPageID: payload.lastPageID)
+        workspace.assistantContext = { [weak workspace] in
+            TiyiAssistantContext(scope: .init(kind: "document_question", sourceId: documentID, questionId: element.id.uuidString),
+                title: "圈题作答", prompt: "当前题目是从文稿圈选的题面。请以本轮题目图片和最新作答为准。",
+                captureQuestion: { [.init(id: "question", label: "题面", data: payload.snapshotPNG)] },
+                capture: { try workspace?.assistantImages() ?? [] })
+        }
         // Reject nested attachments even when loading an externally supplied editable package.
         guard workspace.store.pages(in: workspace.documentID).allSatisfy({ page in
             workspace.store.loadPageElements(forPage: page.orderIndex, in: workspace.documentID)

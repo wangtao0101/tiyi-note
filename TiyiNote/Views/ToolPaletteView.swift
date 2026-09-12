@@ -47,6 +47,8 @@ struct ToolPaletteView: View {
     let onDocumentAction: (DocumentOutputAction) -> Void
     let onClearPage: () -> Void
     var allowsQuestionCapture = false
+    var onAssistant: (() -> Void)? = nil
+    var isAssistantOpen = false
 
     var body: some View {
         ZStack {
@@ -60,7 +62,7 @@ struct ToolPaletteView: View {
                 let leadingControlsWidth: CGFloat = onSearch == nil ? 38 : 78
                 let dividerWidth: CGFloat = 5
                 let outerSpacing: CGFloat = 24
-                let trailingActionCount = 2
+                let trailingActionCount = onAssistant == nil ? 2 : 3
                 let trailingActionsWidth = CGFloat(trailingActionCount * 38)
                     + CGFloat(max(trailingActionCount - 1, 0))
                 let centerWidth = max(
@@ -188,12 +190,20 @@ struct ToolPaletteView: View {
                     .frame(width: centerWidth, height: 38)
                     .accessibilityIdentifier("tool-settings-scroll")
 
-                    DocumentToolbarActions(
-                        hasActiveDocument: hasActiveDocument,
-                        canClearPage: canClearPage,
-                        onDocumentAction: onDocumentAction,
-                        onClearPage: onClearPage
-                    )
+                    HStack(spacing: 1) {
+                        DocumentToolbarActions(
+                            hasActiveDocument: hasActiveDocument,
+                            canClearPage: canClearPage,
+                            onDocumentAction: onDocumentAction,
+                            onClearPage: onClearPage
+                        )
+                        if let onAssistant {
+                            DocumentToolbarButton(symbol: "sparkles", title: "TIYI 助手",
+                                isSelected: isAssistantOpen, action: onAssistant)
+                                .disabled(!hasActiveDocument)
+                                .accessibilityIdentifier("tiyi-assistant-open")
+                        }
+                    }
                     .fixedSize(horizontal: true, vertical: false)
                 }
                 .frame(width: max(geometry.size.width - horizontalPadding, 0), height: geometry.size.height)
@@ -468,6 +478,8 @@ struct ReadOnlyToolPaletteView: View {
     let onSearch: (() -> Void)?
     let hasActiveDocument: Bool
     let onDocumentAction: (DocumentOutputAction) -> Void
+    var onAssistant: (() -> Void)? = nil
+    var isAssistantOpen = false
 
     var body: some View {
         ZStack {
@@ -509,6 +521,12 @@ struct ReadOnlyToolPaletteView: View {
                     onDocumentAction: onDocumentAction,
                     onClearPage: {}
                 )
+                if let onAssistant {
+                    DocumentToolbarButton(symbol: "sparkles", title: "TIYI 助手",
+                        isSelected: isAssistantOpen, action: onAssistant)
+                        .disabled(!hasActiveDocument)
+                        .accessibilityIdentifier("tiyi-assistant-open")
+                }
             }
             .padding(.horizontal, 10)
         }

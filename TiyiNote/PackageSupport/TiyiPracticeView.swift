@@ -43,6 +43,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     @Published public var statusText = "已保存到本机"
     @Published public var errorMessage: String?
     public var onCheckpoint: ((Data, [TiyiPracticeSection], String?) throws -> Void)?
+    public var assistantContext: (() -> TiyiAssistantContext)?
     public var onAnswer: ((String) -> Void)?
     @Published public var isCompleted = false
     public var onToggleCompleted: (() throws -> Void)?

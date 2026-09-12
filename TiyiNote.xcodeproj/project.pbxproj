@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		98AD81270C2945D5911322B1 /* TiyiAssistant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98AD81270C2945D5911322B2 /* TiyiAssistant.swift */; };
 		DC1000000000000000000005 /* TiyiNoteQuestionUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC1000000000000000000006 /* TiyiNoteQuestionUITests.swift */; };
 		DC1000000000000000000003 /* DocumentQuestionChecks.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC1000000000000000000004 /* DocumentQuestionChecks.swift */; };
 		DC1000000000000000000001 /* DocumentQuestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC1000000000000000000002 /* DocumentQuestion.swift */; };
@@ -58,6 +59,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		98AD81270C2945D5911322B2 /* TiyiAssistant.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiAssistant.swift; path = PackageSupport/TiyiAssistant.swift; sourceTree = "<group>"; };
 		DC1000000000000000000006 /* TiyiNoteQuestionUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiNoteQuestionUITests.swift; path = TiyiNoteUITests/TiyiNoteQuestionUITests.swift; sourceTree = SOURCE_ROOT; };
 		DC1000000000000000000004 /* DocumentQuestionChecks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DocumentQuestionChecks.swift; path = Tests/DocumentQuestionChecks.swift; sourceTree = SOURCE_ROOT; };
 		DC1000000000000000000002 /* DocumentQuestion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DocumentQuestion.swift; path = PackageSupport/DocumentQuestion.swift; sourceTree = "<group>"; };
@@ -135,6 +137,7 @@
 				F65000000000000000000022 /* TiyiHandoutCanvas.swift */,
 				F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */,
 				DC1000000000000000000002 /* DocumentQuestion.swift */,
+				98AD81270C2945D5911322B2 /* TiyiAssistant.swift */,
 				DC1000000000000000000006 /* TiyiNoteQuestionUITests.swift */,
 				DC1000000000000000000004 /* DocumentQuestionChecks.swift */,
 				100000000000000000000403 /* App */,
@@ -337,7 +340,8 @@
 				F65000000000000000000021 /* TiyiHandoutCanvas.swift in Sources */,
 				F65000000000000000000023 /* TiyiWorkspaceNavigation.swift in Sources */,
 				DC1000000000000000000003 /* DocumentQuestionChecks.swift in Sources */,
-				DC1000000000000000000001 /* DocumentQuestion.swift in Sources */,
+					DC1000000000000000000001 /* DocumentQuestion.swift in Sources */,
+				98AD81270C2945D5911322B1 /* TiyiAssistant.swift in Sources */,
 				100000000000000000000101 /* TiyiNoteApp.swift in Sources */,
 				100000000000000000000102 /* CanvasTool.swift in Sources */,
 				100000000000000000000103 /* CanvasController.swift in Sources */,
