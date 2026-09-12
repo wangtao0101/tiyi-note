@@ -179,11 +179,12 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
 public struct TiyiPracticeEditor: View {
     @ObservedObject private var workspace: TiyiPracticeWorkspace
     private let onExit: () -> Void
-    public init(workspace: TiyiPracticeWorkspace, onExit: @escaping () -> Void) { self.workspace = workspace; self.onExit = onExit }
+    private let navigation: TiyiWorkspaceNavigation?
+    public init(workspace: TiyiPracticeWorkspace, onExit: @escaping () -> Void, navigation: TiyiWorkspaceNavigation? = nil) { self.workspace = workspace; self.onExit = onExit; self.navigation = navigation }
     public var body: some View {
         CanvasScreen(documentStore: workspace.store, onShowLibrary: {
             do { try workspace.checkpoint(); onExit() } catch { workspace.errorMessage = "保存失败：\(error.localizedDescription)" }
-        }, practice: workspace)
+        }, practice: workspace, navigation: navigation)
         .defaultAppStorage(workspace.defaults)
         .task {
             while !Task.isCancelled {
@@ -219,6 +220,16 @@ struct PracticeEditorHeader: View {
             Button { workspace.step(-1) } label: { Image(systemName: "chevron.up").frame(width: 28, height: 44) }.accessibilityLabel("上一题")
             Button { workspace.step(1) } label: { Image(systemName: "chevron.down").frame(width: 28, height: 44) }.accessibilityLabel("下一题")
             }
+            TiyiPracticeActions(workspace: workspace)
+        }.padding(.horizontal, 6).frame(height: 44).background(TiyiNoteTheme.chrome)
+    }
+}
+
+/// The same answer/add-page/completion actions in standalone and tabbed editors.
+public struct TiyiPracticeActions: View {
+    @ObservedObject private var workspace: TiyiPracticeWorkspace
+    public init(workspace: TiyiPracticeWorkspace) { self.workspace = workspace }
+    public var body: some View {
             Menu {
                 Button("插入作答页", systemImage: "doc.badge.plus") { do { try workspace.appendPage() } catch { workspace.errorMessage = error.localizedDescription } }.accessibilityIdentifier("practice-add-page")
                 if workspace.onAnswer != nil {
@@ -226,6 +237,5 @@ struct PracticeEditorHeader: View {
                 }
                 Button(workspace.isCompleted ? "标记为未完成" : "标记完成", systemImage: "checkmark.circle") { do { try workspace.onToggleCompleted?() } catch { workspace.errorMessage = error.localizedDescription } }
             } label: { Image(systemName: "ellipsis").frame(width: 36, height: 44) }.accessibilityLabel("作答操作")
-        }.padding(.horizontal, 6).frame(height: 44).background(TiyiNoteTheme.chrome)
     }
 }

@@ -44,6 +44,7 @@
 		100000000000000000000125 /* AutomaticBackupCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000227 /* AutomaticBackupCoordinator.swift */; };
 		100000000000000000000126 /* TiyiNoteTextInteractionUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000228 /* TiyiNoteTextInteractionUITests.swift */; };
 		F65000000000000000000021 /* TiyiHandoutCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = F65000000000000000000022 /* TiyiHandoutCanvas.swift */; };
+		F65000000000000000000023 /* TiyiWorkspaceNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -97,6 +98,7 @@
 		100000000000000000000228 /* TiyiNoteTextInteractionUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteTextInteractionUITests.swift; sourceTree = "<group>"; };
 		100000000000000000000229 /* TiyiNoteUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TiyiNoteUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F65000000000000000000022 /* TiyiHandoutCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiHandoutCanvas.swift; path = PackageSupport/TiyiHandoutCanvas.swift; sourceTree = "<group>"; };
+		F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiWorkspaceNavigation.swift; path = PackageSupport/TiyiWorkspaceNavigation.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -131,6 +133,7 @@
 			children = (
 				100000000000000000000233 /* TiyiPracticeView.swift */,
 				F65000000000000000000022 /* TiyiHandoutCanvas.swift */,
+				F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */,
 				DC1000000000000000000002 /* DocumentQuestion.swift */,
 				DC1000000000000000000006 /* TiyiNoteQuestionUITests.swift */,
 				DC1000000000000000000004 /* DocumentQuestionChecks.swift */,
@@ -332,6 +335,7 @@
 			files = (
 				100000000000000000000130 /* TiyiPracticeView.swift in Sources */,
 				F65000000000000000000021 /* TiyiHandoutCanvas.swift in Sources */,
+				F65000000000000000000023 /* TiyiWorkspaceNavigation.swift in Sources */,
 				DC1000000000000000000003 /* DocumentQuestionChecks.swift in Sources */,
 				DC1000000000000000000001 /* DocumentQuestion.swift in Sources */,
 				100000000000000000000101 /* TiyiNoteApp.swift in Sources */,

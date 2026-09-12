@@ -7,7 +7,7 @@ struct PDFDocumentTabBar: View {
     @State private var dragOriginIndex: Int?
     @State private var dragTranslationX: CGFloat = 0
 
-    let openDocuments: [PDFWorkspaceDocument]
+    let openDocuments: [TiyiWorkspaceTab]
     let activeDocumentID: String
     let onSelectDocument: (String) -> Void
     let onCloseDocument: (String) -> Void
@@ -15,6 +15,7 @@ struct PDFDocumentTabBar: View {
     let onShowLibrary: () -> Void
     var libraryLabel: String = "返回文稿"
     var onInteract: (() -> Void)? = nil
+    var actions: AnyView? = nil
 
     private var isCompact: Bool { horizontalSizeClass == .compact }
 
@@ -78,6 +79,7 @@ struct PDFDocumentTabBar: View {
                 }
             }
             .frame(maxWidth: .infinity)
+            if let actions { actions.foregroundStyle(TiyiNoteTheme.documentChromeForeground) }
             if let onInteract {
                 Button(action: onInteract) { Label("互动", systemImage: "hand.tap") }
                     .buttonStyle(.plain).font(.system(size: 13, weight: .semibold))
@@ -114,7 +116,7 @@ struct PDFDocumentTabBar: View {
     }
 
     @ViewBuilder
-    private func reorderableTab(_ document: PDFWorkspaceDocument, width: CGFloat) -> some View {
+    private func reorderableTab(_ document: TiyiWorkspaceTab, width: CGFloat) -> some View {
         let tab = PDFDocumentTab(
             document: document,
             isActive: document.id == activeDocumentID,
@@ -397,7 +399,7 @@ struct DocumentToolbarActions: View {
 }
 
 private struct PDFDocumentTab: View {
-    let document: PDFWorkspaceDocument
+    let document: TiyiWorkspaceTab
     let isActive: Bool
     let width: CGFloat
     let onSelect: () -> Void

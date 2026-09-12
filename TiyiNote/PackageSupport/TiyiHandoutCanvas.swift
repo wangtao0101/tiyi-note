@@ -156,11 +156,12 @@ enum HandoutAttachmentError: LocalizedError {
 public struct TiyiHandoutEditor: View {
     @ObservedObject private var workspace: TiyiHandoutWorkspace
     private let onExit: () -> Void
-    public init(workspace: TiyiHandoutWorkspace, onExit: @escaping () -> Void) { self.workspace = workspace; self.onExit = onExit }
+    private let navigation: TiyiWorkspaceNavigation?
+    public init(workspace: TiyiHandoutWorkspace, onExit: @escaping () -> Void, navigation: TiyiWorkspaceNavigation? = nil) { self.workspace = workspace; self.onExit = onExit; self.navigation = navigation }
     public var body: some View {
         CanvasScreen(documentStore: workspace.store, onShowLibrary: {
             do { try workspace.checkpoint(); onExit() } catch { workspace.errorMessage = error.localizedDescription }
-        }, handout: workspace)
+        }, handout: workspace, navigation: navigation)
         .defaultAppStorage(workspace.defaults)
         .alert("讲义保存", isPresented: Binding(get: { workspace.errorMessage != nil }, set: { if !$0 { workspace.errorMessage = nil } })) {
             Button("好", role: .cancel) { workspace.errorMessage = nil }

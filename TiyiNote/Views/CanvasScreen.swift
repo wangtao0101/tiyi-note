@@ -10,6 +10,7 @@ struct CanvasScreen: View {
     let onShowLibrary: () -> Void
     var practice: TiyiPracticeWorkspace?
     var handout: TiyiHandoutWorkspace?
+    var navigation: TiyiWorkspaceNavigation?
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
     @State private var selectedTool = CanvasToolKind.pen
@@ -52,13 +53,15 @@ struct CanvasScreen: View {
         onShowLibrary: @escaping () -> Void = {},
         initialPageElementInsertionRequest: PageElementInsertionRequest? = nil,
         practice: TiyiPracticeWorkspace? = nil,
-        handout: TiyiHandoutWorkspace? = nil
+        handout: TiyiHandoutWorkspace? = nil,
+        navigation: TiyiWorkspaceNavigation? = nil
     ) {
         self.documentStore = documentStore
         self.canEditActiveDocument = canEditActiveDocument
         self.onShowLibrary = onShowLibrary
         self.practice = practice
         self.handout = handout
+        self.navigation = navigation
         if let handout {
             _activeDocumentID = AppStorage(wrappedValue: handout.documentID, "pdfWorkspace.activeDocumentID", store: handout.defaults)
         }
@@ -76,11 +79,20 @@ struct CanvasScreen: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                if let practice {
+                if let navigation {
+                    PDFDocumentTabBar(openDocuments: navigation.tabs, activeDocumentID: navigation.selectedID,
+                        onSelectDocument: navigation.onSelect, onCloseDocument: navigation.onClose,
+                        onMoveDocument: navigation.onMove, onShowLibrary: onShowLibrary, libraryLabel: "返回讲义库",
+                        onInteract: handout.map { workspace in { workspace.interact(at: activePageIndex) } },
+                        actions: AnyView(HStack(spacing: 0) {
+                            navigation.actions
+                            if let practice { TiyiPracticeActions(workspace: practice) }
+                        }))
+                } else if let practice {
                     PracticeEditorHeader(workspace: practice, onExit: onShowLibrary)
                 } else {
                 PDFDocumentTabBar(
-                    openDocuments: documentStore.openDocuments,
+                    openDocuments: documentStore.openDocuments.map { TiyiWorkspaceTab(id: $0.id, title: $0.title) },
                     activeDocumentID: activeDocumentID,
                     onSelectDocument: selectDocument,
                     onCloseDocument: closeDocument,

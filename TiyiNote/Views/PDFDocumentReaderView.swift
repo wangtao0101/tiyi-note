@@ -82,6 +82,9 @@ struct PDFDocumentReaderView: View {
         self.onSelectLassoTool = onSelectLassoTool
         self.onSelectTextTool = onSelectTextTool
         self.onActiveCanvasChanged = onActiveCanvasChanged
+        // Initial layout briefly reports page zero before scrollPosition restores its target.
+        // Treat restoration like a page jump so that geometry cannot overwrite the saved page.
+        _pendingProgrammaticPageIndex = State(initialValue: initialPageIndex > 0 ? initialPageIndex : nil)
         _currentPageIndex = State(initialValue: initialPageIndex)
         _visiblePageID = State(initialValue: documentStore.pageID(at: initialPageIndex, in: documentID))
         var viewports: [String: CanvasViewport] = [:]
