@@ -107,6 +107,7 @@ struct RootWorkspaceView: View {
                       !documentStore.hadRecentDrawingInteraction(
                         within: Self.automaticCloudQuietWindow
                       ) else { continue }
+                if let cloudSyncCoordinator { await cloudSyncCoordinator.syncAutomaticallyNow() }
                 // Refresh CKShare permission before accepting another local edit window. Push is
                 // only a latency hint; polling also catches owner downgrades/revocations.
                 await refreshSharedDocuments()
@@ -117,7 +118,7 @@ struct RootWorkspaceView: View {
         }
         .onChange(of: documentStore.cloudSyncGeneration) { _, _ in
             Task {
-                await scheduleAllCloudZones()
+                await scheduleAllCloudZones(localChangesOnly: true)
             }
         }
         .onReceive(
@@ -319,7 +320,7 @@ struct RootWorkspaceView: View {
         }
     }
 
-    private func scheduleAllCloudZones() async {
+    private func scheduleAllCloudZones(localChangesOnly: Bool = false) async {
         guard !documentStore.isDrawingInteractionActive,
               !documentStore.hasPendingLocalDrawingPersistence else {
             if await cancelScheduledCloudZones() {
@@ -336,7 +337,11 @@ struct RootWorkspaceView: View {
         if let cloudSyncCoordinator {
             await cloudSyncCoordinator.scheduleSync(after: delay)
         }
-        for coordinator in sharedSyncCoordinators.values {
+        let changedIDs = localChangesOnly ? documentStore.sparsePendingDocumentIDs() : nil
+        for (key, coordinator) in sharedSyncCoordinators {
+            if let changedIDs,
+               let documentID = collaborativeZonesByDocumentID.first(where: { $0.value.key == key })?.key,
+               !changedIDs.contains(documentID) { continue }
             await coordinator.scheduleSync(after: delay)
         }
     }

@@ -125,7 +125,18 @@ struct PDFDocumentReaderView: View {
                     .frame(width: 1)
             }
 
-            pagesScrollView
+            if documentStore.isOriginalPDFDownloaded(documentID) {
+                pagesScrollView
+            } else {
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text("正在从 iCloud 下载 PDF…")
+                        .font(.callout)
+                        .foregroundStyle(TiyiNoteTheme.textSecondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .task { documentStore.requestSparsePDF(documentID) }
+            }
         }
         .background(TiyiNoteTheme.documentWorkspace)
         .overlay(alignment: .bottomTrailing) { zoomResetControl }

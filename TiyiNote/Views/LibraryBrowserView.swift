@@ -329,6 +329,11 @@ struct LibraryBrowserView: View {
                     id,
                     documentStore.documentMetadataCollaborationFrontier(for: id)
                 )
+            case .duplicateDocument(let id):
+                Task {
+                    do { _ = try await documentStore.duplicateDocumentInBackground(id) }
+                    catch { present(error) }
+                }
             case .moveFolder(let id):
                 presentMovePicker(folderIDs: [id], documentIDs: [])
             case .moveDocument(let id):
@@ -496,40 +501,23 @@ struct LibraryBrowserView: View {
     }
 
     private func importDocuments(_ urls: [URL], into folderID: String?) {
-        // File importer and Finder drag URLs can be security scoped on both iPadOS
-        // and Mac Catalyst. Keep every granted scope open until the store has
-        // synchronously copied the source into the managed workspace.
         let accessedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
-        defer {
-            for url in accessedURLs {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
-
-        let pdfURLs = urls.filter {
-            $0.pathExtension.caseInsensitiveCompare("pdf") == .orderedSame
-        }
-        let editableURLs = urls.filter {
-            $0.pathExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
-        }
-        do {
-            if !pdfURLs.isEmpty {
-                _ = try documentStore.importPDFs(from: pdfURLs, into: folderID)
-            }
-            for url in editableURLs {
-                _ = try documentStore.importEditableDocumentPackage(from: url, into: folderID)
-            }
-        } catch {
-            present(error)
+        Task {
+            defer { for url in accessedURLs { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let pdfURLs = urls.filter { $0.pathExtension.lowercased() == "pdf" }
+                if !pdfURLs.isEmpty {
+                    _ = try await documentStore.importPDFsInBackground(from: pdfURLs, into: folderID)
+                }
+                for url in urls where url.pathExtension.lowercased() == "tiyinote" {
+                    _ = try documentStore.importEditableDocumentPackage(from: url, into: folderID)
+                }
+            } catch { present(error) }
         }
     }
 
     private func importPDFs(_ urls: [URL], into folderID: String?) {
-        do {
-            _ = try documentStore.importPDFs(from: urls, into: folderID)
-        } catch {
-            present(error)
-        }
+        importDocuments(urls, into: folderID)
     }
 
     private func startDocumentScan(into folderID: String?) {
@@ -1481,6 +1469,9 @@ private struct LibraryDocumentListRow: View {
                 Button { onCommand(.moveDocument(document.id)) } label: {
                     Label("移动到", systemImage: "folder.badge.arrow.forward")
                 }
+                Button { onCommand(.duplicateDocument(document.id)) } label: {
+                    Label("复制", systemImage: "doc.on.doc")
+                }
                 Divider()
                 Button(role: .destructive) { onCommand(.trashDocument(document.id)) } label: {
                     Label("移到回收站", systemImage: "trash")
@@ -1635,6 +1626,9 @@ private struct LibraryDocumentGridCard: View {
                     }
                     Button { onCommand(.moveDocument(document.id)) } label: {
                         Label("移动到", systemImage: "folder.badge.arrow.forward")
+                    }
+                    Button { onCommand(.duplicateDocument(document.id)) } label: {
+                        Label("复制", systemImage: "doc.on.doc")
                     }
                     Button(role: .destructive) { onCommand(.trashDocument(document.id)) } label: {
                         Label("移到回收站", systemImage: "trash")
@@ -1958,8 +1952,8 @@ private struct CanvasCreationSheet: View {
     let onCreate: (String, CanvasBackgroundStyle, CanvasBackgroundColor) throws -> Void
 
     @State private var title = "未命名画板"
-    @State private var style = CanvasBackgroundStyle.blank
-    @State private var color = CanvasBackgroundColor.white
+    @State private var style = CanvasBackgroundStyle.dotted
+    @State private var color = CanvasBackgroundColor.ivory
     @State private var errorMessage: String?
 
     var body: some View {
@@ -2403,6 +2397,7 @@ private enum LibraryItemCommand {
     case openDocument(String)
     case editFolder(String)
     case renameDocument(String)
+    case duplicateDocument(String)
     case moveFolder(String)
     case moveDocument(String)
     case toggleFolderFavorite(String, Bool)

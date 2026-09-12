@@ -35,7 +35,7 @@ private actor CloudLibrarySyncTransactionGate {
 /// It uses zone-change tokens rather than queries, so the CloudKit schema needs no query indexes.
 actor CloudLibrarySyncCoordinator {
     static let containerIdentifier = "iCloud.com.tiyi.app"
-    static let defaultZoneName = "TiyiNoteLibrary"
+    static let defaultZoneName = "TiyiLibraryV2"
     static let documentShareZonePrefix = "TiyiNoteDocument."
 
     static func documentShareZoneName(for documentID: String) -> String {
@@ -91,6 +91,7 @@ actor CloudLibrarySyncCoordinator {
         static let pageWidth = "pageWidth"
         static let pageHeight = "pageHeight"
         static let pageRotation = "pageRotation"
+        static let sourcePDFPageIndex = "sourcePDFPageIndex"
         static let pageSourceKind = "pageSourceKind"
         static let isBookmarked = "isBookmarked"
         static let deletedAt = "deletedAt"
@@ -266,6 +267,7 @@ actor CloudLibrarySyncCoordinator {
     /// Automatic maintenance is suspended during an active Pencil interaction and while entering
     /// the editor. RootWorkspaceView starts it only after the ten-second local checkpoint is fully
     /// durable. Manual "现在同步" and collaboration setup use explicit entry points.
+    private var sparseSync: SparseCloudLibrarySync?
     private var automaticSyncSuspended = false
     private var excludedDocumentIDs: Set<String> = []
     private var currentParticipantID: String?
@@ -462,6 +464,12 @@ actor CloudLibrarySyncCoordinator {
         guard dataSource != nil else { throw SyncError.noDataSource }
         let accountStatus = try await container.accountStatus()
         guard accountStatus == .available else { throw SyncError.accountUnavailable }
+
+        if let store = dataSource as? DrawingDocumentStore, databaseScope == .private, scopedDocumentID == nil {
+            if sparseSync == nil { sparseSync = SparseCloudLibrarySync(database: database, zoneID: zoneID, store: store) }
+            try await sparseSync?.sync()
+            return
+        }
 
         if isAutomatic { try requireAutomaticSyncMayContinue() }
         try await ensureZone()
@@ -777,7 +785,77 @@ actor CloudLibrarySyncCoordinator {
             return
         }
 
-        let records = candidates.map(\.record)
+        // The source file is immutable. Fetch only metadata/change tags for existing document
+        // records and update those fields without assigning CKAsset again on rename/move.
+        let pageRecordIDs = candidates.filter { $0.reference.kind == .page && !$0.isTombstone }
+            .map { $0.record.recordID }
+        let pageMetadataKeys = managedFields(forRecordType: RecordType.page).filter {
+            ![Field.pageBackgroundAsset, Field.drawingAsset, Field.elementsAsset].contains($0)
+        }
+        let existingPages = pageRecordIDs.isEmpty ? [:] : try await database.records(
+            for: pageRecordIDs, desiredKeys: pageMetadataKeys
+        )
+        var records: [CKRecord] = []
+        for candidate in candidates {
+            let record = candidate.record
+            if candidate.reference.kind == .page, !candidate.isTombstone,
+               let result = existingPages[record.recordID] {
+                switch result {
+                case .success(let existing):
+                    let serverDate = date(in: existing, key: Field.modifiedAt) ?? .distantPast
+                    if (existing[Field.isDeleted] as? NSNumber)?.boolValue != true,
+                       serverDate <= candidate.modifiedAt {
+                        // Standalone page backgrounds are immutable too. Rotation, bookmark,
+                        // position and ink updates must not retransmit the PDF image asset.
+                        for key in managedFields(forRecordType: RecordType.page)
+                        where key != Field.pageBackgroundAsset {
+                            existing[key] = record[key]
+                        }
+                        records.append(existing)
+                        continue
+                    }
+                case .failure(let error):
+                    if (error as? CKError)?.code != .unknownItem { throw error }
+                }
+            }
+            if candidate.reference.kind == .document, !candidate.isTombstone {
+                let result = try await database.records(
+                    for: [record.recordID],
+                    desiredKeys: managedFields(forRecordType: RecordType.document).filter { $0 != Field.pdfAsset }
+                )
+                if let value = result[record.recordID] {
+                    switch value {
+                    case .success(let existing):
+                        if case .deletion(let tombstone)? = decodeRemoteRecord(existing) {
+                            try await applyDownloadedChanges([.deletion(tombstone)])
+                            needsAnotherPass = true
+                            continue
+                        }
+                        if case .document(let serverDocument, _)? = decodeRemoteRecord(existing),
+                           case .document(let clientDocument, _)? = decodeRemoteRecord(record) {
+                            let merged = serverDocument.mergedPrivateRecord(with: clientDocument)
+                            if merged != clientDocument {
+                                try await applyDownloadedChanges([.document(merged, pdfAssetURL: nil)])
+                                try populateDocumentRecord(record, with: merged,
+                                    reference: merged.personalReference, assetFrom: record)
+                                needsAnotherPass = true
+                            }
+                        }
+                        let sameSource = (existing[Field.fileName] as? String)
+                            == (record[Field.fileName] as? String)
+                        for key in managedFields(forRecordType: RecordType.document)
+                        where key != Field.pdfAsset || !sameSource {
+                            existing[key] = record[key]
+                        }
+                        records.append(existing)
+                        continue
+                    case .failure(let error):
+                        if (error as? CKError)?.code != .unknownItem { throw error }
+                    }
+                }
+            }
+            records.append(record)
+        }
         let candidatesByRecordID = Dictionary(
             uniqueKeysWithValues: candidates.map { ($0.record.recordID, $0) }
         )
@@ -1011,6 +1089,7 @@ actor CloudLibrarySyncCoordinator {
                 record[Field.pageWidth] = NSNumber(value: page.width)
                 record[Field.pageHeight] = NSNumber(value: page.height)
                 record[Field.pageRotation] = NSNumber(value: page.rotation)
+                record[Field.sourcePDFPageIndex] = page.sourcePDFPageIndex.map { NSNumber(value: $0) }
                 record[Field.pageSourceKind] = page.sourceKind.rawValue as CKRecordValue
                 record[Field.backgroundStyle] = page.backgroundStyle?.rawValue as CKRecordValue?
                 record[Field.backgroundColor] = page.backgroundColor?.rawValue as CKRecordValue?
@@ -1407,7 +1486,7 @@ actor CloudLibrarySyncCoordinator {
                 fullServerRecord,
                 with: mergedDocument,
                 reference: mergedDocument.personalReference,
-                assetFrom: clientProvidesContent ? clientRecord : fullServerRecord
+                assetFrom: clientProvidesContent && clientRecord[Field.pdfAsset] != nil ? clientRecord : fullServerRecord
             )
             let repair = try await database.modifyRecords(
                 saving: [fullServerRecord],
@@ -1540,12 +1619,12 @@ actor CloudLibrarySyncCoordinator {
         var downloadedAcknowledgements: [CollaborationAcknowledgement] = []
         for change in changes {
             switch change {
-            case .document(let document, _):
-                pageChangedDocumentIDs.insert(document.id)
+            case .document:
+                break
             case .page(let page, _, _, _):
                 pageChangedDocumentIDs.insert(page.documentID)
-            case .operation(let operation):
-                pageChangedDocumentIDs.insert(operation.documentID)
+            case .operation:
+                break // applyRemoteCollaborationOperations already materializes affected pages.
             case .deletion(let tombstone) where tombstone.reference.kind == .page:
                 let reference = tombstone.reference
                 if let page = snapshot.pages.first(where: { $0.id == reference.entityID }) {
@@ -1717,10 +1796,12 @@ actor CloudLibrarySyncCoordinator {
                       current.contentModifiedAt <= document.contentModifiedAt,
                       !document.isBundled,
                       let pdfURL else { continue }
-                try await dataSource.applyRemoteAsset(
-                    from: pdfURL,
-                    for: LibraryAssetReference(documentID: document.id, kind: .pdf)
-                )
+                let reference = LibraryAssetReference(documentID: document.id, kind: .pdf)
+                if let localURL = await dataSource.assetURL(for: reference),
+                   FileManager.default.fileExists(atPath: localURL.path) {
+                    continue // This document's immutable source is already installed.
+                }
+                try await dataSource.applyRemoteAsset(from: pdfURL, for: reference)
             case .page(let page, let backgroundURL, let drawingURL, let elementsURL):
                 guard snapshot.documents.contains(where: { $0.id == page.documentID }),
                       snapshot.pages.contains(where: { $0.id == page.id }) else { continue }
@@ -2087,6 +2168,7 @@ actor CloudLibrarySyncCoordinator {
                     width: width,
                     height: height,
                     rotation: integer(in: record, key: Field.pageRotation) ?? 0,
+                    sourcePDFPageIndex: integer(in: record, key: Field.sourcePDFPageIndex),
                     sourceKind: (record[Field.pageSourceKind] as? String)
                         .flatMap(LibraryPageSourceKind.init(rawValue:)) ?? .pdf,
                     backgroundStyle: (record[Field.backgroundStyle] as? String)
@@ -2161,10 +2243,14 @@ actor CloudLibrarySyncCoordinator {
             let isTombstone: Bool
             switch change {
             case .folder(let folder):
-                fingerprint = metadataFingerprint(prefix: "folder", modifiedAt: folder.modifiedAt)
+                fingerprint = payloadFingerprint(prefix: "folder", data: try encodedCollaboration(folder))
                 isTombstone = false
             case .document(let document, _):
-                fingerprint = metadataFingerprint(prefix: "document", modifiedAt: document.modifiedAt)
+                var payload = try encodedCollaboration(document)
+                if scopedDocumentID == nil, let reference = document.personalReference {
+                    payload.append(try encodedCollaboration(reference))
+                }
+                fingerprint = payloadFingerprint(prefix: "document", data: payload)
                 isTombstone = false
             case .documentReference(let referenceValue):
                 let payload = try encodedCollaboration(referenceValue)
@@ -2340,7 +2426,7 @@ actor CloudLibrarySyncCoordinator {
             return common + [
                 Field.documentID, Field.orderIndex, Field.pagePosition, Field.createdAt,
                 Field.pageWidth, Field.pageHeight, Field.pageRotation,
-                Field.pageSourceKind, Field.backgroundStyle, Field.backgroundColor,
+                Field.sourcePDFPageIndex, Field.pageSourceKind, Field.backgroundStyle, Field.backgroundColor,
                 Field.isBookmarked, Field.pageBackgroundAsset,
                 Field.drawingAsset, Field.elementsAsset
             ]
@@ -2513,12 +2599,12 @@ actor CloudLibrarySyncCoordinator {
         [
             "page",
             dateFingerprint(modifiedAt),
-            String(page.orderIndex),
             positionFingerprint(page.position),
             String(format: "%.3f", page.width),
             String(format: "%.3f", page.height),
             String(page.rotation),
             page.sourceKind.rawValue,
+            page.sourcePDFPageIndex.map(String.init) ?? "standalone",
             page.backgroundStyle?.rawValue ?? "none",
             page.backgroundColor?.rawValue ?? "none",
             page.isBookmarked ? "1" : "0",

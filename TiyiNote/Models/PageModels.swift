@@ -126,6 +126,10 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
     var width: Double
     var height: Double
     var rotation: Int
+    /// Stable index in the immutable source PDF; independent of display order.
+    var sourcePDFPageIndex: Int?
+    /// Sparse removal override for an implicit source page; its source identity survives undo.
+    var isRemoved: Bool = false
     var sourceKind: LibraryPageSourceKind
     var backgroundStyle: CanvasBackgroundStyle?
     var backgroundColor: CanvasBackgroundColor?
@@ -142,6 +146,7 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
         width: Double,
         height: Double,
         rotation: Int = 0,
+        sourcePDFPageIndex: Int? = nil,
         sourceKind: LibraryPageSourceKind = .pdf,
         backgroundStyle: CanvasBackgroundStyle? = nil,
         backgroundColor: CanvasBackgroundColor? = nil,
@@ -157,6 +162,7 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
         self.width = width
         self.height = height
         self.rotation = rotation
+        self.sourcePDFPageIndex = sourcePDFPageIndex
         self.sourceKind = sourceKind
         self.backgroundStyle = backgroundStyle
         self.backgroundColor = backgroundColor
@@ -165,12 +171,14 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case isRemoved
         case id, documentID, orderIndex, position, createdAt, modifiedAt
-        case width, height, rotation, sourceKind, backgroundStyle, backgroundColor, isBookmarked, handoutSourceID
+        case sourcePDFPageIndex, width, height, rotation, sourceKind, backgroundStyle, backgroundColor, isBookmarked, handoutSourceID
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        isRemoved = try container.decodeIfPresent(Bool.self, forKey: .isRemoved) ?? false
         id = try container.decode(String.self, forKey: .id)
         documentID = try container.decode(String.self, forKey: .documentID)
         orderIndex = try container.decode(Int.self, forKey: .orderIndex)
@@ -183,6 +191,7 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
         width = try container.decode(Double.self, forKey: .width)
         height = try container.decode(Double.self, forKey: .height)
         rotation = try container.decodeIfPresent(Int.self, forKey: .rotation) ?? 0
+        sourcePDFPageIndex = try container.decodeIfPresent(Int.self, forKey: .sourcePDFPageIndex)
         sourceKind = try container.decodeIfPresent(
             LibraryPageSourceKind.self,
             forKey: .sourceKind

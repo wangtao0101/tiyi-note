@@ -283,13 +283,23 @@ extension LibraryDocumentMetadata {
     /// unrelated move/favorite/trash edit from overwriting those bytes while records cross.
     func mergedPrivateRecord(with other: LibraryDocumentMetadata) -> LibraryDocumentMetadata {
         precondition(id == other.id)
-        let content: LibraryDocumentMetadata
+        var content: LibraryDocumentMetadata
         if contentModifiedAt != other.contentModifiedAt {
             content = contentModifiedAt > other.contentModifiedAt ? self : other
         } else {
             let lhs = privateDocumentContentBytes
             let rhs = other.privateDocumentContentBytes
             content = lhs.lexicographicallyPrecedes(rhs) ? other : self
+        }
+
+        if let a = titleRevision, let b = other.titleRevision {
+            let title = LibraryDocumentReferenceRegister<String>.merged(
+                .init(value: self.title, stamp: a), .init(value: other.title, stamp: b))
+            content.title = title.value; content.titleRevision = title.stamp
+        } else if let revision = titleRevision {
+            content.title = title; content.titleRevision = revision
+        } else if let revision = other.titleRevision {
+            content.title = other.title; content.titleRevision = revision
         }
 
         let reference: LibraryDocumentReference?

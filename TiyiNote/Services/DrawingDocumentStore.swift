@@ -179,16 +179,6 @@ private struct PreparedDrawingCollaborationPlan: Sendable {
     let path: PreparedDrawingCollaborationPath
 }
 
-private struct CollaborationOperationsFileSignature: Equatable {
-    let byteCount: UInt64
-    let modifiedAt: Date?
-}
-
-private struct CollaborationOperationsCacheEntry {
-    let signature: CollaborationOperationsFileSignature
-    let operations: [CollaborationOperation]
-}
-
 private struct PendingCollaborationOperationsSave {
     let token: UUID
     let operations: [CollaborationOperation]
@@ -250,7 +240,10 @@ final class DrawingDocumentStore: ObservableObject {
     @Published private(set) var saveState: LocalSaveState = .saved(nil)
     @Published private(set) var folders: [LibraryFolder] = []
     @Published private(set) var documents: [PDFWorkspaceDocument] = []
-    @Published private(set) var pages: [LibraryPage] = []
+    /// Only inserted pages and source-page overrides. Unedited source pages have no stored row.
+    @Published private(set) var pages: [LibraryPage] = [] {
+        didSet { sparsePageCache.removeAll() }
+    }
     @Published private(set) var openDocumentIDs: [String] = []
     @Published private(set) var pageAssetGeneration: UInt64 = 0
     @Published private(set) var pageAssetRevisions: [LibraryPageReference: UInt64] = [:]
@@ -271,15 +264,23 @@ final class DrawingDocumentStore: ObservableObject {
     private let collaborationAcknowledgementsURL: URL
     private let deletionTombstonesURL: URL
 
+    private var sparseDatabaseHandle: SparseLibraryDatabase?
+    private var persistedRegistry: LibraryRegistry?
+    private var applyingSparseRemote = false
+    private var sparsePageCache: [String: [LibraryPage]] = [:]
+    private var sparseKnownOperationIDs: Set<String> = []
+    private var sparseCoverTaskTokens: [String: UUID] = [:]
+    private var sparseCoverTasks: [String: Task<Void, Never>] = [:]
     private var documentMetadata: [LibraryDocumentMetadata] = []
     private var pdfCache: [String: PDFDocument] = [:]
+    private var pdfCacheOrder: [String] = []
     private var thumbnailCache: [String: UIImage] = [:]
     private var pendingSaves: [String: Task<Void, Never>] = [:]
     private var pendingAssetSaves: [String: PendingAssetSave] = [:]
     /// Operation archives are immutable between edits but used repeatedly by drawing load,
     /// autosave, asset refresh, and CloudKit export. Keeping decoded values here prevents every
     /// quiet pause from decoding the complete history again on MainActor.
-    private var collaborationOperationsCache: [String: CollaborationOperationsCacheEntry] = [:]
+    private var collaborationOperationsCache: [String: [CollaborationOperation]] = [:]
     private var pendingCollaborationOperationsSaves: [String: PendingCollaborationOperationsSave] = [:]
     private var pendingCollaborationOperationsTasks: [String: Task<Void, Never>] = [:]
     /// Invalidates an off-main drawing diff if CloudKit or another editor changes that page while
@@ -333,7 +334,7 @@ final class DrawingDocumentStore: ObservableObject {
         let resolvedTransactionsDirectory = resolvedWorkspaceDirectory
             .appendingPathComponent("Transactions", isDirectory: true)
         transactionsDirectory = resolvedTransactionsDirectory
-        registryURL = resolvedWorkspaceDirectory.appendingPathComponent("documents.json")
+        registryURL = resolvedWorkspaceDirectory.appendingPathComponent("library-v2.sqlite")
         let resolvedCollaborationClockURL = resolvedWorkspaceDirectory
             .appendingPathComponent("collaboration-clock.json")
         collaborationClockURL = resolvedCollaborationClockURL
@@ -595,15 +596,32 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     func pages(in documentID: String) -> [LibraryPage] {
-        pages
-            .filter { $0.documentID == documentID }
-            .sorted {
-                if $0.position != $1.position { return $0.position < $1.position }
-                return $0.id < $1.id
-            }
+        if let cached = sparsePageCache[documentID] { return cached }
+        let overrides = pages.filter { $0.documentID == documentID }
+        let overriddenIDs = Set(overrides.map(\.id))
+        let count = documentMetadata.first { $0.id == documentID }?.sourcePageCount ?? 0
+        var result = (0..<count).compactMap { sourceIndex -> LibraryPage? in
+            guard let page = implicitPage(sourceIndex: sourceIndex, in: documentID),
+                  !overriddenIDs.contains(page.id) else { return nil }
+            return page
+        }
+        result.append(contentsOf: overrides.filter { !$0.isRemoved })
+        result.sort {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.id < $1.id
+        }
+        for index in result.indices { result[index].orderIndex = index }
+        sparsePageCache[documentID] = result
+        return result
     }
 
     func pageMetadata(at pageIndex: Int, in documentID: String) -> LibraryPage? {
+        guard pageIndex >= 0 else { return nil }
+        if !pages.contains(where: { $0.documentID == documentID }),
+           let count = documentMetadata.first(where: { $0.id == documentID })?.sourcePageCount,
+           pageIndex < count {
+            return implicitPage(sourceIndex: pageIndex, in: documentID)
+        }
         let documentPages = pages(in: documentID)
         guard documentPages.indices.contains(pageIndex) else { return nil }
         return documentPages[pageIndex]
@@ -664,17 +682,11 @@ final class DrawingDocumentStore: ObservableObject {
             backgroundURL,
             collaborationOperationsURL(forPageID: page.id, in: documentID)
         ]
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let documentURL = fileURL(for: metadata) {
-            affectedURLs.append(documentURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "insert-page",
             affectedURLs: affectedURLs
         )
         do {
-            try templatePagePDFData(size: size, style: style, color: color)
-                .write(to: backgroundURL, options: .atomic)
             var updated = ordered
             updated.insert(page, at: insertionIndex)
             try commitPageMutation(updated, in: documentID)
@@ -722,6 +734,7 @@ final class DrawingDocumentStore: ObservableObject {
             width: source.width,
             height: source.height,
             rotation: source.rotation,
+            sourcePDFPageIndex: source.sourcePDFPageIndex,
             sourceKind: source.sourceKind,
             backgroundStyle: source.backgroundStyle,
             backgroundColor: source.backgroundColor,
@@ -736,10 +749,6 @@ final class DrawingDocumentStore: ObservableObject {
             imageAnnotationsURL(forPageID: duplicate.id, in: documentID),
             collaborationOperationsURL(forPageID: duplicate.id, in: documentID)
         ]
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let documentURL = fileURL(for: metadata) {
-            affectedURLs.append(documentURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "duplicate-page",
             affectedURLs: affectedURLs
@@ -795,10 +804,6 @@ final class DrawingDocumentStore: ObservableObject {
             collaborationClockURL,
             collaborationOperationsURL(forPageID: pageID, in: documentID)
         ]
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let documentURL = fileURL(for: metadata) {
-            affectedURLs.append(documentURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "move-page",
             affectedURLs: affectedURLs
@@ -859,10 +864,6 @@ final class DrawingDocumentStore: ObservableObject {
         affectedURLs.append(contentsOf: pageIDs.map {
             collaborationOperationsURL(forPageID: $0, in: documentID)
         })
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let documentURL = fileURL(for: metadata) {
-            affectedURLs.append(documentURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "delete-pages",
             affectedURLs: affectedURLs
@@ -881,7 +882,7 @@ final class DrawingDocumentStore: ObservableObject {
     func deletedPages(in documentID: String) -> [LibraryPage] {
         let activePageIDs = Set(pages(in: documentID).map(\.id))
         let grouped = Dictionary(
-            grouping: exportCollaborationOperations().filter {
+            grouping: ((try? sparseDatabase().entries(kind: "operation", documentID: documentID)) ?? []).compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }.filter {
                 $0.documentID == documentID
                     && $0.pageID != CollaborationReservedID.documentMetadata
                     && !activePageIDs.contains($0.pageID)
@@ -936,10 +937,6 @@ final class DrawingDocumentStore: ObservableObject {
         affectedURLs.append(contentsOf: pageIDs.map {
             collaborationOperationsURL(forPageID: $0, in: documentID)
         })
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let pdfURL = fileURL(for: metadata) {
-            affectedURLs.append(pdfURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "restore-deleted-pages",
             affectedURLs: affectedURLs
@@ -975,32 +972,19 @@ final class DrawingDocumentStore: ObservableObject {
             throw LibraryStoreError.pageNotFound(pageID)
         }
         let backgroundURL = pageBackgroundURL(forPageID: pageID, in: documentID)
-        guard let pageDocument = PDFDocument(url: backgroundURL),
-              let pdfPage = pageDocument.page(at: 0) else {
-            throw PDFWorkspaceError.invalidPDF(documentID)
-        }
         let delta = clockwise ? 90 : -90
-        let rotation = normalizedPageRotation(pdfPage.rotation + delta)
-        pdfPage.rotation = rotation
-        guard let data = pageDocument.dataRepresentation() else {
-            throw PDFWorkspaceError.invalidPDF(documentID)
-        }
+        let rotation = normalizedPageRotation(ordered[index].rotation + delta)
         var affectedURLs = [
             registryURL,
             collaborationClockURL,
             backgroundURL,
             collaborationOperationsURL(forPageID: pageID, in: documentID)
         ]
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let documentURL = fileURL(for: metadata) {
-            affectedURLs.append(documentURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "rotate-page",
             affectedURLs: affectedURLs
         )
         do {
-            try data.write(to: backgroundURL, options: .atomic)
             let stamp = collaborationClock.nextStamp()
             ordered[index].rotation = rotation
             ordered[index].modifiedAt = stamp.createdAt
@@ -1028,6 +1012,8 @@ final class DrawingDocumentStore: ObservableObject {
     func setPageBookmark(_ pageID: String, isBookmarked: Bool, in documentID: String) throws {
         try requireEditableSharedDocument(documentID)
         var updated = pages
+        if !updated.contains(where: { $0.id == pageID }),
+           let original = pages(in: documentID).first(where: { $0.id == pageID }) { updated.append(original) }
         guard let index = updated.firstIndex(where: {
             $0.id == pageID && $0.documentID == documentID
         }) else { throw LibraryStoreError.pageNotFound(pageID) }
@@ -1095,10 +1081,6 @@ final class DrawingDocumentStore: ObservableObject {
             backgroundURL,
             collaborationOperationsURL(forPageID: pageID, in: documentID)
         ]
-        if let metadata = documentMetadata.first(where: { $0.id == documentID }),
-           let documentURL = fileURL(for: metadata) {
-            affectedURLs.append(documentURL)
-        }
         let transaction = try beginWorkspaceTransaction(
             kind: "debug-interrupted-rotation-stage-\(completedStage)",
             affectedURLs: affectedURLs
@@ -1337,35 +1319,14 @@ final class DrawingDocumentStore: ObservableObject {
 
         var updatedMetadata = documentMetadata
         updatedMetadata[index].title = title
-        let previousOperations = loadCollaborationOperations(
-            forPageID: CollaborationReservedID.documentMetadata,
-            in: documentID
-        )
-        let titleData = try collaborationJSONEncoder().encode(title)
-        let titleOperation = CollaborationOperation(
-            workspaceID: "personal-library",
-            documentID: documentID,
-            pageID: CollaborationReservedID.documentMetadata,
-            stamp: causalContext.map {
-                collaborationClock.nextStamp(observedContext: $0)
-            } ?? collaborationClock.nextStamp(),
-            payload: .metadataSet(field: "document.title", value: titleData)
-        )
-        updatedMetadata[index].modifiedAt = titleOperation.stamp.createdAt
-        updatedMetadata[index].contentModifiedAt = titleOperation.stamp.createdAt
-        try appendCollaborationOperation(titleOperation)
-        do {
-            try persistRegistry(folders: folders, documents: updatedMetadata)
-        } catch {
-            // The registry and its causal event are one logical mutation. A failed registry write
-            // must not later rename the document through CloudKit.
-            try? saveCollaborationOperations(
-                previousOperations,
-                forPageID: CollaborationReservedID.documentMetadata,
-                in: documentID
-            )
-            throw error
-        }
+        guard title != documentMetadata[index].title else { return }
+        let stamp = causalContext.map { collaborationClock.nextStamp(observedContext: $0) }
+            ?? collaborationClock.nextStamp()
+        updatedMetadata[index].titleRevision = stamp
+        updatedMetadata[index].modifiedAt = stamp.createdAt
+        updatedMetadata[index].contentModifiedAt = stamp.createdAt
+        try persistCollaborationClock()
+        try persistRegistry(folders: folders, documents: updatedMetadata)
         documentMetadata = updatedMetadata
         rebuildWorkspaceDocuments()
         signalLocalCloudChange()
@@ -1879,11 +1840,6 @@ final class DrawingDocumentStore: ObservableObject {
             let updatedMetadata = documentMetadata + [metadata]
             let createdPages = makePageMetadata(for: metadata, pdf: pdf)
             let updatedPages = pages + createdPages
-            try persistPageBackgroundAssets(
-                pages: createdPages,
-                from: pdf,
-                documentID: documentID
-            )
             try persistRegistry(
                 folders: folders,
                 documents: updatedMetadata,
@@ -1935,6 +1891,66 @@ final class DrawingDocumentStore: ObservableObject {
         guard reorderedDocumentIDs != openDocumentIDs else { return }
         openDocumentIDs = reorderedDocumentIDs
         persistOpenDocuments()
+    }
+
+    /// Read/copy PDFs on a worker; publish the finished page manifest in one main-actor commit.
+    func importPDFsInBackground(from urls: [URL], into parentID: String?) async throws -> [PDFWorkspaceDocument] {
+        try validateParentFolder(parentID)
+        let titles = try urls.map { try normalizedTitle($0.lastPathComponent) }
+        for title in titles { try validateUniqueTitle(title, in: parentID) }
+        guard Set(titles.map(normalizedComparisonKey)).count == titles.count else {
+            throw LibraryStoreError.nameConflict(titles.first ?? "PDF")
+        }
+        let staging = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: staging) }
+        let prepared = try await Task.detached(priority: .userInitiated) {
+            var documents: [LibraryDocumentMetadata] = []
+            var pages: [LibraryPage] = []
+            for (source, title) in zip(urls, titles) {
+                try Task.checkCancellation()
+                let access = source.startAccessingSecurityScopedResource()
+                defer { if access { source.stopAccessingSecurityScopedResource() } }
+                let id = UUID().uuidString.lowercased()
+                let name = "\(id).pdf"
+                let target = staging.appendingPathComponent(name)
+                try FileManager.default.copyItem(at: source, to: target)
+                guard let pdf = PDFDocument(url: target), pdf.pageCount > 0 else {
+                    throw PDFWorkspaceError.invalidPDF(title)
+                }
+                let metadata = LibraryDocumentMetadata(
+                    id: id, title: title, parentID: parentID, fileName: name,
+                    isBundled: false, sourcePageCount: pdf.pageCount, createdAt: Date(), modifiedAt: Date()
+                )
+                documents.append(metadata)
+
+            }
+            return (documents, pages)
+        }.value
+        try Task.checkCancellation()
+        try validateParentFolder(parentID)
+        for title in titles { try validateUniqueTitle(title, in: parentID) }
+        let targets = prepared.0.map { importsDirectory.appendingPathComponent($0.fileName) }
+        let transaction = try beginWorkspaceTransaction(kind: "import-source-pdfs", affectedURLs: [registryURL] + targets)
+        do {
+            for (metadata, target) in zip(prepared.0, targets) {
+                try fileManager.moveItem(at: staging.appendingPathComponent(metadata.fileName), to: target)
+            }
+            let documents = documentMetadata + prepared.0
+            let updatedPages = pages + prepared.1
+            try persistRegistry(folders: folders, documents: documents, pages: updatedPages)
+            documentMetadata = documents
+            pages = updatedPages
+            try commitWorkspaceTransaction(transaction)
+            rebuildWorkspaceDocuments()
+            openDocumentIDs.append(contentsOf: prepared.0.map(\.id))
+            persistOpenDocuments()
+            signalLocalCloudChange()
+            return prepared.0.compactMap { document(withID: $0.id) }
+        } catch {
+            rollbackWorkspaceTransaction(transaction)
+            throw error
+        }
     }
 
     @discardableResult
@@ -1995,6 +2011,7 @@ final class DrawingDocumentStore: ObservableObject {
                         parentID: parentID,
                         fileName: targetFileName,
                         isBundled: false,
+                        sourcePageCount: pdfDocument.pageCount,
                         createdAt: now,
                         modifiedAt: now
                     )
@@ -2003,18 +2020,7 @@ final class DrawingDocumentStore: ObservableObject {
             }
 
             let updatedMetadata = documentMetadata + newMetadata
-            let newPages = newMetadata.flatMap { metadata in
-                loadedPDFs[metadata.id].map { makePageMetadata(for: metadata, pdf: $0) } ?? []
-            }
-            for metadata in newMetadata {
-                guard let pdf = loadedPDFs[metadata.id] else { continue }
-                try persistPageBackgroundAssets(
-                    pages: newPages.filter { $0.documentID == metadata.id },
-                    from: pdf,
-                    documentID: metadata.id
-                )
-            }
-            let updatedPages = pages + newPages
+            let updatedPages = pages
             try persistRegistry(
                 folders: folders,
                 documents: updatedMetadata,
@@ -2036,23 +2042,76 @@ final class DrawingDocumentStore: ObservableObject {
         }
     }
 
+    private var thumbnailVisualKeys: [String: String] = [:]
+    private var dirtyThumbnailKeys: Set<String> = []
+    private var pendingThumbnailIDs: [String: UUID] = [:]
+    private var resolvedPageDocuments: [String: PDFDocument] = [:]
+
     func pdfDocument(for documentID: String) -> PDFDocument? {
+        pdfCacheOrder.removeAll { $0 == documentID }
+        pdfCacheOrder.append(documentID)
+        while pdfCacheOrder.count > 4 { pdfCache[pdfCacheOrder.removeFirst()] = nil }
         if let cachedDocument = pdfCache[documentID] {
             return cachedDocument
         }
         guard let workspaceDocument = document(withID: documentID) else { return nil }
+        guard fileManager.fileExists(atPath: workspaceDocument.fileURL.path) else {
+            requestSparsePDF(documentID)
+            return nil
+        }
         let pdfDocument = PDFDocument(url: workspaceDocument.fileURL)
         pdfCache[documentID] = pdfDocument
         return pdfDocument
     }
 
     func pageCount(for documentID: String) -> Int {
-        pdfDocument(for: documentID)?.pageCount ?? 0
+        let overrides = pages.filter { $0.documentID == documentID }
+        let count = documentMetadata.first { $0.id == documentID }?.sourcePageCount ?? 0
+        return count + overrides.filter { page in
+            !page.isRemoved && (page.sourcePDFPageIndex.map { index in
+                page.id != Self.implicitPageID(documentID: documentID,
+                    resourceID: documentMetadata.first { $0.id == documentID }?.sourceResourceID ?? documentID, sourceIndex: index)
+            } ?? true)
+        }.count - overrides.filter { page in
+            page.isRemoved && page.sourcePDFPageIndex.map { index in
+                page.id == Self.implicitPageID(documentID: documentID,
+                    resourceID: documentMetadata.first { $0.id == documentID }?.sourceResourceID ?? documentID, sourceIndex: index)
+            } == true
+        }.count
+    }
+
+    private func resolvedPage(_ metadata: LibraryPage) -> PDFPage? {
+        let key = "\(metadata.documentID)#\(metadata.id)"
+        if let cached = resolvedPageDocuments[key] { return cached.page(at: 0) }
+        let holder: PDFDocument
+        if let sourceIndex = metadata.sourcePDFPageIndex {
+            guard let source = pdfDocument(for: metadata.documentID)?.page(at: sourceIndex),
+                  let copy = source.copy() as? PDFPage else { return nil }
+            holder = PDFDocument()
+            holder.insert(copy, at: 0)
+        } else if metadata.sourceKind == .template {
+            guard let data = try? templatePagePDFData(
+                size: CGSize(width: metadata.width, height: metadata.height),
+                style: metadata.backgroundStyle ?? .blank,
+                color: metadata.backgroundColor ?? .white
+            ), let template = PDFDocument(data: data) else { return nil }
+            holder = template
+        } else {
+            guard let background = PDFDocument(url: pageBackgroundURL(
+                forPageID: metadata.id, in: metadata.documentID
+            )) else { return nil }
+            holder = background
+        }
+        holder.page(at: 0)?.rotation = metadata.rotation
+        // Bound the page cache: opening a textbook must not retain every decoded image.
+        if resolvedPageDocuments.count >= 32 { resolvedPageDocuments.removeAll() }
+        resolvedPageDocuments[key] = holder
+        return holder.page(at: 0)
     }
 
     func page(at index: Int, in documentID: String) -> PDFPage? {
-        guard index >= 0, index < pageCount(for: documentID) else { return nil }
-        return pdfDocument(for: documentID)?.page(at: index)
+        guard let metadata = pageMetadata(at: index, in: documentID) else { return nil }
+        return resolvedPage(metadata)
     }
 
     func searchPDF(
@@ -2060,27 +2119,21 @@ final class DrawingDocumentStore: ObservableObject {
         in documentID: String,
         limit: Int = 250
     ) -> [PDFTextSearchResult] {
-        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedQuery.isEmpty,
-              let document = pdfDocument(for: documentID) else { return [] }
-        return document.findString(normalizedQuery, withOptions: [.caseInsensitive])
-            .prefix(max(limit, 1))
-            .enumerated()
-            .compactMap { offset, selection in
-                guard let page = selection.pages.first else { return nil }
-                let pageIndex = document.index(for: page)
-                let lineSelection = selection.copy() as? PDFSelection
-                lineSelection?.extendForLineBoundaries()
-                let excerpt = (lineSelection?.string ?? selection.string ?? normalizedQuery)
-                    .replacingOccurrences(of: "\n", with: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return PDFTextSearchResult(
-                    id: "\(pageIndex)-\(offset)",
-                    pageIndex: pageIndex,
-                    excerpt: excerpt,
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+        var results: [PDFTextSearchResult] = []
+        for (index, metadata) in pages(in: documentID).enumerated() {
+            guard let page = resolvedPage(metadata), let holder = page.document else { continue }
+            for selection in holder.findString(query, withOptions: [.caseInsensitive]) {
+                results.append(PDFTextSearchResult(
+                    id: "\(metadata.id)-\(results.count)", pageIndex: index,
+                    excerpt: (selection.string ?? query).replacingOccurrences(of: "\n", with: " "),
                     pageBounds: selection.bounds(for: page)
-                )
+                ))
+                if results.count >= max(limit, 1) { return results }
             }
+        }
+        return results
     }
 
     func exportFlattenedPDF(documentID: String) throws -> URL {
@@ -2209,6 +2262,105 @@ final class DrawingDocumentStore: ObservableObject {
         return try encoder.encode(package)
     }
 
+    func duplicateDocumentInBackground(_ documentID: String) async throws -> PDFWorkspaceDocument {
+        guard let source = documentMetadata.first(where: { $0.id == documentID }),
+              source.trashedAt == nil, let sourcePDF = fileURL(for: source) else {
+            throw LibraryStoreError.documentNotFound(documentID)
+        }
+        guard flushAllPendingSaves() else { throw PDFWorkspaceError.cannotAccess("仍有批注未能保存") }
+        let newID = UUID().uuidString.lowercased()
+        let hasOperations = !(try sparseDatabase().entries(kind: "operation", documentID: documentID, limit: 1)).isEmpty
+        let hasEdits = pages.contains { $0.documentID == documentID } || hasOperations
+        let originalPages = hasEdits ? pages(in: documentID) : []
+        let allPages = hasEdits ? originalPages + deletedPages(in: documentID) : []
+        let pageMap = Dictionary(uniqueKeysWithValues: allPages.map { page in
+            (page.id, page.sourcePDFPageIndex.map { Self.implicitPageID(documentID: newID, resourceID: source.sourceResourceID ?? source.id, sourceIndex: $0) } ?? UUID().uuidString.lowercased())
+        })
+        let originalOperations = allPages.flatMap { loadCollaborationOperations(forPageID: $0.id, in: documentID) }
+            + loadCollaborationOperations(forPageID: CollaborationReservedID.documentMetadata, in: documentID)
+        let actorMap = importedActorMap(operations: originalOperations, newDocumentID: newID, rewritesHistory: true)
+        let operationMap = Dictionary(uniqueKeysWithValues: originalOperations.map { ($0.id, UUID().uuidString.lowercased()) })
+        let operations = try originalOperations.map {
+            try transformedImportedOperation($0, documentID: newID, pageIDMap: pageMap,
+                actorMap: actorMap, operationIDMap: operationMap, rewritesHistory: true)
+        }
+        let newPages = allPages.map { page -> LibraryPage in
+            var value = LibraryPage(id: pageMap[page.id]!, documentID: newID, orderIndex: page.orderIndex,
+                position: page.position, createdAt: page.createdAt, modifiedAt: page.modifiedAt,
+                width: page.width, height: page.height, rotation: page.rotation,
+                sourcePDFPageIndex: page.sourcePDFPageIndex, sourceKind: page.sourceKind,
+                backgroundStyle: page.backgroundStyle, backgroundColor: page.backgroundColor,
+                isBookmarked: page.isBookmarked, handoutSourceID: page.handoutSourceID)
+            value.isRemoved = !originalPages.contains { $0.id == page.id }
+            return value
+        }
+        let staging = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: staging) }
+        let reusesSource = source.sourceResourceID != nil
+        var copies: [(URL, URL)] = reusesSource ? [] : [(sourcePDF, staging.appendingPathComponent("source.pdf"))]
+        var installs: [(URL, URL)] = reusesSource ? [] : [(staging.appendingPathComponent("source.pdf"), importsDirectory.appendingPathComponent("\(newID).pdf"))]
+        for page in allPages {
+            let id = pageMap[page.id]!
+            let pairs = [
+                (pageBackgroundURL(forPageID: page.id, in: documentID), pageBackgroundURL(forPageID: id, in: newID)),
+                (drawingURL(forPageID: page.id, in: documentID), drawingURL(forPageID: id, in: newID)),
+                (imageAnnotationsURL(forPageID: page.id, in: documentID), imageAnnotationsURL(forPageID: id, in: newID))
+            ]
+            for (from, to) in pairs where fileManager.fileExists(atPath: from.path) {
+                let staged = staging.appendingPathComponent(to.lastPathComponent)
+                copies.append((from, staged))
+                installs.append((staged, to))
+            }
+        }
+        let fileCopies = copies
+        try await Task.detached(priority: .userInitiated) {
+            for (from, to) in fileCopies {
+                try Task.checkCancellation()
+                try FileManager.default.copyItem(at: from, to: to)
+            }
+        }.value
+        try Task.checkCancellation()
+        try validateParentFolder(source.parentID)
+        let name = source.title as NSString
+        let proposed = source.kind == .pdf && name.pathExtension.lowercased() == "pdf"
+            ? "\(name.deletingPathExtension)_副本.\(name.pathExtension)" : "\(source.title)_副本"
+        let title = uniqueRestoredTitle(proposed, parentID: source.parentID, excludingID: newID,
+            folders: folders, documents: documentMetadata, isDocument: true)
+        let grouped = Dictionary(grouping: operations, by: \.pageID)
+        let operationURLs = Set(grouped.keys).union([CollaborationReservedID.documentMetadata]).map {
+            collaborationOperationsURL(forPageID: $0, in: newID)
+        }
+        let transaction = try beginWorkspaceTransaction(kind: "duplicate-document",
+            affectedURLs: [registryURL, collaborationClockURL] + installs.map { $0.1 } + operationURLs)
+        do {
+            for operation in operations { collaborationClock.observe(operation.stamp) }
+            let stamp = collaborationClock.nextStamp()
+            let metadata = LibraryDocumentMetadata(id: newID, title: title, parentID: source.parentID,
+                fileName: reusesSource ? source.fileName : "\(newID).pdf", isBundled: false, sourcePageCount: source.sourcePageCount,
+                sourceResourceID: source.sourceResourceID, createdAt: stamp.createdAt,
+                modifiedAt: stamp.createdAt, contentModifiedAt: stamp.createdAt, kind: source.kind,
+                canvasBackgroundStyle: source.canvasBackgroundStyle, canvasBackgroundColor: source.canvasBackgroundColor,
+                isFavorite: source.isFavorite, parentRevision: stamp, favoriteRevision: stamp, trashRevision: stamp)
+            for (from, to) in installs { try fileManager.moveItem(at: from, to: to) }
+            for (pageID, values) in grouped {
+                try saveCollaborationOperations(values, forPageID: pageID, in: newID)
+            }
+            documentMetadata.append(metadata)
+            pages.append(contentsOf: newPages.filter { !isImplicitDefault($0) })
+            try persistRegistry(folders: folders, documents: documentMetadata, pages: pages)
+            try persistCollaborationClock()
+            try commitWorkspaceTransaction(transaction)
+            rebuildWorkspaceDocuments()
+            signalLocalCloudChange()
+            guard let result = document(withID: newID) else { throw LibraryStoreError.documentNotFound(newID) }
+            return result
+        } catch {
+            rollbackWorkspaceTransaction(transaction)
+            throw error
+        }
+    }
+
     @discardableResult
     func importEditableDocumentPackage(
         from sourceURL: URL,
@@ -2228,6 +2380,15 @@ final class DrawingDocumentStore: ObservableObject {
         } catch {
             throw PDFWorkspaceError.cannotAccess(sourceURL.lastPathComponent)
         }
+        return try importEditableDocumentPackage(data: packageData, into: parentID)
+    }
+
+    private func importEditableDocumentPackage(
+        data packageData: Data,
+        into parentID: String?,
+        preferredTitle: String? = nil
+    ) throws -> PDFWorkspaceDocument {
+        try validateParentFolder(parentID)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let package: EditableDocumentPackage
@@ -2306,6 +2467,7 @@ final class DrawingDocumentStore: ObservableObject {
                 width: page.width,
                 height: page.height,
                 rotation: normalizedPageRotation(page.rotation),
+                sourcePDFPageIndex: page.sourcePDFPageIndex,
                 sourceKind: page.sourceKind,
                 backgroundStyle: page.backgroundStyle,
                 backgroundColor: page.backgroundColor,
@@ -2342,7 +2504,7 @@ final class DrawingDocumentStore: ObservableObject {
             for operation in transformedOperations { collaborationClock.observe(operation.stamp) }
             let placementStamp = collaborationClock.nextStamp()
             let title = uniqueRestoredTitle(
-                try normalizedTitle(package.document.title),
+                try normalizedTitle(preferredTitle ?? package.document.title),
                 parentID: parentID,
                 excludingID: newDocumentID,
                 folders: folders,
@@ -2384,17 +2546,15 @@ final class DrawingDocumentStore: ObservableObject {
             try package.sourcePDFData.write(to: targetPDFURL, options: .atomic)
             for oldPage in allPackagePages {
                 let importedPageID = pageIDMap[oldPage.id]!
-                guard let assets = assetsByOldPageID[oldPage.id],
-                      let backgroundData = assets.backgroundPDFData else {
+                guard let assets = assetsByOldPageID[oldPage.id] else {
                     throw LibraryStoreError.invalidSnapshot("页面背景资产缺失")
                 }
-                try backgroundData.write(
-                    to: pageBackgroundURL(
-                        forPageID: importedPageID,
-                        in: newDocumentID
-                    ),
-                    options: .atomic
-                )
+                if let backgroundData = assets.backgroundPDFData {
+                    try backgroundData.write(
+                        to: pageBackgroundURL(forPageID: importedPageID, in: newDocumentID),
+                        options: .atomic
+                    )
+                }
                 if let drawingData = assets.drawingData {
                     try drawingData.write(
                         to: drawingURL(forPageID: importedPageID, in: newDocumentID),
@@ -2424,7 +2584,7 @@ final class DrawingDocumentStore: ObservableObject {
 
             documentMetadata.append(importedMetadata)
             pages.append(contentsOf: importedPages)
-            try rebuildPDFDocumentFromPageBackgrounds(documentID: newDocumentID)
+            invalidatePagePresentation(documentID: newDocumentID)
             try persistRegistry(
                 folders: folders,
                 documents: documentMetadata,
@@ -2458,7 +2618,7 @@ final class DrawingDocumentStore: ObservableObject {
               !package.pages.isEmpty,
               package.pages.count + package.deletedPages.count <= 10_000,
               let sourcePDF = PDFDocument(data: package.sourcePDFData),
-              sourcePDF.pageCount == package.pages.count else {
+              sourcePDF.pageCount > 0 else {
             throw LibraryStoreError.invalidSnapshot("文稿身份、PDF 或页数无效")
         }
         _ = try normalizedTitle(package.document.title)
@@ -2491,10 +2651,16 @@ final class DrawingDocumentStore: ObservableObject {
             throw LibraryStoreError.invalidSnapshot("页面资产索引不完整或重复")
         }
         for assets in package.pageAssets {
-            guard let backgroundData = assets.backgroundPDFData,
-                  let background = PDFDocument(data: backgroundData),
-                  background.pageCount == 1 else {
-                throw LibraryStoreError.invalidSnapshot("页面 \(assets.pageID) 背景无效")
+            let page = allPackagePages.first { $0.id == assets.pageID }!
+            if let index = page.sourcePDFPageIndex {
+                guard index >= 0, index < sourcePDF.pageCount else {
+                    throw LibraryStoreError.invalidSnapshot("原始 PDF 页面引用无效")
+                }
+            } else if page.sourceKind != .template {
+                guard let data = assets.backgroundPDFData,
+                      PDFDocument(data: data)?.pageCount == 1 else {
+                    throw LibraryStoreError.invalidSnapshot("页面 \(assets.pageID) 背景无效")
+                }
             }
             if let drawingData = assets.drawingData,
                (try? PKDrawing(data: drawingData)) == nil {
@@ -2668,6 +2834,7 @@ final class DrawingDocumentStore: ObservableObject {
                 width: archived.width,
                 height: archived.height,
                 rotation: normalizedPageRotation(archived.rotation),
+                sourcePDFPageIndex: archived.sourcePDFPageIndex,
                 sourceKind: archived.sourceKind,
                 backgroundStyle: archived.backgroundStyle,
                 backgroundColor: archived.backgroundColor,
@@ -2690,17 +2857,11 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     func collaborationConflicts(in documentID: String) -> [CollaborationConflictItem] {
-        let directory = documentDrawingsDirectory(for: documentID, createIfNeeded: false)
-        guard let urls = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-
-        return urls
-            .filter { $0.lastPathComponent.hasSuffix(".operations.json") }
-            .flatMap { url -> [CollaborationConflictItem] in
-                let operations = loadCollaborationOperations(at: url)
+        let indexed = ((try? sparseDatabase().entries(kind: "operation", documentID: documentID)) ?? [])
+            .compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }
+        let grouped = Dictionary(grouping: indexed, by: \.pageID)
+        return grouped.values
+            .flatMap { operations -> [CollaborationConflictItem] in
                 guard let first = operations.first,
                       first.documentID == documentID else { return [] }
                 let state = CollaborationMergeEngine.materialize(operations)
@@ -2873,7 +3034,7 @@ final class DrawingDocumentStore: ObservableObject {
         try persistRegistry(folders: folders, documents: updatedMetadata)
         documentMetadata = updatedMetadata
         rebuildWorkspaceDocuments()
-        thumbnailCache.removeAll()
+        invalidatePagePresentation(documentID: documentID)
         signalLocalCloudChange()
     }
 
@@ -2897,14 +3058,12 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     func pageSize(at index: Int, in documentID: String) -> CGSize {
-        guard let page = page(at: index, in: documentID) else {
+        guard let metadata = pageMetadata(at: index, in: documentID) else {
             return CGSize(width: 595, height: 842)
         }
-        let bounds = page.bounds(for: .mediaBox)
-        let rotation = abs(page.rotation) % 180
-        return rotation == 90
-            ? CGSize(width: bounds.height, height: bounds.width)
-            : bounds.size
+        return abs(metadata.rotation) % 180 == 90
+            ? CGSize(width: metadata.height, height: metadata.width)
+            : CGSize(width: metadata.width, height: metadata.height)
     }
 
     func thumbnail(
@@ -2912,40 +3071,59 @@ final class DrawingDocumentStore: ObservableObject {
         in documentID: String,
         size: CGSize
     ) -> UIImage? {
-        let cacheKey = "\(documentID)#\(index)#\(Int(size.width))x\(Int(size.height))"
-        if let cachedImage = thumbnailCache[cacheKey] {
-            return cachedImage
-        }
-        guard let page = page(at: index, in: documentID) else { return nil }
-        let image: UIImage
-        if document(withID: documentID)?.kind == .canvas {
-            let bounds = exportBounds(forPage: index, in: documentID)
-            let scale = min(size.width / bounds.width, size.height / bounds.height)
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 2
-            format.opaque = true
-            image = UIGraphicsImageRenderer(
-                size: CGSize(width: bounds.width * scale, height: bounds.height * scale),
-                format: format
-            ).image { rendererContext in
-                rendererContext.cgContext.scaleBy(x: scale, y: scale)
-                renderFlattenedPage(
-                    documentID: documentID, pageIndex: index,
-                    bounds: bounds, context: rendererContext.cgContext
-                )
+        guard let metadata = pageMetadata(at: index, in: documentID) else { return nil }
+        let cacheKey = "\(documentID)#\(metadata.id)#\(Int(size.width))x\(Int(size.height))"
+        if thumbnailCache.count > 128 {
+            for key in thumbnailCache.keys.sorted().prefix(thumbnailCache.count - 96) where key != cacheKey {
+                thumbnailCache[key] = nil; thumbnailVisualKeys[key] = nil; dirtyThumbnailKeys.remove(key)
             }
-        } else {
-            image = page.thumbnail(of: size, for: .mediaBox)
         }
-        thumbnailCache[cacheKey] = image
-        return image
+        let visualKey = sparsePageVisualKey(metadata)
+        if thumbnailVisualKeys[cacheKey] != visualKey { dirtyThumbnailKeys.insert(cacheKey) }
+        let previous = thumbnailCache[cacheKey]
+        if let previous, !dirtyThumbnailKeys.contains(cacheKey) { return previous }
+        if index == 0 {
+            if let previous {
+                thumbnailVisualKeys[cacheKey] = visualKey
+                scheduleSparseCover(documentID)
+                return previous
+            }
+            if let entry = try? sparseDatabase().entry(kind: "cover", id: documentID),
+               entry.pageID == metadata.id, let path = entry.filePath,
+               let image = UIImage(contentsOfFile: path) {
+                thumbnailCache[cacheKey] = image
+                thumbnailVisualKeys[cacheKey] = visualKey
+                dirtyThumbnailKeys.remove(cacheKey)
+                return image
+            }
+            scheduleSparseCover(documentID)
+            return previous
+        }
+        guard pendingThumbnailIDs[cacheKey] == nil else { return previous }
+        let token = UUID(); pendingThumbnailIDs[cacheKey] = token
+        let sourceURL = metadata.sourcePDFPageIndex != nil ? document(withID: documentID)?.fileURL
+            : pageBackgroundURL(forPageID: metadata.id, in: documentID)
+        let operations = loadCollaborationOperations(forPageID: metadata.id, in: documentID)
+        Task { [weak self] in
+            let image = await Task.detached(priority: .utility) {
+                Self.renderSparsePreview(page: metadata, sourceURL: sourceURL, operations: operations, size: size)
+            }.value
+            guard let self, self.pendingThumbnailIDs[cacheKey] == token else { return }
+            self.pendingThumbnailIDs[cacheKey] = nil
+            if let image {
+                self.objectWillChange.send()
+                self.thumbnailCache[cacheKey] = image
+                self.thumbnailVisualKeys[cacheKey] = visualKey
+                self.dirtyThumbnailKeys.remove(cacheKey)
+            }
+        }
+        return previous
     }
 
     func thumbnail(forDeletedPage page: LibraryPage, size: CGSize) -> UIImage? {
         let cacheKey = "deleted#\(page.documentID)#\(page.id)#\(Int(size.width))x\(Int(size.height))"
         if let cachedImage = thumbnailCache[cacheKey] { return cachedImage }
-        let url = pageBackgroundURL(forPageID: page.id, in: page.documentID)
-        guard let pdfPage = PDFDocument(url: url)?.page(at: 0) else { return nil }
+        guard let pdfPage = resolvedPage(page) else { return nil }
         let image = pdfPage.thumbnail(of: size, for: .mediaBox)
         thumbnailCache[cacheKey] = image
         return image
@@ -3496,6 +3674,7 @@ final class DrawingDocumentStore: ObservableObject {
         do {
             try pendingSave.data.write(to: pendingSave.targetURL, options: .atomic)
             pendingAssetSaves[saveKey] = nil
+            bumpPageAssetRevision(for: pendingSave.reference)
             saveState = pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
             signalLocalCloudChange()
         } catch {
@@ -3560,6 +3739,7 @@ final class DrawingDocumentStore: ObservableObject {
         do {
             try pendingSave.data.write(to: pendingSave.targetURL, options: .atomic)
             pendingAssetSaves[saveKey] = nil
+            bumpPageAssetRevision(for: pendingSave.reference)
             saveState = pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
             signalLocalCloudChange()
         } catch {
@@ -3611,7 +3791,10 @@ final class DrawingDocumentStore: ObservableObject {
     func documentMetadataCollaborationFrontier(
         for documentID: String
     ) -> CollaborationVersionVector {
-        collaborationFrontier(
+        if let stamp = documentMetadata.first(where: { $0.id == documentID })?.titleRevision {
+            var frontier = stamp.context; frontier.observe(stamp.dot); return frontier
+        }
+        return collaborationFrontier(
             from: loadCollaborationOperations(
                 forPageID: CollaborationReservedID.documentMetadata,
                 in: documentID
@@ -3672,6 +3855,7 @@ final class DrawingDocumentStore: ObservableObject {
                 if pendingAssetSaves[key]?.token == pendingSave.token {
                     pendingAssetSaves[key] = nil
                 }
+                bumpPageAssetRevision(for: pendingSave.reference)
                 didWriteAsset = true
             } catch {
                 firstError = firstError ?? error
@@ -3828,26 +4012,12 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     func exportCollaborationOperations() -> [CollaborationOperation] {
-        guard let enumerator = fileManager.enumerator(
-            at: drawingsDirectory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        var operationsByID: [String: CollaborationOperation] = [:]
-        for case let url as URL in enumerator
-        where url.lastPathComponent.hasSuffix(".operations.json") {
-            for operation in loadCollaborationOperations(at: url) {
-                operationsByID[operation.id] = operation
-            }
+        var byID = Dictionary(uniqueKeysWithValues: ((try? sparseDatabase().entries(kind: "operation")) ?? [])
+            .compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }.map { ($0.id, $0) })
+        for pending in pendingCollaborationOperationsSaves.values {
+            for operation in pending.operations { byID[operation.id] = operation }
         }
-        for pendingSave in pendingCollaborationOperationsSaves.values {
-            for operation in pendingSave.operations {
-                operationsByID[operation.id] = operation
-            }
-        }
-        return operationsByID.values.sorted {
-            $0.deterministicallyPrecedes($1)
-        }
+        return byID.values.sorted { $0.deterministicallyPrecedes($1) }
     }
 
     func exportDocumentReferences(
@@ -4069,6 +4239,11 @@ final class DrawingDocumentStore: ObservableObject {
                 continue
             }
             let state = CollaborationMergeEngine.materialize(mergedOperations)
+            if !pages.contains(where: { $0.id == reference.pageID }),
+               (state.position != nil || state.isDeleted || state.metadata["rotation"] != nil || state.metadata["isBookmarked"] != nil),
+               let original = pages(in: reference.documentID).first(where: { $0.id == reference.pageID }) {
+                pages.append(original)
+            }
             if !state.isDeleted,
                !pages.contains(where: {
                    $0.id == reference.pageID && $0.documentID == reference.documentID
@@ -4119,9 +4294,14 @@ final class DrawingDocumentStore: ObservableObject {
                 $0.id == reference.pageID && $0.documentID == reference.documentID
             }) {
                 if state.isDeleted {
-                    pages.remove(at: index)
+                    pages[index].isRemoved = true
                     pageMetadataChanged = true
                 } else {
+                    if pages[index].isRemoved {
+                        pages[index].isRemoved = false
+                        pages[index].modifiedAt = mergedOperations.map(\.stamp.createdAt).max() ?? Date()
+                        pageMetadataChanged = true
+                    }
                     if let position = state.position, pages[index].position != position {
                         pages[index].position = position
                         pageMetadataChanged = true
@@ -4163,6 +4343,7 @@ final class DrawingDocumentStore: ObservableObject {
         if pageMetadataChanged || documentMetadataChanged {
             if pageMetadataChanged {
             for documentID in affectedDocumentIDs {
+                invalidatePagePresentation(documentID: documentID)
                 let orderedIDs = pages(in: documentID).map(\.id)
                 let orderByID = Dictionary(
                     uniqueKeysWithValues: orderedIDs.enumerated().map { ($1, $0) }
@@ -4185,13 +4366,12 @@ final class DrawingDocumentStore: ObservableObject {
             // replaying the immutable log here prevents it from resurrecting deleted strokes or
             // hiding concurrent objects merely because of delivery order.
             try rematerializeCollaborationAssets(for: documentID)
-            try rebuildPDFDocumentFromPageBackgrounds(documentID: documentID)
         }
     }
 
     private func rematerializeCollaborationAssets(for documentID: String) throws {
         let grouped = Dictionary(
-            grouping: exportCollaborationOperations().filter { $0.documentID == documentID },
+            grouping: ((try? sparseDatabase().entries(kind: "operation", documentID: documentID)) ?? []).compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) },
             by: \.pageID
         )
         var didChangeDocumentMetadata = false
@@ -4220,7 +4400,10 @@ final class DrawingDocumentStore: ObservableObject {
 
             if state.isDeleted {
                 let previousCount = pages.count
-                pages.removeAll { $0.id == pageID && $0.documentID == documentID }
+                if let index = pages.firstIndex(where: { $0.id == pageID && $0.documentID == documentID }) {
+                    pages[index].isRemoved = true
+                    didChangePageMetadata = true
+                }
                 if pages.count != previousCount {
                     didChangePageMetadata = true
                     bumpPageAssetRevision(forPageID: pageID, in: documentID)
@@ -4242,6 +4425,11 @@ final class DrawingDocumentStore: ObservableObject {
             guard let pageIndex = pages.firstIndex(where: {
                 $0.id == pageID && $0.documentID == documentID
             }) else { continue }
+            if pages[pageIndex].isRemoved {
+                pages[pageIndex].isRemoved = false
+                pages[pageIndex].modifiedAt = operations.map(\.stamp.createdAt).max() ?? Date()
+                didChangePageMetadata = true
+            }
             if let position = state.position, pages[pageIndex].position != position {
                 pages[pageIndex].position = position
                 didChangePageMetadata = true
@@ -4287,10 +4475,8 @@ final class DrawingDocumentStore: ObservableObject {
                 guard let data = encodedPageElements(Array(state.elements.values)) else {
                     throw LibraryStoreError.cannotApplyAsset(pageID)
                 }
-                try data.write(
-                    to: imageAnnotationsURL(forPageID: pageID, in: documentID),
-                    options: .atomic
-                )
+                let url = imageAnnotationsURL(forPageID: pageID, in: documentID)
+                if (try? Data(contentsOf: url)) != data { try data.write(to: url, options: .atomic) }
             }
             bumpPageAssetRevision(forPageID: pageID, in: documentID)
         }
@@ -4315,23 +4501,14 @@ final class DrawingDocumentStore: ObservableObject {
         }
     }
 
-    /// Page records/CKAssets are bootstrap snapshots. Rotation is selected by the causal metadata
-    /// register, so normalize whichever background asset won the CloudKit record race before the
-    /// document PDF is rebuilt.
+    /// Rotation belongs to page metadata; invalidate display copies without modifying source bytes.
     private func materializeCollaborationBackgroundRotation(
         _ rotation: Int,
         forPageID pageID: String,
         in documentID: String
     ) throws {
-        let url = pageBackgroundURL(forPageID: pageID, in: documentID)
-        guard let document = PDFDocument(url: url),
-              let page = document.page(at: 0),
-              normalizedPageRotation(page.rotation) != rotation else { return }
-        page.rotation = rotation
-        guard let data = document.dataRepresentation() else {
-            throw PDFWorkspaceError.invalidPDF(documentID)
-        }
-        try data.write(to: url, options: .atomic)
+        // Rotation is applied to a display-only PDFPage copy by resolvedPage(_:).
+        invalidatePagePresentation(documentID: documentID)
     }
 
     /// Applies a complete remote metadata snapshot. Assets can arrive before or after this call.
@@ -4350,6 +4527,7 @@ final class DrawingDocumentStore: ObservableObject {
         }
         for metadata in sanitized.documents {
             for stamp in [
+                metadata.titleRevision,
                 metadata.parentRevision,
                 metadata.favoriteRevision,
                 metadata.trashRevision
@@ -4362,7 +4540,7 @@ final class DrawingDocumentStore: ObservableObject {
         var normalizedPages = snapshot.pages
         for documentID in Set(snapshot.documents.map(\.id)) {
             if normalizedPages.allSatisfy({ $0.documentID != documentID }),
-               snapshot.documents.contains(where: { $0.id == documentID && $0.trashedAt == nil }) {
+               snapshot.documents.contains(where: { $0.id == documentID && $0.trashedAt == nil && $0.sourcePageCount == nil }) {
                 normalizedPages.append(try recoverPageForEmptyDocument(documentID))
             }
             let orderedIDs = normalizedPages
@@ -4393,9 +4571,33 @@ final class DrawingDocumentStore: ObservableObject {
         )
         try persistCollaborationClock()
 
+        let previousDocuments = Dictionary(uniqueKeysWithValues: documentMetadata.map { ($0.id, $0) })
+        let previousPages = Dictionary(grouping: pages, by: \.documentID)
+        let incomingPages = Dictionary(grouping: normalizedSnapshot.pages, by: \.documentID)
+        for document in normalizedSnapshot.documents {
+            let previous = previousDocuments[document.id]
+            let sourceChanged = previous?.fileName != document.fileName || previous?.isBundled != document.isBundled
+            let appearanceChanged = previous?.kind != document.kind
+                || previous?.canvasBackgroundStyle != document.canvasBackgroundStyle
+                || previous?.canvasBackgroundColor != document.canvasBackgroundColor
+            let oldPages = Dictionary(uniqueKeysWithValues: (previousPages[document.id] ?? []).map { ($0.id, $0) })
+            let newPages = incomingPages[document.id] ?? []
+            let pagesChanged = oldPages.count != newPages.count || newPages.contains { page in
+                guard let old = oldPages[page.id] else { return true }
+                return old.width != page.width || old.height != page.height || old.rotation != page.rotation
+                    || old.sourcePDFPageIndex != page.sourcePDFPageIndex || old.sourceKind != page.sourceKind
+                    || old.backgroundStyle != page.backgroundStyle || old.backgroundColor != page.backgroundColor
+                    || old.handoutSourceID != page.handoutSourceID
+            }
+            if sourceChanged { pdfCache[document.id] = nil }
+            if sourceChanged || appearanceChanged || pagesChanged {
+                invalidatePagePresentation(documentID: document.id)
+            }
+        }
         folders = normalizedSnapshot.folders
         documentMetadata = normalizedSnapshot.documents
         pages = normalizedSnapshot.pages
+        sparsePageCache.removeAll()
         rebuildWorkspaceDocuments()
         if !pendingDocumentReferences.isEmpty {
             try applyRemoteDocumentReferences(Array(pendingDocumentReferences.values))
@@ -4409,7 +4611,12 @@ final class DrawingDocumentStore: ObservableObject {
             openDocumentIDs = [firstDocumentID]
         }
         pdfCache = pdfCache.filter { availableIDs.contains($0.key) }
-        thumbnailCache.removeAll()
+        resolvedPageDocuments = resolvedPageDocuments.filter { availableIDs.contains(String($0.key.split(separator: "#")[0])) }
+        pendingThumbnailIDs = pendingThumbnailIDs.filter { availableIDs.contains(String($0.key.split(separator: "#")[0])) }
+        thumbnailCache = thumbnailCache.filter {
+            availableIDs.contains(String($0.key.split(separator: "#")[0]))
+        }
+        dirtyThumbnailKeys.formIntersection(thumbnailCache.keys)
         persistOpenDocuments()
     }
 
@@ -4424,15 +4631,15 @@ final class DrawingDocumentStore: ObservableObject {
             // Cloud record needs a canonical destination before its PDF asset exists locally.
             return fileURL(for: metadata)
         case .pageBackground(let pageID):
-            guard pages.contains(where: { $0.id == pageID && $0.documentID == reference.documentID })
+            guard pages(in: reference.documentID).contains(where: { $0.id == pageID })
             else { return nil }
             return pageBackgroundURL(forPageID: pageID, in: reference.documentID)
         case .pageDrawing(let pageID):
-            guard pages.contains(where: { $0.id == pageID && $0.documentID == reference.documentID })
+            guard pages(in: reference.documentID).contains(where: { $0.id == pageID })
             else { return nil }
             return drawingURL(forPageID: pageID, in: reference.documentID)
         case .pageElements(let pageID):
-            guard pages.contains(where: { $0.id == pageID && $0.documentID == reference.documentID })
+            guard pages(in: reference.documentID).contains(where: { $0.id == pageID })
             else { return nil }
             return imageAnnotationsURL(forPageID: pageID, in: reference.documentID)
         case .drawing(let pageIndex):
@@ -4525,12 +4732,11 @@ final class DrawingDocumentStore: ObservableObject {
             }
             switch reference.kind {
             case .pdf:
+                invalidatePagePresentation(documentID: reference.documentID)
                 pdfCache[reference.documentID] = nil
-                thumbnailCache = thumbnailCache.filter {
-                    !$0.key.hasPrefix("\(reference.documentID)#")
-                }
                 rebuildWorkspaceDocuments()
             case .pageBackground(let pageID):
+                invalidatePagePresentation(documentID: reference.documentID)
                 bumpPageAssetRevision(forPageID: pageID, in: reference.documentID)
             case .pageDrawing(let pageID), .pageElements(let pageID):
                 bumpPageAssetRevision(forPageID: pageID, in: reference.documentID)
@@ -4565,12 +4771,11 @@ final class DrawingDocumentStore: ObservableObject {
             }
             switch reference.kind {
             case .pdf:
+                invalidatePagePresentation(documentID: reference.documentID)
                 pdfCache[reference.documentID] = nil
-                thumbnailCache = thumbnailCache.filter {
-                    !$0.key.hasPrefix("\(reference.documentID)#")
-                }
                 rebuildWorkspaceDocuments()
             case .pageBackground(let pageID):
+                invalidatePagePresentation(documentID: reference.documentID)
                 bumpPageAssetRevision(forPageID: pageID, in: reference.documentID)
             case .pageDrawing(let pageID), .pageElements(let pageID):
                 bumpPageAssetRevision(forPageID: pageID, in: reference.documentID)
@@ -4586,42 +4791,21 @@ final class DrawingDocumentStore: ObservableObject {
         let bundledMetadata = defaultBundledMetadata()
         var needsRegistryUpgrade = false
 
-        if let registryData = try? Data(contentsOf: registryURL) {
-            if let registry = try? JSONDecoder().decode(LibraryRegistry.self, from: registryData) {
-                folders = registry.folders
-                documentMetadata = registry.documents
-                pages = registry.pages
-            } else if let legacyRecords = try? JSONDecoder().decode(
-                [LegacyImportedPDFRecord].self,
-                from: registryData
-            ) {
-                folders = []
-                pages = []
-                documentMetadata = bundledMetadata + legacyRecords.map { record in
-                    let fileURL = importsDirectory.appendingPathComponent(record.fileName)
-                    let dates = fileDates(for: fileURL)
-                    return LibraryDocumentMetadata(
-                        id: record.id,
-                        title: record.title,
-                        parentID: nil,
-                        fileName: record.fileName,
-                        isBundled: false,
-                        createdAt: dates.createdAt,
-                        modifiedAt: dates.modifiedAt
-                    )
-                }
-                needsRegistryUpgrade = true
-            } else {
-                folders = []
-                pages = []
+        do {
+            let db = try sparseDatabase()
+            let decoder = JSONDecoder()
+            folders = try db.entries(kind: "folder").map { try decoder.decode(LibraryFolder.self, from: $0.payload) }
+            documentMetadata = try db.entries(kind: "document").map { try decoder.decode(LibraryDocumentMetadata.self, from: $0.payload) }
+            pages = try db.entries(kind: "page").map { try decoder.decode(LibraryPage.self, from: $0.payload) }
+            if documentMetadata.isEmpty && folders.isEmpty {
                 documentMetadata = bundledMetadata
-                needsRegistryUpgrade = true
+                needsRegistryUpgrade = !bundledMetadata.isEmpty
             }
-        } else {
-            folders = []
-            pages = []
-            documentMetadata = bundledMetadata
-            needsRegistryUpgrade = true
+            persistedRegistry = LibraryRegistry(schemaVersion: LibrarySnapshot.currentSchemaVersion,
+                folders: folders, documents: documentMetadata, pages: pages)
+        } catch {
+            saveState = .failed("资料库无法读取：\(error.localizedDescription)")
+            return
         }
 
         // A committed deletion ledger is authoritative even if the process stopped before the
@@ -4661,6 +4845,7 @@ final class DrawingDocumentStore: ObservableObject {
         }
         for metadata in documentMetadata {
             for stamp in [
+                metadata.titleRevision,
                 metadata.parentRevision,
                 metadata.favoriteRevision,
                 metadata.trashRevision
@@ -4675,22 +4860,6 @@ final class DrawingDocumentStore: ObservableObject {
 
         rebuildWorkspaceDocuments()
         needsRegistryUpgrade = reconcilePageMetadata() || needsRegistryUpgrade
-        for metadata in documentMetadata where !metadata.isBundled {
-            guard let pdf = pdfDocument(for: metadata.id) else { continue }
-            let documentPages = pages(in: metadata.id)
-            let needsBackgrounds = documentPages.contains {
-                !fileManager.fileExists(
-                    atPath: pageBackgroundURL(forPageID: $0.id, in: metadata.id).path
-                )
-            }
-            if needsBackgrounds {
-                try? persistPageBackgroundAssets(
-                    pages: documentPages,
-                    from: pdf,
-                    documentID: metadata.id
-                )
-            }
-        }
         if needsRegistryUpgrade {
             try? persistRegistry(folders: folders, documents: documentMetadata, pages: pages)
         }
@@ -4713,16 +4882,31 @@ final class DrawingDocumentStore: ObservableObject {
         documents: [LibraryDocumentMetadata],
         pages persistedPages: [LibraryPage]? = nil
     ) throws {
-        let registry = LibraryRegistry(
-            schemaVersion: LibrarySnapshot.currentSchemaVersion,
-            folders: folders,
-            documents: documents,
-            pages: persistedPages ?? pages
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(registry)
-        try data.write(to: registryURL, options: .atomic)
+        let storedPages = (persistedPages ?? pages).filter { !isImplicitDefault($0, documents: documents) }
+        let db = try sparseDatabase()
+        let old = persistedRegistry
+        try db.transaction {
+            try persistSparseEntities(folders, previous: old?.folders ?? [], kind: "folder", database: db)
+            try persistSparseEntities(documents, previous: old?.documents ?? [], kind: "document", database: db)
+            try persistSparseEntities(storedPages, previous: old?.pages ?? [], kind: "page", database: db)
+            if !applyingSparseRemote {
+                let oldPages = Dictionary(uniqueKeysWithValues: (old?.pages ?? []).map { ($0.id, $0) })
+                for page in storedPages where oldPages[page.id] == nil && page.sourcePDFPageIndex == nil {
+                    let url = pageBackgroundURL(forPageID: page.id, in: page.documentID)
+                    if fileManager.fileExists(atPath: url.path) {
+                        try registerSparseAsset(url, documentID: page.documentID, kind: .pageBackground(pageID: page.id))
+                    }
+                }
+            }
+            for metadata in documents where old?.documents.contains(where: { $0.id == metadata.id && $0.fileName == metadata.fileName }) != true {
+                if !applyingSparseRemote, let url = fileURL(for: metadata), fileManager.fileExists(atPath: url.path) {
+                    try registerSparseAsset(url, documentID: metadata.id, kind: .pdf)
+                    scheduleSparseCover(metadata.id)
+                }
+            }
+        }
+        persistedRegistry = LibraryRegistry(schemaVersion: LibrarySnapshot.currentSchemaVersion,
+            folders: folders, documents: documents, pages: storedPages)
     }
 
     private func beginWorkspaceTransaction(
@@ -4744,7 +4928,7 @@ final class DrawingDocumentStore: ObservableObject {
 
         do {
             let uniqueURLs = Dictionary(
-                affectedURLs.map { ($0.standardizedFileURL.path, $0.standardizedFileURL) },
+                affectedURLs.filter { $0 != registryURL }.map { ($0.standardizedFileURL.path, $0.standardizedFileURL) },
                 uniquingKeysWith: { first, _ in first }
             ).values.sorted { $0.path < $1.path }
             var entries: [WorkspaceTransactionEntry] = []
@@ -4776,6 +4960,7 @@ final class DrawingDocumentStore: ObservableObject {
                 entries: entries
             )
             try Self.writeWorkspaceTransactionJournal(journal, in: directory)
+            try sparseDatabase().execute("SAVEPOINT workspace_\(transactionID.replacingOccurrences(of: "-", with: ""))")
             return ActiveWorkspaceTransaction(
                 directory: directory,
                 journal: journal,
@@ -4789,6 +4974,9 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func commitWorkspaceTransaction(_ transaction: ActiveWorkspaceTransaction) throws {
+        let db = try sparseDatabase()
+        try db.setState("committed-workspace-transaction|\(transaction.journal.id)", Data([1]))
+        try db.execute("RELEASE workspace_\(transaction.journal.id.replacingOccurrences(of: "-", with: ""))")
         var committed = transaction.journal
         committed.phase = .committed
         try Self.writeWorkspaceTransactionJournal(committed, in: transaction.directory)
@@ -4798,6 +4986,12 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func rollbackWorkspaceTransaction(_ transaction: ActiveWorkspaceTransaction) {
+        if let db = sparseDatabaseHandle {
+            let savepoint = "workspace_" + transaction.journal.id.replacingOccurrences(of: "-", with: "")
+            try? db.execute("ROLLBACK TO \(savepoint)")
+            try? db.execute("RELEASE \(savepoint)")
+        }
+        persistedRegistry = nil
         do {
             try Self.restoreWorkspaceTransaction(
                 transaction.journal,
@@ -4813,9 +5007,14 @@ final class DrawingDocumentStore: ObservableObject {
         documentMetadata = transaction.snapshotBefore.documents
         pages = transaction.snapshotBefore.pages
         collaborationClock = transaction.clockBefore
+        persistedRegistry = LibraryRegistry(schemaVersion: LibrarySnapshot.currentSchemaVersion, folders: folders, documents: documentMetadata, pages: pages)
         pdfCache.removeAll()
+        resolvedPageDocuments.removeAll()
+        pendingThumbnailIDs.removeAll()
+        dirtyThumbnailKeys.removeAll()
         thumbnailCache.removeAll()
         collaborationOperationsCache.removeAll()
+        sparseKnownOperationIDs.removeAll()
         rebuildWorkspaceDocuments()
         pageAssetGeneration &+= 1
     }
@@ -4871,7 +5070,9 @@ final class DrawingDocumentStore: ObservableObject {
                 continue
             }
             do {
-                if journal.phase == .prepared {
+                let database = try? SparseLibraryDatabase(url: workspaceDirectory.appendingPathComponent("library-v2.sqlite"))
+                let databaseCommitted = (try? database?.state("committed-workspace-transaction|\(journal.id)")) != nil
+                if journal.phase == .prepared && !databaseCommitted {
                     try restoreWorkspaceTransaction(
                         journal,
                         from: directory,
@@ -5077,6 +5278,7 @@ final class DrawingDocumentStore: ObservableObject {
                 width: Double(max(bounds.width, 1)),
                 height: Double(max(bounds.height, 1)),
                 rotation: pdfPage.rotation,
+                sourcePDFPageIndex: metadata.kind == .canvas ? nil : pageIndex,
                 sourceKind: metadata.kind == .canvas ? .template : .pdf,
                 backgroundStyle: metadata.kind == .canvas
                     ? metadata.canvasBackgroundStyle
@@ -5088,56 +5290,14 @@ final class DrawingDocumentStore: ObservableObject {
         }
     }
 
-    private func persistPageBackgroundAssets(
-        pages: [LibraryPage],
-        from pdf: PDFDocument,
-        documentID: String
-    ) throws {
-        for page in pages.sorted(by: { $0.orderIndex < $1.orderIndex }) {
-            guard let sourcePage = pdf.page(at: page.orderIndex),
-                  let copiedPage = sourcePage.copy() as? PDFPage else {
-                throw PDFWorkspaceError.invalidPDF(documentID)
-            }
-            let pageDocument = PDFDocument()
-            pageDocument.insert(copiedPage, at: 0)
-            guard let data = pageDocument.dataRepresentation() else {
-                throw PDFWorkspaceError.invalidPDF(documentID)
-            }
-            try data.write(
-                to: pageBackgroundURL(forPageID: page.id, in: documentID),
-                options: .atomic
-            )
-        }
+    private func invalidatePagePresentation(documentID: String) {
+        pendingThumbnailIDs = pendingThumbnailIDs.filter { !$0.key.hasPrefix("\(documentID)#") }
+        resolvedPageDocuments = resolvedPageDocuments.filter { !$0.key.hasPrefix("\(documentID)#") }
+        pageAssetGeneration &+= 1
     }
 
-    private func rebuildPDFDocumentFromPageBackgrounds(documentID: String) throws {
-        guard let metadata = documentMetadata.first(where: { $0.id == documentID }),
-              !metadata.isBundled else { return }
-        let orderedPages = pages(in: documentID)
-        guard !orderedPages.isEmpty else { return }
-        let sourceDocuments = orderedPages.map {
-            PDFDocument(url: pageBackgroundURL(forPageID: $0.id, in: documentID))
-        }
-        guard sourceDocuments.allSatisfy({ $0?.pageCount == 1 }) else { return }
-
-        let rebuilt = PDFDocument()
-        for sourceDocument in sourceDocuments {
-            guard let page = sourceDocument?.page(at: 0)?.copy() as? PDFPage else {
-                throw PDFWorkspaceError.invalidPDF(metadata.title)
-            }
-            rebuilt.insert(page, at: rebuilt.pageCount)
-        }
-        guard let data = rebuilt.dataRepresentation(), let targetURL = fileURL(for: metadata) else {
-            throw PDFWorkspaceError.invalidPDF(metadata.title)
-        }
-        try data.write(to: targetURL, options: .atomic)
-        pdfCache[documentID] = rebuilt
-        thumbnailCache = thumbnailCache.filter { !$0.key.hasPrefix("\(documentID)#") }
-        rebuildWorkspaceDocuments()
-    }
-
-    /// Creates stable page identities for v1/v2 registries and repairs interrupted page edits.
-    /// Legacy page-number asset files are moved once to their stable page-ID destinations.
+    /// Keep the saved page manifest authoritative, including when source assets arrive later.
+    /// Only documents without a manifest initialize identities from the source PDF.
     @discardableResult
     private func reconcilePageMetadata() -> Bool {
         let availableDocumentIDs = Set(documentMetadata.map(\.id))
@@ -5158,7 +5318,6 @@ final class DrawingDocumentStore: ObservableObject {
 
         var reconciledPages: [LibraryPage] = []
         for metadata in documentMetadata.sorted(by: { $0.id < $1.id }) {
-            guard let pdf = pdfDocument(for: metadata.id) else { continue }
             let existing = pagesByID.values
                 .filter { $0.documentID == metadata.id }
                 .sorted {
@@ -5166,53 +5325,12 @@ final class DrawingDocumentStore: ObservableObject {
                     return $0.id < $1.id
                 }
 
-            if existing.count != pdf.pageCount { didChange = true }
-            for pageIndex in 0..<pdf.pageCount {
-                guard let pdfPage = pdf.page(at: pageIndex) else { continue }
-                let pageBounds = pdfPage.bounds(for: .mediaBox)
-                var page: LibraryPage
-                if existing.indices.contains(pageIndex) {
-                    page = existing[pageIndex]
-                    if page.orderIndex != pageIndex {
-                        page.orderIndex = pageIndex
-                        didChange = true
-                    }
-                    if page.width <= 0 || page.height <= 0 {
-                        page.width = Double(max(pageBounds.width, 1))
-                        page.height = Double(max(pageBounds.height, 1))
-                        didChange = true
-                    }
-                } else {
-                    page = LibraryPage(
-                        id: deterministicLegacyPageID(
-                            documentID: metadata.id,
-                            pageIndex: pageIndex
-                        ),
-                        documentID: metadata.id,
-                        orderIndex: pageIndex,
-                        createdAt: metadata.createdAt,
-                        modifiedAt: metadata.modifiedAt,
-                        width: Double(max(pageBounds.width, 1)),
-                        height: Double(max(pageBounds.height, 1)),
-                        rotation: pdfPage.rotation,
-                        sourceKind: metadata.kind == .canvas ? .template : .pdf,
-                        backgroundStyle: metadata.kind == .canvas
-                            ? metadata.canvasBackgroundStyle
-                            : nil,
-                        backgroundColor: metadata.kind == .canvas
-                            ? metadata.canvasBackgroundColor
-                            : nil
-                    )
-                    didChange = true
-                }
-                reconciledPages.append(page)
-                if migrateLegacyPageAssets(
-                    documentID: metadata.id,
-                    pageIndex: pageIndex,
-                    pageID: page.id
-                ) {
-                    didChange = true
-                }
+            if !existing.isEmpty {
+                reconciledPages.append(contentsOf: existing)
+            } else if metadata.sourcePageCount == nil {
+                guard let pdf = pdfDocument(for: metadata.id) else { continue }
+                reconciledPages.append(contentsOf: makePageMetadata(for: metadata, pdf: pdf))
+                didChange = true
             }
         }
 
@@ -5258,6 +5376,9 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func fileURL(for metadata: LibraryDocumentMetadata) -> URL? {
+        if let resourceID = metadata.sourceResourceID,
+           let entry = try? sparseDatabase().entry(kind: "asset", id: resourceID),
+           let path = entry.filePath, fileManager.fileExists(atPath: path) { return URL(fileURLWithPath: path) }
         if metadata.isBundled {
             let fileURL = URL(fileURLWithPath: metadata.fileName)
             return Bundle.main.url(
@@ -5366,7 +5487,7 @@ final class DrawingDocumentStore: ObservableObject {
         // Distinct records pointing at one imported PDF would overwrite each other's asset.
         var seenImportedFileNames = Set<String>()
         sanitizedDocuments = sanitizedDocuments.filter { document in
-            guard !document.isBundled else { return true }
+            guard !document.isBundled, document.sourceResourceID == nil else { return true }
             let inserted = seenImportedFileNames.insert(document.fileName).inserted
             if !inserted { didChange = true }
             return inserted
@@ -5688,7 +5809,10 @@ final class DrawingDocumentStore: ObservableObject {
 
     private func cleanupDeletedDocumentAssets(_ deletedMetadata: [LibraryDocumentMetadata]) {
         for metadata in deletedMetadata {
-            if !metadata.isBundled, let url = fileURL(for: metadata) {
+            let resourceStillReferenced = documentMetadata.contains {
+                ($0.sourceResourceID ?? $0.id) == (metadata.sourceResourceID ?? metadata.id)
+            }
+            if !metadata.isBundled, !resourceStillReferenced, let url = fileURL(for: metadata) {
                 try? fileManager.removeItem(at: url)
             }
             let drawingsURL = documentDrawingsDirectory(
@@ -5889,7 +6013,7 @@ final class DrawingDocumentStore: ObservableObject {
             if let parentID = document.parentID, !availableFolderIDs.contains(parentID) {
                 throw LibraryStoreError.invalidSnapshot("文档引用了不存在的父文件夹")
             }
-            if !document.isBundled,
+            if !document.isBundled, document.sourceResourceID == nil,
                !nonBundledFileNames.insert(document.fileName).inserted {
                 throw LibraryStoreError.invalidSnapshot("多个文档引用了同一 PDF 文件")
             }
@@ -6935,71 +7059,31 @@ final class DrawingDocumentStore: ObservableObject {
         forPageID pageID: String,
         in documentID: String
     ) -> [CollaborationOperation] {
-        let url = collaborationOperationsURL(forPageID: pageID, in: documentID)
-        return loadCollaborationOperations(at: url)
-    }
-
-    private func loadCollaborationOperations(at url: URL) -> [CollaborationOperation] {
-        let cacheKey = url.standardizedFileURL.path
-        if let pendingSave = pendingCollaborationOperationsSaves[cacheKey] {
-            return pendingSave.operations
-        }
-        guard let signature = collaborationOperationsFileSignature(at: url) else {
-            collaborationOperationsCache[cacheKey] = nil
-            return []
-        }
-        if let cached = collaborationOperationsCache[cacheKey],
-           cached.signature == signature {
-            return cached.operations
-        }
-
-        let operations: [CollaborationOperation]
-        if let data = try? Data(contentsOf: url),
-           let archive = try? JSONDecoder().decode(
-            CollaborationPageOperationArchive.self,
-            from: data
-           ),
-           archive.schemaVersion > 0,
-           archive.schemaVersion <= CollaborationPageOperationArchive.currentSchemaVersion {
-            operations = archive.operations
-        } else {
-            operations = []
-        }
-        collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
-            signature: signature,
-            operations: operations
-        )
-        return operations
+        let key = collaborationOperationsURL(forPageID: pageID, in: documentID).standardizedFileURL.path
+        if let pending = pendingCollaborationOperationsSaves[key] { return pending.operations }
+        if let cached = collaborationOperationsCache[key] { return cached }
+        let indexed = (try? sparseDatabase().entries(kind: "operation", documentID: documentID, pageID: pageID)) ?? []
+        let result = indexed.compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }
+            .sorted { $0.deterministicallyPrecedes($1) }
+        sparseKnownOperationIDs.formUnion(result.map(\.id))
+        collaborationOperationsCache[key] = result
+        return result
     }
 
     private func saveCollaborationOperations(
-        _ operations: [CollaborationOperation],
-        forPageID pageID: String,
-        in documentID: String
+        _ operations: [CollaborationOperation], forPageID pageID: String, in documentID: String
     ) throws {
-        let url = collaborationOperationsURL(forPageID: pageID, in: documentID)
-        let cacheKey = url.standardizedFileURL.path
-        pendingCollaborationOperationsTasks[cacheKey]?.cancel()
-        pendingCollaborationOperationsTasks[cacheKey] = nil
-        pendingCollaborationOperationsSaves[cacheKey] = nil
-        markCollaborationOperationsChanged(cacheKey: cacheKey)
-        let encoded = try Self.encodedCollaborationOperations(operations)
-        try encoded.data.write(to: url, options: .atomic)
-        if let signature = collaborationOperationsFileSignature(at: url) {
-            collaborationOperationsCache[cacheKey] =
-                CollaborationOperationsCacheEntry(
-                    signature: signature,
-                    operations: encoded.operations
-                )
-        } else {
-            collaborationOperationsCache[cacheKey] = nil
-        }
+        let key = collaborationOperationsURL(forPageID: pageID, in: documentID).standardizedFileURL.path
+        try indexSparseOperations(operations)
+        pendingCollaborationOperationsTasks[key]?.cancel()
+        pendingCollaborationOperationsTasks[key] = nil
+        pendingCollaborationOperationsSaves[key] = nil
+        collaborationOperationsCache[key] = operations
+        markCollaborationOperationsChanged(cacheKey: key)
     }
 
-    /// Drawing edits use this path so the full JSON archive is encoded away from MainActor. The
-    /// decoded operation array remains immediately available to recovery and CloudKit export; a
-    /// page close or scene transition drains it synchronously if the background encoding has not
-    /// completed yet.
+    /// Coalesce editor changes during the input quiet window. Only new operations are inserted
+    /// into SQLite; there is no whole-page JSON archive to encode or rewrite.
     private func scheduleCollaborationOperationsSave(
         _ operations: [CollaborationOperation],
         forPageID pageID: String,
@@ -7037,172 +7121,41 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func schedulePendingCollaborationOperationsSave(
-        _ pendingSave: PendingCollaborationOperationsSave,
-        cacheKey: String
+        _ pendingSave: PendingCollaborationOperationsSave, cacheKey: String
     ) {
         pendingCollaborationOperationsTasks[cacheKey]?.cancel()
         let delay = drawingPersistenceQuietTimeRemaining()
-        pendingCollaborationOperationsTasks[cacheKey] = Task.detached(priority: .background) {
-            [weak self] in
-            let stagingURL = pendingSave.targetURL
-                .deletingLastPathComponent()
-                .appendingPathComponent(
-                    ".\(pendingSave.targetURL.lastPathComponent)."
-                        + "\(pendingSave.token.uuidString.lowercased()).pending"
-                )
-            do {
-                try await Task.sleep(
-                    nanoseconds: UInt64(delay * 1_000_000_000)
-                )
-                guard !Task.isCancelled else { return }
-                let encoded = try Self.encodedCollaborationOperations(pendingSave.operations)
-                guard !Task.isCancelled else { return }
-                try encoded.data.write(to: stagingURL, options: .atomic)
-                guard !Task.isCancelled else {
-                    try? FileManager.default.removeItem(at: stagingURL)
-                    return
-                }
-                guard let self else {
-                    try? FileManager.default.removeItem(at: stagingURL)
-                    return
-                }
-                await self.finishScheduledCollaborationOperationsSave(
-                    pendingSave,
-                    cacheKey: cacheKey,
-                    encoded: encoded,
-                    stagingURL: stagingURL
-                )
-            } catch {
-                try? FileManager.default.removeItem(at: stagingURL)
-                guard !Task.isCancelled else { return }
-                await self?.failScheduledCollaborationOperationsSave(
-                    pendingSave,
-                    cacheKey: cacheKey,
-                    error: error
-                )
+        pendingCollaborationOperationsTasks[cacheKey] = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, !Task.isCancelled,
+                  self.pendingCollaborationOperationsSaves[cacheKey]?.token == pendingSave.token else { return }
+            self.pendingCollaborationOperationsTasks[cacheKey] = nil
+            guard !self.isDrawingInteractionActive else { return }
+            if self.drawingPersistenceQuietTimeRemaining() > 0 {
+                self.schedulePendingCollaborationOperationsSave(pendingSave, cacheKey: cacheKey)
+                return
             }
+            _ = self.flushPendingCollaborationOperationsSaves(withKeys: [cacheKey])
         }
-    }
-
-    private func finishScheduledCollaborationOperationsSave(
-        _ pendingSave: PendingCollaborationOperationsSave,
-        cacheKey: String,
-        encoded: (data: Data, operations: [CollaborationOperation]),
-        stagingURL: URL
-    ) {
-        guard pendingCollaborationOperationsSaves[cacheKey]?.token == pendingSave.token else {
-            try? FileManager.default.removeItem(at: stagingURL)
-            return
-        }
-        pendingCollaborationOperationsTasks[cacheKey] = nil
-        guard !isDrawingInteractionActive else {
-            try? FileManager.default.removeItem(at: stagingURL)
-            return
-        }
-        if drawingPersistenceQuietTimeRemaining() > 0 {
-            try? FileManager.default.removeItem(at: stagingURL)
-            schedulePendingCollaborationOperationsSave(pendingSave, cacheKey: cacheKey)
-            return
-        }
-        do {
-            // Encoding and writing happen off MainActor; only the same-volume rename is installed
-            // here after one final Pencil-idle check.
-            try Self.installStagedFile(stagingURL, at: pendingSave.targetURL)
-            pendingCollaborationOperationsSaves[cacheKey] = nil
-            if let signature = collaborationOperationsFileSignature(at: pendingSave.targetURL) {
-                collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
-                    signature: signature,
-                    operations: encoded.operations
-                )
-            } else {
-                collaborationOperationsCache[cacheKey] = nil
-            }
-            saveState = pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
-            signalLocalCloudChange()
-        } catch {
-            try? FileManager.default.removeItem(at: stagingURL)
-            saveState = .failed("协作操作无法保存：\(error.localizedDescription)")
-        }
-    }
-
-    private func failScheduledCollaborationOperationsSave(
-        _ pendingSave: PendingCollaborationOperationsSave,
-        cacheKey: String,
-        error: Error
-    ) {
-        guard pendingCollaborationOperationsSaves[cacheKey]?.token == pendingSave.token else {
-            return
-        }
-        pendingCollaborationOperationsTasks[cacheKey] = nil
-        saveState = .failed("协作操作无法保存：\(error.localizedDescription)")
     }
 
     private func flushPendingCollaborationOperationsSaves(withKeys keys: [String]) -> Bool {
-        var firstError: Error?
-        var didPersistOperations = false
-        for cacheKey in keys {
-            pendingCollaborationOperationsTasks[cacheKey]?.cancel()
-            pendingCollaborationOperationsTasks[cacheKey] = nil
-            guard let pendingSave = pendingCollaborationOperationsSaves[cacheKey] else { continue }
+        var wrote = false
+        for key in keys {
+            guard let pending = pendingCollaborationOperationsSaves[key] else { continue }
             do {
-                let encoded = try Self.encodedCollaborationOperations(pendingSave.operations)
-                try encoded.data.write(to: pendingSave.targetURL, options: .atomic)
-                pendingCollaborationOperationsSaves[cacheKey] = nil
-                if let signature = collaborationOperationsFileSignature(at: pendingSave.targetURL) {
-                    collaborationOperationsCache[cacheKey] = CollaborationOperationsCacheEntry(
-                        signature: signature,
-                        operations: encoded.operations
-                    )
-                } else {
-                    collaborationOperationsCache[cacheKey] = nil
-                }
-                didPersistOperations = true
+                try saveCollaborationOperations(pending.operations, forPageID: pending.pageID, in: pending.documentID)
+                wrote = true
             } catch {
-                firstError = firstError ?? error
+                saveState = .failed("笔迹操作无法保存：\(error.localizedDescription)")
+                return false
             }
         }
-        if let firstError {
-            saveState = .failed("协作操作无法保存：\(firstError.localizedDescription)")
-            return false
-        }
-        if didPersistOperations {
+        if wrote {
             saveState = pendingAssetSaves.isEmpty ? .saved(Date()) : .saving
             signalLocalCloudChange()
         }
         return true
-    }
-
-    nonisolated private static func encodedCollaborationOperations(
-        _ operations: [CollaborationOperation]
-    ) throws -> (data: Data, operations: [CollaborationOperation]) {
-        var unique: [String: CollaborationOperation] = [:]
-        for operation in operations {
-            if let current = unique[operation.id] {
-                unique[operation.id] = .preferred(current, operation)
-            } else {
-                unique[operation.id] = operation
-            }
-        }
-        let canonicalOperations = unique.values.sorted {
-            $0.deterministicallyPrecedes($1)
-        }
-        let archive = CollaborationPageOperationArchive(operations: canonicalOperations)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return (try encoder.encode(archive), canonicalOperations)
-    }
-
-    private func collaborationOperationsFileSignature(
-        at url: URL
-    ) -> CollaborationOperationsFileSignature? {
-        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else {
-            return nil
-        }
-        let byteCount = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        return CollaborationOperationsFileSignature(
-            byteCount: byteCount,
-            modifiedAt: attributes[.modificationDate] as? Date
-        )
     }
 
     private func encodedPageElements(_ pageElements: [CanvasPageElement]) -> Data? {
@@ -7227,10 +7180,9 @@ final class DrawingDocumentStore: ObservableObject {
         forPageID pageID: String,
         in documentID: String
     ) throws {
-        try collaborationDrawingData(from: operations).write(
-            to: drawingURL(forPageID: pageID, in: documentID),
-            options: .atomic
-        )
+        let data = collaborationDrawingData(from: operations)
+        let url = drawingURL(forPageID: pageID, in: documentID)
+        if (try? Data(contentsOf: url)) != data { try data.write(to: url, options: .atomic) }
     }
 
     private func collaborationDrawingData(
@@ -7420,7 +7372,7 @@ final class DrawingDocumentStore: ObservableObject {
 
     private func prepareDocumentForPageEditing(_ documentID: String) throws {
         guard let metadataIndex = documentMetadata.firstIndex(where: { $0.id == documentID }),
-              let currentPDF = pdfDocument(for: documentID) else {
+              pdfDocument(for: documentID) != nil else {
             throw LibraryStoreError.documentNotFound(documentID)
         }
         guard documentMetadata[metadataIndex].trashedAt == nil else {
@@ -7448,11 +7400,6 @@ final class DrawingDocumentStore: ObservableObject {
             updatedMetadata[metadataIndex].modifiedAt = contentDate
             do {
                 try fileManager.copyItem(at: sourceURL, to: targetURL)
-                try persistPageBackgroundAssets(
-                    pages: documentPages,
-                    from: currentPDF,
-                    documentID: documentID
-                )
                 try persistRegistry(
                     folders: folders,
                     documents: updatedMetadata,
@@ -7469,30 +7416,6 @@ final class DrawingDocumentStore: ObservableObject {
             return
         }
 
-        let hasEveryBackground = documentPages.allSatisfy {
-            fileManager.fileExists(
-                atPath: pageBackgroundURL(forPageID: $0.id, in: documentID).path
-            )
-        }
-        if !hasEveryBackground {
-            let transaction = try beginWorkspaceTransaction(
-                kind: "prepare-page-backgrounds",
-                affectedURLs: documentPages.map {
-                    pageBackgroundURL(forPageID: $0.id, in: documentID)
-                }
-            )
-            do {
-                try persistPageBackgroundAssets(
-                    pages: documentPages,
-                    from: currentPDF,
-                    documentID: documentID
-                )
-                try commitWorkspaceTransaction(transaction)
-            } catch {
-                rollbackWorkspaceTransaction(transaction)
-                throw error
-            }
-        }
     }
 
     private func commitPageMutation(
@@ -7500,10 +7423,6 @@ final class DrawingDocumentStore: ObservableObject {
         in documentID: String
     ) throws {
         let previousPages = pages
-        let previousPDFData = documentMetadata
-            .first(where: { $0.id == documentID })
-            .flatMap(fileURL(for:))
-            .flatMap { try? Data(contentsOf: $0) }
         var normalizedDocumentPages = proposedDocumentPages.sorted {
             if $0.position != $1.position { return $0.position < $1.position }
             return $0.id < $1.id
@@ -7511,26 +7430,34 @@ final class DrawingDocumentStore: ObservableObject {
         for index in normalizedDocumentPages.indices {
             normalizedDocumentPages[index].orderIndex = index
         }
-        pages = previousPages.filter { $0.documentID != documentID } + normalizedDocumentPages
-        pages.sort {
-            if $0.documentID != $1.documentID { return $0.documentID < $1.documentID }
-            if $0.position != $1.position { return $0.position < $1.position }
-            return $0.id < $1.id
+        let activeIDs = Set(normalizedDocumentPages.map(\.id))
+        var overrides = normalizedDocumentPages.filter { !isImplicitDefault($0) }
+        let sourceCount = documentMetadata.first { $0.id == documentID }?.sourcePageCount ?? 0
+        for index in 0..<sourceCount {
+            guard var original = implicitPage(sourceIndex: index, in: documentID),
+                  !activeIDs.contains(original.id) else { continue }
+            original.isRemoved = true
+            overrides.append(original)
+        }
+        for var oldPage in previousPages where oldPage.documentID == documentID && !activeIDs.contains(oldPage.id)
+            && !overrides.contains(where: { $0.id == oldPage.id }) {
+            oldPage.isRemoved = true
+            overrides.append(oldPage)
+        }
+        let beforeCover = pageMetadata(at: 0, in: documentID)
+        pages = previousPages.filter { $0.documentID != documentID } + overrides
+        let afterCover = pageMetadata(at: 0, in: documentID)
+        if beforeCover?.id != afterCover?.id || beforeCover.map(sparsePageVisualKey) != afterCover.map(sparsePageVisualKey) {
+            scheduleSparseCover(documentID, invalidating: true)
         }
 
         do {
-            try rebuildPDFDocumentFromPageBackgrounds(documentID: documentID)
+            invalidatePagePresentation(documentID: documentID)
             try persistRegistry(folders: folders, documents: documentMetadata, pages: pages)
             pageAssetGeneration &+= 1
         } catch {
             pages = previousPages
-            if let previousPDFData,
-               let metadata = documentMetadata.first(where: { $0.id == documentID }),
-               let targetURL = fileURL(for: metadata) {
-                try? previousPDFData.write(to: targetURL, options: .atomic)
-                pdfCache[documentID] = PDFDocument(data: previousPDFData)
-                rebuildWorkspaceDocuments()
-            }
+            invalidatePagePresentation(documentID: documentID)
             throw error
         }
     }
@@ -7555,16 +7482,10 @@ final class DrawingDocumentStore: ObservableObject {
     /// pages. If the merged active set becomes empty, restore a deterministic archived page.
     /// Every replica keeps the same page identity; a later user deletion can then proceed normally.
     private func recoverPageForEmptyDocument(_ documentID: String) throws -> LibraryPage {
-        let directory = documentDrawingsDirectory(for: documentID, createIfNeeded: true)
-        let operationURLs = (try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ))?.filter { $0.lastPathComponent.hasSuffix(".operations.json") } ?? []
-
+        let operationsByPage = Dictionary(grouping: ((try? sparseDatabase().entries(kind: "operation", documentID: documentID)) ?? [])
+            .compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }, by: \.pageID)
         var archivedPages: [(page: LibraryPage, state: MaterializedCollaborationPage)] = []
-        for url in operationURLs {
-            let operations = loadCollaborationOperations(at: url)
+        for operations in operationsByPage.values {
             guard !operations.isEmpty else { continue }
             for operation in operations {
                 collaborationClock.observe(operation.stamp)
@@ -7634,6 +7555,7 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func ensureRecoveryBackground(for page: LibraryPage) throws {
+        guard page.sourcePDFPageIndex == nil, page.sourceKind != .template else { return }
         let url = pageBackgroundURL(forPageID: page.id, in: page.documentID)
         guard !fileManager.fileExists(atPath: url.path) else { return }
         let size = CGSize(width: max(page.width, 1), height: max(page.height, 1))
@@ -7740,7 +7662,7 @@ final class DrawingDocumentStore: ObservableObject {
                 if $0.zIndex != $1.zIndex { return $0.zIndex < $1.zIndex }
                 return $0.id.uuidString < $1.id.uuidString
             }) {
-                drawExportElement(element, in: context)
+                Self.drawExportElement(element, in: context)
             }
         }
         guard includesAnnotations else { return }
@@ -7753,7 +7675,7 @@ final class DrawingDocumentStore: ObservableObject {
         drawing.image(from: bounds, scale: rasterScale).draw(in: bounds)
     }
 
-    private func drawExportElement(_ element: CanvasPageElement, in context: CGContext) {
+    nonisolated private static func drawExportElement(_ element: CanvasPageElement, in context: CGContext) {
         let bounds = element.logicalBounds
         guard bounds.width > 0, bounds.height > 0 else { return }
         context.saveGState()
@@ -7775,8 +7697,8 @@ final class DrawingDocumentStore: ObservableObject {
             case .trailing: .right
             }
             var attributes: [NSAttributedString.Key: Any] = [
-                .font: exportFont(for: payload),
-                .foregroundColor: exportColor(payload.colorHex),
+                .font: Self.exportFont(for: payload),
+                .foregroundColor: Self.exportColor(payload.colorHex),
                 .paragraphStyle: paragraph
             ]
             if payload.isUnderlined {
@@ -7788,12 +7710,12 @@ final class DrawingDocumentStore: ObservableObject {
         case .question:
             break // Navigation markers and attached answers are not flattened into the source PDF.
         case .shape(let payload):
-            drawExportShape(payload, in: localRect, context: context)
+            Self.drawExportShape(payload, in: localRect, context: context)
         }
         context.restoreGState()
     }
 
-    private func drawExportShape(
+    nonisolated private static func drawExportShape(
         _ payload: PageShapePayload,
         in rect: CGRect,
         context: CGContext
@@ -7831,11 +7753,11 @@ final class DrawingDocumentStore: ObservableObject {
         if let fill = payload.fillColorHex,
            ![.line, .arrow].contains(payload.kind) {
             context.addPath(path)
-            context.setFillColor(exportColor(fill).cgColor)
+            context.setFillColor(Self.exportColor(fill).cgColor)
             context.fillPath()
         }
         context.addPath(path)
-        context.setStrokeColor(exportColor(payload.strokeColorHex).cgColor)
+        context.setStrokeColor(Self.exportColor(payload.strokeColorHex).cgColor)
         context.setLineWidth(lineWidth)
         context.setLineCap(.round)
         context.setLineJoin(.round)
@@ -7843,7 +7765,7 @@ final class DrawingDocumentStore: ObservableObject {
         context.strokePath()
     }
 
-    private func exportFont(for payload: PageTextPayload) -> UIFont {
+    nonisolated private static func exportFont(for payload: PageTextPayload) -> UIFont {
         let size = CGFloat(max(6, payload.fontSize))
         var descriptor = UIFont.systemFont(ofSize: size).fontDescriptor
         let design: UIFontDescriptor.SystemDesign? = switch PageTextFontPreset(
@@ -7864,7 +7786,7 @@ final class DrawingDocumentStore: ObservableObject {
         return UIFont(descriptor: descriptor, size: size)
     }
 
-    private func exportColor(_ rawValue: String) -> UIColor {
+    nonisolated private static func exportColor(_ rawValue: String) -> UIColor {
         var hex = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if hex.hasPrefix("#") { hex.removeFirst() }
         guard (hex.count == 6 || hex.count == 8),
@@ -7908,9 +7830,6 @@ final class DrawingDocumentStore: ObservableObject {
             drawingURL(forPageID: destinationPageID, in: documentID),
             imageAnnotationsURL(forPageID: destinationPageID, in: documentID)
         ]
-        guard fileManager.fileExists(atPath: sourceURLs[0].path) else {
-            throw PDFWorkspaceError.invalidPDF(documentID)
-        }
         var copied: [URL] = []
         do {
             for (source, destination) in zip(sourceURLs, destinationURLs)
@@ -8057,6 +7976,9 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func bumpPageAssetRevision(forPageID pageID: String, in documentID: String) {
+        dirtyThumbnailKeys.formUnion(thumbnailCache.keys.filter { $0.hasPrefix("\(documentID)#\(pageID)#") })
+        pendingThumbnailIDs = pendingThumbnailIDs.filter { !$0.key.hasPrefix("\(documentID)#\(pageID)#") }
+        if pageMetadata(at: 0, in: documentID)?.id == pageID { scheduleSparseCover(documentID, invalidating: true) }
         pageAssetGeneration &+= 1
         pageAssetRevisions[
             LibraryPageReference(documentID: documentID, pageID: pageID)
@@ -8068,8 +7990,465 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func signalLocalCloudChange() {
-        // Saved ink and objects are included in canvas previews, including outside the old page.
-        thumbnailCache.removeAll()
+        // Sync scheduling is independent of image content. Drawing persistence invalidates
+        // canvas previews through bumpPageAssetRevision; renaming must retain all thumbnails.
         cloudSyncGeneration &+= 1
+    }
+}
+
+private struct SparseAssetDescriptor: Codable, Sendable {
+    let reference: LibraryAssetReference
+    let resourceID: String
+}
+
+private struct SparseCoverDescriptor: Codable, Sendable {
+    let documentID: String
+    let pageID: String
+    let visualVersion: String
+}
+
+extension DrawingDocumentStore {
+    private func sparseDatabase() throws -> SparseLibraryDatabase {
+        if let sparseDatabaseHandle { return sparseDatabaseHandle }
+        let db = try SparseLibraryDatabase(url: registryURL)
+        sparseDatabaseHandle = db
+        return db
+    }
+
+    nonisolated static func implicitPageID(documentID: String, resourceID: String, sourceIndex: Int) -> String {
+        let data = Data("\(documentID)|\(resourceID)|\(sourceIndex)".utf8)
+        return "source-" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func implicitPage(sourceIndex: Int, in documentID: String) -> LibraryPage? {
+        guard let document = documentMetadata.first(where: { $0.id == documentID }),
+              let count = document.sourcePageCount, sourceIndex >= 0, sourceIndex < count else { return nil }
+        let source: PDFPage?
+        if let url = fileURL(for: document), fileManager.fileExists(atPath: url.path) {
+            source = pdfDocument(for: documentID)?.page(at: sourceIndex)
+        } else { source = nil }
+        let bounds = source?.bounds(for: .mediaBox) ?? CGRect(x: 0, y: 0, width: 595, height: 842)
+        return LibraryPage(id: Self.implicitPageID(documentID: documentID,
+                resourceID: document.sourceResourceID ?? documentID, sourceIndex: sourceIndex),
+            documentID: documentID, orderIndex: sourceIndex,
+            createdAt: document.createdAt, modifiedAt: document.createdAt,
+            width: max(bounds.width, 1), height: max(bounds.height, 1),
+            rotation: source?.rotation ?? 0, sourcePDFPageIndex: sourceIndex)
+    }
+
+    private func isImplicitDefault(_ page: LibraryPage, documents: [LibraryDocumentMetadata]? = nil) -> Bool {
+        guard let sourceIndex = page.sourcePDFPageIndex,
+              let document = (documents ?? documentMetadata).first(where: { $0.id == page.documentID }),
+              let count = document.sourcePageCount, sourceIndex < count,
+              page.id == Self.implicitPageID(documentID: document.id, resourceID: document.sourceResourceID ?? document.id, sourceIndex: sourceIndex),
+              !page.isRemoved, !page.isBookmarked, page.handoutSourceID == nil,
+              page.position == .legacy(orderIndex: sourceIndex), page.sourceKind == .pdf,
+              page.backgroundStyle == nil, page.backgroundColor == nil else { return false }
+        // An untouched page is recognizable without opening the PDF. Edited rotation stores a row.
+        return page.modifiedAt == page.createdAt
+    }
+
+    private func sparsePageVisualKey(_ page: LibraryPage) -> String {
+        "\(page.id)|\(page.sourcePDFPageIndex ?? -1)|\(page.width)|\(page.height)|\(page.rotation)|\(page.sourceKind)|\(page.backgroundStyle?.rawValue ?? "")|\(page.backgroundColor?.rawValue ?? "")"
+    }
+
+    private func persistSparseEntities<T: Codable & Hashable & Identifiable>(
+        _ values: [T], previous: [T], kind: String, database: SparseLibraryDatabase
+    ) throws where T.ID == String {
+        let old = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        let ids = Set(values.map(\.id))
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        for value in values where old[value.id] != value {
+            let documentID = (value as? LibraryPage)?.documentID ?? (kind == "document" ? value.id : "")
+            try database.put(kind: kind, id: value.id, documentID: documentID,
+                payload: encoder.encode(value), pending: !applyingSparseRemote)
+        }
+        for value in previous where !ids.contains(value.id) {
+            try database.remove(kind: kind, id: value.id)
+            if !applyingSparseRemote {
+                let documentID = (value as? LibraryPage)?.documentID ?? (kind == "document" ? value.id : "")
+                let deletion = SparseEntityRemoval(kind: kind, id: value.id, documentID: documentID)
+                try database.put(kind: "removal", id: "\(kind)|\(value.id)", documentID: documentID,
+                    payload: encoder.encode(deletion))
+            }
+        }
+    }
+
+    private func registerSparseAsset(_ url: URL, documentID: String, kind: LibraryAssetKind) throws {
+        let resourceID: String
+        if case .pdf = kind {
+            resourceID = documentMetadata.first { $0.id == documentID }?.sourceResourceID ?? documentID
+        } else { resourceID = "\(documentID)-\(url.lastPathComponent)" }
+        let reference = LibraryAssetReference(documentID: kind == .pdf ? resourceID : documentID, kind: kind)
+        let db = try sparseDatabase()
+        if let existing = try db.entry(kind: "asset", id: resourceID), existing.filePath != nil { return }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let payload = try encoder.encode(SparseAssetDescriptor(reference: reference, resourceID: resourceID))
+        try sparseDatabase().put(kind: "asset", id: resourceID, documentID: documentID,
+            payload: payload, filePath: url.path, pending: !applyingSparseRemote)
+    }
+
+    private func indexSparseOperations(_ operations: [CollaborationOperation]) throws {
+        let db = try sparseDatabase()
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        var indexedIDs: Set<String> = []
+        var changedPages: Set<LibraryPageReference> = []
+        try db.transaction {
+            for operation in operations {
+                // Immutable IDs: lookup first instead of re-encoding the existing page journal.
+                if sparseKnownOperationIDs.contains(operation.id) { continue }
+                if try db.entry(kind: "operation", id: operation.id) != nil {
+                    indexedIDs.insert(operation.id); continue
+                }
+                try db.put(kind: "operation", id: operation.id, documentID: operation.documentID,
+                    pageID: operation.pageID, payload: encoder.encode(operation), pending: !applyingSparseRemote)
+                indexedIDs.insert(operation.id)
+                switch operation.payload {
+                case .strokeUpsert, .strokeDelete, .elementUpsert, .elementPatch, .elementDelete:
+                    changedPages.insert(LibraryPageReference(documentID: operation.documentID, pageID: operation.pageID))
+                default: break
+                }
+            }
+        }
+        sparseKnownOperationIDs.formUnion(indexedIDs)
+        for page in changedPages { bumpPageAssetRevision(forPageID: page.pageID, in: page.documentID) }
+    }
+
+    func sparsePendingEntries(limit: Int = 100) throws -> [SparseLibraryEntry] {
+        try sparseDatabase().entries(pendingOnly: true, limit: limit)
+    }
+
+    func sparseEntry(kind: String, id: String) throws -> SparseLibraryEntry? {
+        try sparseDatabase().entry(kind: kind, id: id)
+    }
+
+    func sparseAcknowledge(_ entry: SparseLibraryEntry) throws {
+        let db = try sparseDatabase()
+        try db.acknowledge(entry)
+        if entry.kind == "cover", let current = try db.entry(kind: "cover", id: entry.id), !current.pending {
+            let directory = workspaceDirectory.appendingPathComponent("Covers")
+            for url in (try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            where url.lastPathComponent.hasPrefix("\(entry.id)-") && url.path != current.filePath {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+    }
+    func sparseSyncState(_ key: String) throws -> Data? { try sparseDatabase().state(key) }
+    func setSparseSyncState(_ key: String, _ data: Data) throws { try sparseDatabase().setState(key, data) }
+
+    private func scheduleSparseCover(_ documentID: String, invalidating: Bool = false) {
+        if sparseCoverTasks[documentID] != nil && !invalidating { return }
+        sparseCoverTasks[documentID]?.cancel()
+        let token = UUID()
+        sparseCoverTaskTokens[documentID] = token
+        sparseCoverTasks[documentID] = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(700))
+                guard let self else { return }
+                try await self.generateSparseCover(documentID)
+            } catch is CancellationError {} catch {
+                self?.saveState = .failed("封面生成失败：\(error.localizedDescription)")
+            }
+            if self?.sparseCoverTaskTokens[documentID] == token {
+                self?.sparseCoverTasks[documentID] = nil
+                self?.sparseCoverTaskTokens[documentID] = nil
+            }
+        }
+    }
+
+    /// Fixed-size persisted cover is independently synchronized. UI variants reuse the same image.
+    func generateSparseCover(_ documentID: String) async throws {
+        guard let page = pageMetadata(at: 0, in: documentID) else { return }
+        let operations = loadCollaborationOperations(forPageID: page.id, in: documentID)
+        let visualOperations = operations.filter {
+            switch $0.payload {
+            case .strokeUpsert, .strokeDelete, .elementUpsert, .elementPatch, .elementDelete: true
+            default: false
+            }
+        }
+        let versionBytes = Data((sparsePageVisualKey(page) + "|" + visualOperations.map(\.id).sorted().joined(separator: ",")).utf8)
+        let version = SHA256.hash(data: versionBytes).map { String(format: "%02x", $0) }.joined()
+        let db = try sparseDatabase()
+        if let current = try db.entry(kind: "cover", id: documentID),
+           let value = try? JSONDecoder().decode(SparseCoverDescriptor.self, from: current.payload),
+           value.visualVersion == version, let path = current.filePath, fileManager.fileExists(atPath: path) {
+            for key in thumbnailCache.keys where key.hasPrefix("\(documentID)#\(page.id)#") { dirtyThumbnailKeys.remove(key) }
+            return
+        }
+        let sourceURL = page.sourcePDFPageIndex != nil ? document(withID: documentID)?.fileURL
+            : pageBackgroundURL(forPageID: page.id, in: documentID)
+        let directory = workspaceDirectory.appendingPathComponent("Covers")
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("\(documentID)-\(version).jpg")
+        let image = await Task.detached(priority: .utility) {
+            Self.renderSparsePreview(page: page, sourceURL: sourceURL, operations: visualOperations,
+                size: CGSize(width: 480, height: 640))
+        }.value
+        try Task.checkCancellation()
+        let currentPage = pageMetadata(at: 0, in: documentID)
+        let currentVisualOperations = loadCollaborationOperations(forPageID: page.id, in: documentID).filter {
+            switch $0.payload {
+            case .strokeUpsert, .strokeDelete, .elementUpsert, .elementPatch, .elementDelete: true
+            default: false
+            }
+        }
+        guard currentPage?.id == page.id, currentPage.map(sparsePageVisualKey) == sparsePageVisualKey(page),
+              Set(currentVisualOperations.map(\.id)) == Set(visualOperations.map(\.id)), let image,
+              let bytes = image.jpegData(compressionQuality: 0.82) else { return }
+        try bytes.write(to: url, options: .atomic)
+        let payload = try JSONEncoder().encode(SparseCoverDescriptor(documentID: documentID, pageID: page.id, visualVersion: version))
+        try db.put(kind: "cover", id: documentID, documentID: documentID, pageID: page.id,
+            payload: payload, filePath: url.path)
+        objectWillChange.send()
+        for key in thumbnailCache.keys where key.hasPrefix("\(documentID)#\(page.id)#") {
+            thumbnailCache[key] = image; dirtyThumbnailKeys.remove(key)
+        }
+        signalLocalCloudChange()
+    }
+
+    nonisolated private static func renderSparsePreview(page: LibraryPage, sourceURL: URL?,
+        operations: [CollaborationOperation], size: CGSize) -> UIImage? {
+        autoreleasepool {
+            let pdf = sourceURL.flatMap(PDFDocument.init(url:))
+            let sourcePage = pdf?.page(at: page.sourcePDFPageIndex ?? 0)
+            if page.sourceKind != .template && sourcePage == nil { return nil }
+            sourcePage?.rotation = page.rotation
+            let rotated = abs(page.rotation) % 180 == 90
+            let paperSize = CGSize(width: rotated ? page.height : page.width, height: rotated ? page.width : page.height)
+            let bounds = CGRect(origin: .zero, size: paperSize)
+            let scale = min(size.width / paperSize.width, size.height / paperSize.height)
+            let format = UIGraphicsImageRendererFormat(); format.scale = 1; format.opaque = true
+            let state = CollaborationMergeEngine.materialize(operations)
+            let drawing = PKDrawing(strokes: state.strokes.values.sorted {
+                $0.zIndex == $1.zIndex ? $0.id < $1.id : $0.zIndex < $1.zIndex
+            }.flatMap { (try? PKDrawing(data: $0.drawingData).strokes) ?? [] })
+            return UIGraphicsImageRenderer(size: CGSize(width: paperSize.width * scale, height: paperSize.height * scale), format: format).image { output in
+                let context = output.cgContext
+                context.scaleBy(x: scale, y: scale)
+                UIColor.white.setFill(); context.fill(bounds)
+                if page.sourceKind == .template {
+                    CanvasBackgroundRenderer.draw(in: context, bounds: bounds,
+                        style: page.backgroundStyle ?? .blank, color: page.backgroundColor ?? .white)
+                } else if let sourcePage {
+                    sourcePage.thumbnail(of: CGSize(width: paperSize.width * scale, height: paperSize.height * scale), for: .mediaBox).draw(in: bounds)
+                }
+                for element in state.elements.values.sorted(by: { $0.zIndex == $1.zIndex ? $0.id.uuidString < $1.id.uuidString : $0.zIndex < $1.zIndex }) {
+                    Self.drawExportElement(element, in: context)
+                }
+                if !drawing.strokes.isEmpty { drawing.image(from: bounds, scale: max(scale, 0.1)).draw(in: bounds) }
+            }
+        }
+    }
+}
+
+struct SparseEntityRemoval: Codable, Sendable {
+    let kind: String
+    let id: String
+    let documentID: String
+}
+
+extension DrawingDocumentStore {
+    func mergeSparseUpload(_ local: SparseLibraryEntry, with remote: SparseLibraryEntry) throws -> SparseLibraryEntry? {
+        let decoder = JSONDecoder(); let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let payload: Data
+        switch local.kind {
+        case "folder":
+            let a = try decoder.decode(LibraryFolder.self, from: local.payload)
+            let b = try decoder.decode(LibraryFolder.self, from: remote.payload)
+            payload = try encoder.encode(a.merged(with: b))
+        case "document":
+            let a = try decoder.decode(LibraryDocumentMetadata.self, from: local.payload)
+            let b = try decoder.decode(LibraryDocumentMetadata.self, from: remote.payload)
+            payload = try encoder.encode(a.mergedPrivateRecord(with: b))
+        case "page":
+            let a = try decoder.decode(LibraryPage.self, from: local.payload)
+            let b = try decoder.decode(LibraryPage.self, from: remote.payload)
+            payload = try encoder.encode(a.modifiedAt >= b.modifiedAt ? a : b)
+        default: return nil
+        }
+        return SparseLibraryEntry(kind: local.kind, id: local.id, documentID: local.documentID,
+            pageID: local.pageID, payload: payload, filePath: local.filePath, revision: local.revision, pending: true)
+    }
+
+    func applySparseMergedEntry(_ entry: SparseLibraryEntry) throws {
+        try sparseDatabase().put(kind: entry.kind, id: entry.id, documentID: entry.documentID,
+            pageID: entry.pageID, payload: entry.payload, filePath: entry.filePath)
+        try applySparseRemoteEntries([entry], preservesPending: true)
+    }
+
+    func applySparseRemoteEntries(_ incoming: [SparseLibraryEntry], preservesPending: Bool = false) throws {
+        let db = try sparseDatabase(); let decoder = JSONDecoder()
+        applyingSparseRemote = true
+        defer { applyingSparseRemote = false }
+        var foldersChanged = false; var documentsChanged = false
+        var remoteOperations: [CollaborationOperation] = []
+        try db.transaction {
+            for remote in incoming {
+                var entry = remote
+                let local = try db.entry(kind: remote.kind, id: remote.id)
+                if local?.payload == remote.payload { continue }
+                if let local, local.pending, remote.kind == "cover", local.payload != remote.payload { continue }
+                if let local, local.pending,
+                   let merged = try mergeSparseUpload(local, with: remote) { entry = merged }
+                // Permanent deletions are authoritative regardless of batch delivery order.
+                if remote.kind != "removal", try db.entry(kind: "removal", id: "\(remote.kind)|\(remote.id)") != nil { continue }
+                if remote.kind != "asset", !remote.documentID.isEmpty,
+                   try db.entry(kind: "removal", id: "document|\(remote.documentID)") != nil { continue }
+                switch entry.kind {
+                case "folder":
+                    let value = try decoder.decode(LibraryFolder.self, from: entry.payload)
+                    for stamp in value.causalStamps { collaborationClock.observe(stamp) }
+                    if let index = folders.firstIndex(where: { $0.id == value.id }) { folders[index] = value }
+                    else { folders.append(value) }
+                    foldersChanged = true
+                case "document":
+                    let value = try decoder.decode(LibraryDocumentMetadata.self, from: entry.payload)
+                    for stamp in [value.titleRevision, value.parentRevision, value.favoriteRevision, value.trashRevision].compactMap({ $0 }) {
+                        collaborationClock.observe(stamp)
+                    }
+                    guard isSafePathComponent(value.id), isSafePathComponent(value.fileName),
+                          (value.sourcePageCount ?? 0) >= 0, (value.sourcePageCount ?? 0) <= 1_000_000 else {
+                        throw LibraryStoreError.invalidSnapshot("文稿资源引用无效")
+                    }
+                    if let index = documentMetadata.firstIndex(where: { $0.id == value.id }) { documentMetadata[index] = value }
+                    else { documentMetadata.append(value) }
+                    documentsChanged = true
+                case "page":
+                    let value = try decoder.decode(LibraryPage.self, from: entry.payload)
+                    guard isSafePathComponent(value.id), isSafePathComponent(value.documentID),
+                          value.width.isFinite, value.height.isFinite, value.width > 0, value.height > 0 else {
+                        throw LibraryStoreError.invalidSnapshot("页面无效")
+                    }
+                    if let index = pages.firstIndex(where: { $0.id == value.id }) { pages[index] = value }
+                    else { pages.append(value) }
+                    resolvedPageDocuments["\(value.documentID)#\(value.id)"] = nil
+                    bumpPageAssetRevision(forPageID: value.id, in: value.documentID)
+                case "operation":
+                    remoteOperations.append(try decoder.decode(CollaborationOperation.self, from: entry.payload))
+                    // applyRemoteCollaborationOperations installs the indexed log after merging.
+                    continue
+                case "cover":
+                    let value = try decoder.decode(SparseCoverDescriptor.self, from: entry.payload)
+                    guard isSafePathComponent(value.documentID), isSafePathComponent(value.pageID) else { throw LibraryStoreError.invalidSnapshot("封面无效") }
+                case "asset":
+                    let value = try decoder.decode(SparseAssetDescriptor.self, from: entry.payload)
+                    guard isSafePathComponent(value.resourceID), isSafePathComponent(value.reference.documentID) else { throw LibraryStoreError.invalidSnapshot("资源无效") }
+                case "removal":
+                    let value = try decoder.decode(SparseEntityRemoval.self, from: entry.payload)
+                    try db.remove(kind: value.kind, id: value.id)
+                    switch value.kind {
+                    case "folder": folders.removeAll { $0.id == value.id }; foldersChanged = true
+                    case "document":
+                        documentMetadata.removeAll { $0.id == value.id }; pages.removeAll { $0.documentID == value.id }; documentsChanged = true
+                    case "page": pages.removeAll { $0.id == value.id }
+                    default: break
+                    }
+                default: throw LibraryStoreError.invalidSnapshot("未知同步数据类型")
+                }
+                try db.put(kind: entry.kind, id: entry.id, documentID: entry.documentID, pageID: entry.pageID,
+                    payload: entry.payload, filePath: entry.payload == local?.payload ? local?.filePath : entry.filePath,
+                    pending: preservesPending || (local?.pending == true && entry.payload != remote.payload))
+            }
+            if !remoteOperations.isEmpty { try applyRemoteCollaborationOperations(remoteOperations) }
+        }
+        sparsePageCache.removeAll()
+        persistedRegistry = LibraryRegistry(schemaVersion: LibrarySnapshot.currentSchemaVersion,
+            folders: folders, documents: documentMetadata, pages: pages)
+        if documentsChanged { rebuildWorkspaceDocuments() }
+        if foldersChanged || documentsChanged {
+            try persistCollaborationClock()
+            objectWillChange.send()
+        }
+    }
+
+    func sparseAssetsToDownload() throws -> [SparseLibraryEntry] {
+        let db = try sparseDatabase()
+        let covers = try db.entries(kind: "cover", missingFileOnly: true).filter { entry in documentMetadata.contains(where: { $0.id == entry.documentID }) }
+        let requested = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
+        let assets = try db.entries(kind: "asset", missingFileOnly: true).filter { (requested.contains($0.id) || openDocumentIDs.contains($0.documentID))
+        }
+        return covers + assets
+    }
+
+    func requestSparsePDF(_ documentID: String) {
+        guard let metadata = documentMetadata.first(where: { $0.id == documentID }) else { return }
+        var requests = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
+        if requests.insert(metadata.sourceResourceID ?? documentID).inserted {
+            userDefaults.set(Array(requests), forKey: "sparse.requestedPDFs")
+            signalLocalCloudChange()
+        }
+    }
+
+    func installSparseRemoteFile(from source: URL, entry: SparseLibraryEntry) throws {
+        let db = try sparseDatabase()
+        let directory = workspaceDirectory.appendingPathComponent(entry.kind == "cover" ? "Covers" : "Resources")
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let hash = SHA256.hash(data: entry.payload).map { String(format: "%02x", $0) }.joined()
+        let destination = directory.appendingPathComponent(hash + (entry.kind == "cover" ? ".jpg" : ".pdf"))
+        if !fileManager.fileExists(atPath: destination.path) {
+            try fileManager.copyItem(at: source, to: destination)
+        }
+        guard let current = try db.entry(kind: entry.kind, id: entry.id), current.payload == entry.payload else { return }
+        try db.put(kind: entry.kind, id: entry.id, documentID: entry.documentID, pageID: entry.pageID,
+            payload: entry.payload, filePath: destination.path, pending: false)
+        if entry.kind == "cover" {
+            if let image = UIImage(contentsOfFile: destination.path) {
+                objectWillChange.send()
+                for key in thumbnailCache.keys where key.hasPrefix("\(entry.documentID)#\(entry.pageID)#") {
+                    thumbnailCache[key] = image; dirtyThumbnailKeys.remove(key)
+                }
+            }
+        } else {
+            let descriptor = try JSONDecoder().decode(SparseAssetDescriptor.self, from: entry.payload)
+            switch descriptor.reference.kind {
+            case .pdf:
+                for document in documentMetadata where (document.sourceResourceID ?? document.id) == entry.id {
+                    pdfCache[document.id] = nil
+                    sparsePageCache[document.id] = nil
+                    invalidatePagePresentation(documentID: document.id)
+                }
+                rebuildWorkspaceDocuments()
+            default:
+                try applyRemoteAsset(from: destination, for: descriptor.reference)
+            }
+        }
+    }
+
+    /// Deliberate one-account reset: keep original PDFs and directory placement, discard all edits.
+    /// The caller verifies its original-file inventory before deleting the retired workspace files.
+    func importOriginalLibraryWithoutEdits(from registryData: Data) throws -> Int {
+        let old = try JSONDecoder().decode(LibraryRegistry.self, from: registryData)
+        guard documentMetadata.isEmpty else { throw LibraryStoreError.invalidSnapshot("目标资料库必须为空") }
+        var originals: [LibraryDocumentMetadata] = []
+        for var metadata in old.documents where metadata.kind == .pdf && !metadata.isBundled {
+            let url = importsDirectory.appendingPathComponent(metadata.fileName)
+            guard let pdf = PDFDocument(url: url), pdf.pageCount > 0 else {
+                throw PDFWorkspaceError.invalidPDF(metadata.title)
+            }
+            metadata.sourcePageCount = pdf.pageCount
+            metadata.sourceResourceID = metadata.id
+            metadata.parentRevision = nil; metadata.favoriteRevision = nil; metadata.trashRevision = nil
+            originals.append(metadata)
+        }
+        var cleanFolders = old.folders
+        _ = ensureFolderCausalRevisions(&cleanFolders)
+        documentMetadata = originals
+        try persistRegistry(folders: cleanFolders, documents: originals, pages: [])
+        folders = cleanFolders; pages = []
+        rebuildWorkspaceDocuments()
+        openDocumentIDs = []
+        persistOpenDocuments()
+        return originals.count
+    }
+}
+
+extension DrawingDocumentStore {
+    func sparsePendingDocumentIDs() -> Set<String> {
+        Set(((try? sparsePendingEntries(limit: 10000)) ?? []).map(\.documentID))
+    }
+    func isOriginalPDFDownloaded(_ documentID: String) -> Bool {
+        guard let metadata = documentMetadata.first(where: { $0.id == documentID }),
+              (metadata.sourcePageCount ?? 0) > 0 else { return true }
+        return fileURL(for: metadata).map { fileManager.fileExists(atPath: $0.path) } ?? false
     }
 }

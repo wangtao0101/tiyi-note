@@ -226,8 +226,12 @@ struct LibraryFolder: Identifiable, Codable, Hashable, Sendable {
 struct LibraryDocumentMetadata: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var title: String
+    var titleRevision: CollaborationStamp? = nil
     var parentID: String?
     var fileName: String
+    /// Immutable source identity and default page sequence. No per-page rows on import.
+    var sourcePageCount: Int?
+    var sourceResourceID: String?
     var isBundled: Bool
     let createdAt: Date
     var modifiedAt: Date
@@ -252,6 +256,8 @@ struct LibraryDocumentMetadata: Identifiable, Codable, Hashable, Sendable {
         parentID: String?,
         fileName: String,
         isBundled: Bool,
+        sourcePageCount: Int? = nil,
+        sourceResourceID: String? = nil,
         createdAt: Date = Date(),
         modifiedAt: Date = Date(),
         contentModifiedAt: Date? = nil,
@@ -268,6 +274,8 @@ struct LibraryDocumentMetadata: Identifiable, Codable, Hashable, Sendable {
         self.title = title
         self.parentID = parentID
         self.fileName = fileName
+        self.sourcePageCount = sourcePageCount
+        self.sourceResourceID = sourceResourceID ?? (sourcePageCount == nil ? nil : id)
         self.isBundled = isBundled
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
@@ -284,6 +292,8 @@ struct LibraryDocumentMetadata: Identifiable, Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, title, parentID, fileName, isBundled, createdAt, modifiedAt, contentModifiedAt
+        case titleRevision
+        case sourcePageCount, sourceResourceID
         case kind, canvasBackgroundStyle, canvasBackgroundColor, isFavorite, trashedAt
         case parentRevision, favoriteRevision, trashRevision
     }
@@ -292,8 +302,11 @@ struct LibraryDocumentMetadata: Identifiable, Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
+        titleRevision = try container.decodeIfPresent(CollaborationStamp.self, forKey: .titleRevision)
         parentID = try container.decodeIfPresent(String.self, forKey: .parentID)
         fileName = try container.decode(String.self, forKey: .fileName)
+        sourcePageCount = try container.decodeIfPresent(Int.self, forKey: .sourcePageCount)
+        sourceResourceID = try container.decodeIfPresent(String.self, forKey: .sourceResourceID)
         isBundled = try container.decode(Bool.self, forKey: .isBundled)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
