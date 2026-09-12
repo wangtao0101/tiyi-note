@@ -246,6 +246,7 @@ enum PDFWorkspaceError: LocalizedError {
 
 @MainActor
 final class DrawingDocumentStore: ObservableObject {
+    weak var handoutWorkspace: TiyiHandoutWorkspace?
     @Published private(set) var saveState: LocalSaveState = .saved(nil)
     @Published private(set) var folders: [LibraryFolder] = []
     @Published private(set) var documents: [PDFWorkspaceDocument] = []
@@ -318,9 +319,14 @@ final class DrawingDocumentStore: ObservableObject {
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first!
-        let resolvedWorkspaceDirectory = workspaceDirectoryOverride ?? applicationSupport
+        let requestedWorkspaceDirectory = workspaceDirectoryOverride ?? applicationSupport
             .appendingPathComponent("TiyiNote", isDirectory: true)
             .appendingPathComponent("Workspace", isDirectory: true)
+        // On device, Foundation normalizes an existing /private/var directory to /var,
+        // but can leave a not-yet-created asset under /private/var. Derive every asset
+        // from the same existing root before transaction containment checks run.
+        try? fileManager.createDirectory(at: requestedWorkspaceDirectory, withIntermediateDirectories: true)
+        let resolvedWorkspaceDirectory = requestedWorkspaceDirectory.standardizedFileURL
         workspaceDirectory = resolvedWorkspaceDirectory
         importsDirectory = resolvedWorkspaceDirectory.appendingPathComponent("PDFs", isDirectory: true)
         drawingsDirectory = resolvedWorkspaceDirectory.appendingPathComponent("Drawings", isDirectory: true)
@@ -719,7 +725,8 @@ final class DrawingDocumentStore: ObservableObject {
             sourceKind: source.sourceKind,
             backgroundStyle: source.backgroundStyle,
             backgroundColor: source.backgroundColor,
-            isBookmarked: source.isBookmarked
+            isBookmarked: source.isBookmarked,
+            handoutSourceID: source.handoutSourceID
         )
         var affectedURLs = [
             registryURL,
@@ -950,7 +957,17 @@ final class DrawingDocumentStore: ObservableObject {
         }
     }
 
+    func setHandoutSource(_ sourceID: String, for pageID: String, in documentID: String) throws {
+        var ordered = pages(in: documentID)
+        guard let index = ordered.firstIndex(where: { $0.id == pageID }) else { throw LibraryStoreError.pageNotFound(pageID) }
+        ordered[index].handoutSourceID = sourceID
+        try commitPageMutation(ordered, in: documentID)
+    }
+
     func rotatePage(_ pageID: String, clockwise: Bool, in documentID: String) throws {
+        guard pages(in: documentID).first(where: { $0.id == pageID })?.handoutSourceID == nil else {
+            throw HandoutAttachmentError.message("网页讲义保持固定排版，暂不支持旋转；可移动和缩放画板。")
+        }
         try requireEditableSharedDocument(documentID)
         try prepareDocumentForPageEditing(documentID)
         var ordered = pages(in: documentID)
@@ -1814,7 +1831,8 @@ final class DrawingDocumentStore: ObservableObject {
         named proposedTitle: String,
         in parentID: String?,
         backgroundStyle: CanvasBackgroundStyle,
-        backgroundColor: CanvasBackgroundColor
+        backgroundColor: CanvasBackgroundColor,
+        size: CGSize = CGSize(width: 1024, height: 768)
     ) throws -> PDFWorkspaceDocument {
         try validateParentFolder(parentID)
         let title = try normalizedTitle(proposedTitle)
@@ -1823,7 +1841,7 @@ final class DrawingDocumentStore: ObservableObject {
         let documentID = UUID().uuidString.lowercased()
         let fileName = "\(documentID).pdf"
         let targetURL = importsDirectory.appendingPathComponent(fileName)
-        let pageBounds = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        let pageBounds = CGRect(origin: .zero, size: size)
         let format = UIGraphicsPDFRendererFormat()
         format.documentInfo = [
             kCGPDFContextTitle as String: title,
@@ -2857,6 +2875,10 @@ final class DrawingDocumentStore: ObservableObject {
         rebuildWorkspaceDocuments()
         thumbnailCache.removeAll()
         signalLocalCloudChange()
+    }
+
+    func hasSavedCanvasViewport(forPageID pageID: String, in documentID: String) -> Bool {
+        userDefaults.data(forKey: "canvas.viewport.v1.\(documentID).\(pageID)") != nil
     }
 
     func canvasViewport(forPageID pageID: String, in documentID: String, referenceSize: CGSize) -> CanvasViewport {

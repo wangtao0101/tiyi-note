@@ -9,6 +9,7 @@ struct PencilCanvasView: UIViewRepresentable {
     let logicalPageSize: CGSize
     let logicalViewport: CGRect?
     let isCurrentPage: Bool
+    var pagesNavigateFromSidebarOnly: Bool = false
     let onFingerPinchChanged: (CGFloat) -> Void
     let onFingerPinchEnded: (CGFloat) -> Void
     let onFingerPinchCancelled: () -> Void
@@ -24,6 +25,7 @@ struct PencilCanvasView: UIViewRepresentable {
             logicalPageSize: logicalPageSize,
             logicalViewport: logicalViewport
         )
+        view.suppressesFingerPaging = pagesNavigateFromSidebarOnly
         let coordinator = context.coordinator
         view.onNavigationAncestorFound = { [weak coordinator, weak view] pager in
             guard let view else { return }
@@ -38,6 +40,7 @@ struct PencilCanvasView: UIViewRepresentable {
             uiView.logicalPageSize = logicalPageSize
         }
         uiView.logicalViewport = logicalViewport
+        uiView.suppressesFingerPaging = pagesNavigateFromSidebarOnly
         uiView.configureAncestorNavigation()
     }
 
@@ -69,7 +72,7 @@ struct PencilCanvasView: UIViewRepresentable {
             canvasContainer = container
             navigationHost = host
             let pan = UIPanGestureRecognizer(target: self, action: #selector(handleCanvasPan(_:)))
-            pan.minimumNumberOfTouches = 2
+            pan.minimumNumberOfTouches = parent.pagesNavigateFromSidebarOnly && UIDevice.current.userInterfaceIdiom == .pad ? 1 : 2
             pan.maximumNumberOfTouches = 2
             pan.allowedScrollTypesMask = .all
             let pinch = UIPinchGestureRecognizer(
@@ -180,6 +183,7 @@ final class PageCanvasContainerView: UIView {
         }
     }
     var onNavigationAncestorFound: ((UIView) -> Void)?
+    var suppressesFingerPaging = false
 
     init(controller: CanvasController, logicalPageSize: CGSize, logicalViewport: CGRect?) {
         self.controller = controller
@@ -283,8 +287,11 @@ final class PageCanvasContainerView: UIView {
                 scrollView.panGestureRecognizer.minimumNumberOfTouches = touchCount
                 scrollView.panGestureRecognizer.maximumNumberOfTouches = touchCount
                 if !isPagePan {
+                    // A handout page is an infinite world. Fingers move its camera; only the
+                    // page sidebar changes chapters. Keep the pager for programmatic selection.
+                    if suppressesFingerPaging { scrollView.panGestureRecognizer.isEnabled = false }
                     scrollView.isDirectionalLockEnabled = true
-                    if (touchCount == 1 || logicalViewport != nil),
+                    if !suppressesFingerPaging, (touchCount == 1 || logicalViewport != nil),
                        scrollView.gestureRecognizers?.contains(where: {
                            $0 is PageMultiTouchPagingGuard
                        }) != true {

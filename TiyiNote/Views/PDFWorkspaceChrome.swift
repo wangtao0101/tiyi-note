@@ -13,6 +13,8 @@ struct PDFDocumentTabBar: View {
     let onCloseDocument: (String) -> Void
     let onMoveDocument: (String, String) -> Void
     let onShowLibrary: () -> Void
+    var libraryLabel: String = "返回文稿"
+    var onInteract: (() -> Void)? = nil
 
     private var isCompact: Bool { horizontalSizeClass == .compact }
 
@@ -26,7 +28,7 @@ struct PDFDocumentTabBar: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("返回文稿")
+            .accessibilityLabel(libraryLabel)
             .accessibilityIdentifier("home-button")
 
             Rectangle()
@@ -76,6 +78,13 @@ struct PDFDocumentTabBar: View {
                 }
             }
             .frame(maxWidth: .infinity)
+            if let onInteract {
+                Button(action: onInteract) { Label("互动", systemImage: "hand.tap") }
+                    .buttonStyle(.plain).font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(TiyiNoteTheme.documentChromeForeground)
+                    .padding(.horizontal, 16).frame(height: 44)
+                    .accessibilityIdentifier("handout-interact")
+            }
         }
         .frame(height: 44)
         .background {

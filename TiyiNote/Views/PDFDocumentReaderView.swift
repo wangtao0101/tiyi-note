@@ -33,6 +33,7 @@ struct PDFDocumentReaderView: View {
     @State private var zoomScale: CGFloat = 1
     @State private var liveFingerPinchMagnification: CGFloat = 1
     @State private var canvasViewports: [String: CanvasViewport]
+    @State private var initialHandoutCameraIDs: Set<String>
 
     private var isUnboundedCanvas: Bool {
         documentStore.document(withID: documentID)?.kind == .canvas
@@ -94,6 +95,9 @@ struct PDFDocumentReaderView: View {
             }
         }
         _canvasViewports = State(initialValue: viewports)
+        _initialHandoutCameraIDs = State(initialValue: Set(documentStore.pages(in: documentID).filter {
+            $0.handoutSourceID != nil && !documentStore.hasSavedCanvasViewport(forPageID: $0.id, in: documentID)
+        }.map(\.id)))
     }
 
     var body: some View {
@@ -209,7 +213,9 @@ struct PDFDocumentReaderView: View {
     private func pageViewport(for pageMetadata: LibraryPage, size: CGSize, scale: CGFloat) -> some View {
         let pageIndex = documentStore.pageIndex(for: pageMetadata.id, in: documentID)
             ?? pageMetadata.orderIndex
-        let logicalSize = documentStore.pageSize(at: pageIndex, in: documentID)
+        let logicalSize = pageMetadata.handoutSourceID != nil
+            ? CGSize(width: pageMetadata.width, height: pageMetadata.height)
+            : documentStore.pageSize(at: pageIndex, in: documentID)
         let fittedScale = min(
             max(size.width - 64, 1) / max(logicalSize.width, 1),
             max(size.height - 32, 1) / max(logicalSize.height, 1)
@@ -218,14 +224,18 @@ struct PDFDocumentReaderView: View {
             width: logicalSize.width * fittedScale * scale,
             height: logicalSize.height * fittedScale * scale
         )
-        let viewport = isUnboundedCanvas
-            ? canvasViewport(for: pageMetadata, referenceSize: logicalSize)
-                .logicalBounds(in: size, referenceSize: logicalSize)
-            : nil
-        let pageView = PDFPageAnnotationView(
+        let needsInitialHandoutCamera = initialHandoutCameraIDs.contains(pageMetadata.id)
+        var camera = canvasViewport(for: pageMetadata, referenceSize: logicalSize)
+        if needsInitialHandoutCamera {
+            camera.center.y = (size.height / 2 - 24) / camera.displayScale(in: size, referenceSize: logicalSize)
+        }
+        let viewport = isUnboundedCanvas ? camera.logicalBounds(in: size, referenceSize: logicalSize) : nil
+        func annotatedPage(_ livePage: TiyiHandoutPageSession? = nil) -> some View {
+        PDFPageAnnotationView(
             documentStore: documentStore,
             documentID: documentID,
             pageID: pageMetadata.id,
+            livePage: livePage,
             pageIndex: pageIndex,
             pageElementInsertionRequest: $pageElementInsertionRequest,
             searchHighlight: searchHighlight?.documentID == documentID
@@ -242,7 +252,7 @@ struct PDFDocumentReaderView: View {
             eraserMode: eraserMode,
             isScribbleEraseEnabled: isScribbleEraseEnabled,
             isAnnotationEditingEnabled: isAnnotationEditingEnabled,
-            allowsQuestionCapture: practice == nil,
+            allowsQuestionCapture: practice == nil && documentStore.handoutWorkspace == nil,
             onOpenQuestionSession: onOpenQuestionSession,
             onSelectLassoTool: onSelectLassoTool,
             onSelectTextTool: onSelectTextTool,
@@ -255,16 +265,20 @@ struct PDFDocumentReaderView: View {
             onReady: registerController,
             onRelease: unregisterController
         )
+        }
 
         // Each paging target occupies exactly one viewport, including the space around the paper.
         // Zoom changes only this page's inner content, so adjacent pages cannot peek into a resting
         // viewport or move the paging boundary when their dimensions or orientations differ.
         return Group {
-            if isUnboundedCanvas {
-                pageView
+            if pageMetadata.handoutSourceID != nil, let workspace = documentStore.handoutWorkspace {
+                HandoutPageHost(workspace: workspace, pageID: pageMetadata.id) { annotatedPage($0) }
+                    .id(pageMetadata.id)
+            } else if isUnboundedCanvas {
+                annotatedPage()
             } else {
                 ScrollView([.horizontal, .vertical], showsIndicators: false) {
-                    pageView
+                    annotatedPage()
                         .frame(width: paperSize.width, height: paperSize.height)
                         .background {
                             ZStack(alignment: .leading) {
@@ -289,6 +303,18 @@ struct PDFDocumentReaderView: View {
                 .scrollDisabled(scale <= 1)
             }
         }
+        .onAppear {
+            if needsInitialHandoutCamera {
+                canvasViewports[pageMetadata.id] = camera
+                documentStore.saveCanvasViewport(camera, forPageID: pageMetadata.id, in: documentID)
+            }
+        }
+        .onChange(of: size) { _, _ in
+            if needsInitialHandoutCamera {
+                canvasViewports[pageMetadata.id] = camera
+                documentStore.saveCanvasViewport(camera, forPageID: pageMetadata.id, in: documentID)
+            }
+        }
         .frame(width: size.width, height: size.height)
         .clipped()
         .background {
@@ -311,6 +337,7 @@ struct PDFDocumentReaderView: View {
 
     private func updateCanvasViewport(_ change: CanvasNavigationChange, for page: LibraryPage, size: CGSize, referenceSize: CGSize) {
         var viewport = canvasViewport(for: page, referenceSize: referenceSize)
+        initialHandoutCameraIDs.remove(page.id)
         switch change {
         case .pan(let translation):
             viewport.pan(by: translation, in: size, referenceSize: referenceSize)
@@ -379,8 +406,13 @@ struct PDFDocumentReaderView: View {
         currentPageIndex = pageIndex
         pendingProgrammaticPageIndex = pageIndex
         documentStore.setLastViewedPage(pageIndex, for: documentID)
-        withAnimation(.easeInOut(duration: 0.28)) {
-            visiblePageID = pageID
+        if documentStore.handoutWorkspace != nil {
+            // A chapter jump must not animate through and mount every intervening WebView.
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { visiblePageID = pageID }
+        } else {
+            withAnimation(.easeInOut(duration: 0.28)) { visiblePageID = pageID }
         }
         if let controller = visibleControllers[pageIndex] {
             onActiveCanvasChanged(controller, pageIndex)
@@ -528,6 +560,7 @@ private struct PDFPageAnnotationView: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     let documentID: String
     let pageID: String
+    var livePage: TiyiHandoutPageSession? = nil
     let pageIndex: Int
     @Binding var pageElementInsertionRequest: PageElementInsertionRequest?
     let searchHighlight: PDFSearchHighlight?
@@ -627,6 +660,11 @@ private struct PDFPageAnnotationView: View {
                     )
                 }
 
+                if let livePage, let logicalViewport {
+                    HandoutPageBackground(session: livePage, viewport: logicalViewport)
+                        .allowsHitTesting(false)
+                }
+
                 if let searchHighlight,
                    let page = documentStore.page(at: resolvedPageIndex, in: documentID) {
                     let bounds = searchHighlightRect(
@@ -668,6 +706,7 @@ private struct PDFPageAnnotationView: View {
                     logicalPageSize: logicalPageSize,
                     logicalViewport: logicalViewport,
                     isCurrentPage: allowsInitialPDFRenderDuringHandwriting,
+                    pagesNavigateFromSidebarOnly: documentStore.handoutWorkspace != nil,
                     onFingerPinchChanged: onFingerPinchChanged,
                     onFingerPinchEnded: onFingerPinchEnded,
                     onFingerPinchCancelled: onFingerPinchCancelled,
@@ -4828,7 +4867,8 @@ private struct PageThumbnailSidebar: View {
                             isBookmarked: page.isBookmarked,
                             rotation: page.rotation,
                             backgroundStyle: page.backgroundStyle,
-                            isSelecting: isSelecting
+                            isSelecting: isSelecting,
+                            handoutTitle: documentStore.handoutWorkspace?.title(for: page.id)
                         ) {
                             select(page, at: pageIndex)
                         }
@@ -4855,7 +4895,7 @@ private struct PageThumbnailSidebar: View {
                                 }
                                 Button("顺时针旋转", systemImage: "rotate.right") {
                                     rotatePages([page.id], clockwise: true)
-                                }
+                                }.disabled(page.handoutSourceID != nil)
                                 Button(
                                     page.isBookmarked ? "取消书签" : "添加书签",
                                     systemImage: page.isBookmarked ? "bookmark.slash" : "bookmark"
@@ -5170,13 +5210,22 @@ private struct PageThumbnailCard: View {
     let rotation: Int
     let backgroundStyle: CanvasBackgroundStyle?
     let isSelecting: Bool
+    var handoutTitle: String? = nil
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 7) {
                 Group {
-                    if let image {
+                    if let handoutTitle {
+                        Rectangle().fill(TiyiNoteTheme.surfaceRaised).overlay {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Image(systemName: "book.pages").foregroundStyle(TiyiNoteTheme.textTertiary)
+                                Text(handoutTitle).font(.system(size: 14, weight: .semibold)).foregroundStyle(TiyiNoteTheme.textPrimary)
+                                Spacer(minLength: 0)
+                            }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    } else if let image {
                         Image(uiImage: image)
                             .resizable()
                             .interpolation(.high)
@@ -5235,7 +5284,7 @@ private struct PageThumbnailCard: View {
                     }
                 }
 
-                Text("\(pageIndex + 1)")
+                Text(handoutTitle.map { "\(pageIndex + 1) · \($0)" } ?? "\(pageIndex + 1)")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(
                         isCurrent || isSelected

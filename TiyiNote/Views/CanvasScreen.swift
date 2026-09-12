@@ -9,6 +9,7 @@ struct CanvasScreen: View {
     let canEditActiveDocument: Bool
     let onShowLibrary: () -> Void
     var practice: TiyiPracticeWorkspace?
+    var handout: TiyiHandoutWorkspace?
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
     @State private var selectedTool = CanvasToolKind.pen
@@ -50,12 +51,17 @@ struct CanvasScreen: View {
         canEditActiveDocument: Bool = true,
         onShowLibrary: @escaping () -> Void = {},
         initialPageElementInsertionRequest: PageElementInsertionRequest? = nil,
-        practice: TiyiPracticeWorkspace? = nil
+        practice: TiyiPracticeWorkspace? = nil,
+        handout: TiyiHandoutWorkspace? = nil
     ) {
         self.documentStore = documentStore
         self.canEditActiveDocument = canEditActiveDocument
         self.onShowLibrary = onShowLibrary
         self.practice = practice
+        self.handout = handout
+        if let handout {
+            _activeDocumentID = AppStorage(wrappedValue: handout.documentID, "pdfWorkspace.activeDocumentID", store: handout.defaults)
+        }
         if let practice {
             _activeDocumentID = AppStorage(wrappedValue: practice.documentID, "pdfWorkspace.activeDocumentID", store: practice.defaults)
         }
@@ -84,7 +90,9 @@ struct CanvasScreen: View {
                             relativeTo: destinationDocumentID
                         )
                     },
-                    onShowLibrary: onShowLibrary
+                    onShowLibrary: onShowLibrary,
+                    libraryLabel: handout == nil ? "返回文稿" : "返回讲义库",
+                    onInteract: handout.map { workspace in { workspace.interact(at: activePageIndex) } }
                 )
                 }
 
@@ -96,19 +104,19 @@ struct CanvasScreen: View {
                         eraserMode: $eraserMode,
                         isScribbleEraseEnabled: $isScribbleEraseEnabled,
                         showsThumbnails: thumbnailVisibility,
-                        onSearch: practice == nil ? { showsPDFSearch = true } : nil,
+                        onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
                         onInsertImage: { showsImageImporter = true },
                         onInsertShape: insertShape,
                         hasActiveDocument: !activeDocumentID.isEmpty,
                         canClearPage: activeController != nil,
                         onDocumentAction: handleDocumentOutput,
                         onClearPage: requestClearCurrentPage,
-                        allowsQuestionCapture: practice == nil
+                        allowsQuestionCapture: practice == nil && handout == nil
                     )
                 } else {
                     ReadOnlyToolPaletteView(
                         showsThumbnails: thumbnailVisibility,
-                        onSearch: practice == nil ? { showsPDFSearch = true } : nil,
+                        onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
                         hasActiveDocument: !activeDocumentID.isEmpty,
                         onDocumentAction: handleDocumentOutput
                     )
@@ -193,6 +201,9 @@ struct CanvasScreen: View {
             .interactiveDismissDisabled()
         }
         .onAppear(perform: prepareWorkspace)
+        .onChange(of: handout?.requestedPageID) { _, id in
+            if let id { requestedReaderPageIndex = documentStore.pageIndex(for: id, in: activeDocumentID) }
+        }
         .onChange(of: practice?.requestedPageID) { _, id in
             if let id { requestedReaderPageIndex = documentStore.pageIndex(for: id, in: activeDocumentID) }
         }
@@ -449,6 +460,10 @@ struct CanvasScreen: View {
     private func handleDocumentOutput(_ action: DocumentOutputAction) {
         guard !activeDocumentID.isEmpty,
               let document = documentStore.document(withID: activeDocumentID) else { return }
+        if handout != nil {
+            workspaceAlert = .outputFailed("这份讲义包含可互动网页，暂不支持 PDF 导出与打印。正文和批注已保存在本机。")
+            return
+        }
         if action == .conflictVersions {
             showsConflictVersions = true
             return
@@ -484,7 +499,7 @@ struct CanvasScreen: View {
     }
 
     private var annotationEditingEnabled: Bool {
-        (PlatformCapabilities.current.canEditAnnotations || (practice != nil && UIDevice.current.userInterfaceIdiom == .phone)) && canEditActiveDocument
+        (PlatformCapabilities.current.canEditAnnotations || ((practice != nil || handout != nil) && UIDevice.current.userInterfaceIdiom == .phone)) && canEditActiveDocument
     }
 }
 

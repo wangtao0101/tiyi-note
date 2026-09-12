@@ -130,6 +130,7 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
     var backgroundStyle: CanvasBackgroundStyle?
     var backgroundColor: CanvasBackgroundColor?
     var isBookmarked: Bool
+    var handoutSourceID: String?
 
     init(
         id: String = UUID().uuidString.lowercased(),
@@ -144,7 +145,8 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
         sourceKind: LibraryPageSourceKind = .pdf,
         backgroundStyle: CanvasBackgroundStyle? = nil,
         backgroundColor: CanvasBackgroundColor? = nil,
-        isBookmarked: Bool = false
+        isBookmarked: Bool = false,
+        handoutSourceID: String? = nil
     ) {
         self.id = id
         self.documentID = documentID
@@ -159,11 +161,12 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
         self.backgroundStyle = backgroundStyle
         self.backgroundColor = backgroundColor
         self.isBookmarked = isBookmarked
+        self.handoutSourceID = handoutSourceID
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, documentID, orderIndex, position, createdAt, modifiedAt
-        case width, height, rotation, sourceKind, backgroundStyle, backgroundColor, isBookmarked
+        case width, height, rotation, sourceKind, backgroundStyle, backgroundColor, isBookmarked, handoutSourceID
     }
 
     init(from decoder: Decoder) throws {
@@ -192,6 +195,7 @@ struct LibraryPage: Identifiable, Codable, Hashable, Sendable {
             CanvasBackgroundColor.self,
             forKey: .backgroundColor
         )
+        handoutSourceID = try container.decodeIfPresent(String.self, forKey: .handoutSourceID)
         isBookmarked = try container.decodeIfPresent(Bool.self, forKey: .isBookmarked) ?? false
     }
 }
