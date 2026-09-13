@@ -294,7 +294,6 @@ final class DrawingDocumentStore: ObservableObject {
     /// immutable result has been handed to the durable writers. CloudKit must not race that handoff.
     private var pendingEditorDrawingPersistenceIDs: Set<UUID> = []
     private(set) var lastDrawingInteractionAt: Date?
-    var allowsPracticeFingerDrawing = false
 #if DEBUG
     private(set) var debugAppendOnlyDrawingSaveCount = 0
     private(set) var debugFullDrawingDiffSaveCount = 0
@@ -3071,7 +3070,11 @@ final class DrawingDocumentStore: ObservableObject {
         in documentID: String,
         size: CGSize
     ) -> UIImage? {
-        guard let metadata = pageMetadata(at: index, in: documentID) else { return nil }
+        guard let metadata = pageMetadata(at: index, in: documentID) else {
+            // Cover headers and page records can arrive in different sync batches.
+            guard index == 0, document(withID: documentID) != nil else { return nil }
+            return availableSparseCover(documentID)
+        }
         let cacheKey = "\(documentID)#\(metadata.id)#\(Int(size.width))x\(Int(size.height))"
         if thumbnailCache.count > 128 {
             for key in thumbnailCache.keys.sorted().prefix(thumbnailCache.count - 96) where key != cacheKey {
@@ -3083,21 +3086,24 @@ final class DrawingDocumentStore: ObservableObject {
         let previous = thumbnailCache[cacheKey]
         if let previous, !dirtyThumbnailKeys.contains(cacheKey) { return previous }
         if index == 0 {
+            let entry = try? sparseDatabase().entry(kind: "cover", id: documentID)
             if let previous {
                 thumbnailVisualKeys[cacheKey] = visualKey
-                scheduleSparseCover(documentID)
+                if entry == nil { scheduleSparseCover(documentID) }
                 return previous
             }
-            if let entry = try? sparseDatabase().entry(kind: "cover", id: documentID),
-               entry.pageID == metadata.id, let path = entry.filePath,
-               let image = UIImage(contentsOfFile: path) {
+            // The persisted cover remains usable even when the first-page ID changes.
+            if let image = availableSparseCover(documentID)
+                ?? thumbnailCache.first(where: { $0.key.hasPrefix("\(documentID)#") })?.value {
                 thumbnailCache[cacheKey] = image
                 thumbnailVisualKeys[cacheKey] = visualKey
                 dirtyThumbnailKeys.remove(cacheKey)
                 return image
             }
-            scheduleSparseCover(documentID)
-            return previous
+            // A missing remote file is a download, not permission to render a replacement
+            // from an incomplete local operation log and upload it back to the source.
+            if entry == nil { scheduleSparseCover(documentID) }
+            return nil
         }
         guard pendingThumbnailIDs[cacheKey] == nil else { return previous }
         let token = UUID(); pendingThumbnailIDs[cacheKey] = token
@@ -7447,7 +7453,8 @@ final class DrawingDocumentStore: ObservableObject {
         let beforeCover = pageMetadata(at: 0, in: documentID)
         pages = previousPages.filter { $0.documentID != documentID } + overrides
         let afterCover = pageMetadata(at: 0, in: documentID)
-        if beforeCover?.id != afterCover?.id || beforeCover.map(sparsePageVisualKey) != afterCover.map(sparsePageVisualKey) {
+        if !applyingSparseRemote,
+           beforeCover?.id != afterCover?.id || beforeCover.map(sparsePageVisualKey) != afterCover.map(sparsePageVisualKey) {
             scheduleSparseCover(documentID, invalidating: true)
         }
 
@@ -7978,7 +7985,9 @@ final class DrawingDocumentStore: ObservableObject {
     private func bumpPageAssetRevision(forPageID pageID: String, in documentID: String) {
         dirtyThumbnailKeys.formUnion(thumbnailCache.keys.filter { $0.hasPrefix("\(documentID)#\(pageID)#") })
         pendingThumbnailIDs = pendingThumbnailIDs.filter { !$0.key.hasPrefix("\(documentID)#\(pageID)#") }
-        if pageMetadata(at: 0, in: documentID)?.id == pageID { scheduleSparseCover(documentID, invalidating: true) }
+        if !applyingSparseRemote, pageMetadata(at: 0, in: documentID)?.id == pageID {
+            scheduleSparseCover(documentID, invalidating: true)
+        }
         pageAssetGeneration &+= 1
         pageAssetRevisions[
             LibraryPageReference(documentID: documentID, pageID: pageID)
@@ -8127,14 +8136,29 @@ extension DrawingDocumentStore {
         try db.acknowledge(entry)
         if entry.kind == "cover", let current = try db.entry(kind: "cover", id: entry.id), !current.pending {
             let directory = workspaceDirectory.appendingPathComponent("Covers")
+            let currentURL = current.filePath.map {
+                URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath()
+            }
             for url in (try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-            where url.lastPathComponent.hasPrefix("\(entry.id)-") && url.path != current.filePath {
+            where url.lastPathComponent.hasPrefix("\(entry.id)-")
+                && url.standardizedFileURL.resolvingSymlinksInPath() != currentURL {
                 try? fileManager.removeItem(at: url)
             }
         }
     }
     func sparseSyncState(_ key: String) throws -> Data? { try sparseDatabase().state(key) }
     func setSparseSyncState(_ key: String, _ data: Data) throws { try sparseDatabase().setState(key, data) }
+
+    private func availableSparseCover(_ documentID: String) -> UIImage? {
+        guard let db = try? sparseDatabase() else { return nil }
+        if let entry = try? db.entry(kind: "cover", id: documentID),
+           let path = entry.filePath, let image = UIImage(contentsOfFile: path) { return image }
+        if let data = try? db.state("cover.previousFile.\(documentID)"),
+           let path = String(data: data, encoding: .utf8), !path.isEmpty {
+            return UIImage(contentsOfFile: path)
+        }
+        return nil
+    }
 
     private func scheduleSparseCover(_ documentID: String, invalidating: Bool = false) {
         if sparseCoverTasks[documentID] != nil && !invalidating { return }
@@ -8199,6 +8223,7 @@ extension DrawingDocumentStore {
         let payload = try JSONEncoder().encode(SparseCoverDescriptor(documentID: documentID, pageID: page.id, visualVersion: version))
         try db.put(kind: "cover", id: documentID, documentID: documentID, pageID: page.id,
             payload: payload, filePath: url.path)
+        try db.setState("cover.previousFile.\(documentID)", Data())
         objectWillChange.send()
         for key in thumbnailCache.keys where key.hasPrefix("\(documentID)#\(page.id)#") {
             thumbnailCache[key] = image; dirtyThumbnailKeys.remove(key)
@@ -8330,6 +8355,9 @@ extension DrawingDocumentStore {
                 case "cover":
                     let value = try decoder.decode(SparseCoverDescriptor.self, from: entry.payload)
                     guard isSafePathComponent(value.documentID), isSafePathComponent(value.pageID) else { throw LibraryStoreError.invalidSnapshot("封面无效") }
+                    if let path = local?.filePath, fileManager.fileExists(atPath: path) {
+                        try db.setState("cover.previousFile.\(entry.documentID)", Data(path.utf8))
+                    }
                 case "asset":
                     let value = try decoder.decode(SparseAssetDescriptor.self, from: entry.payload)
                     guard isSafePathComponent(value.resourceID), isSafePathComponent(value.reference.documentID) else { throw LibraryStoreError.invalidSnapshot("资源无效") }
@@ -8363,7 +8391,11 @@ extension DrawingDocumentStore {
 
     func sparseAssetsToDownload() throws -> [SparseLibraryEntry] {
         let db = try sparseDatabase()
-        let covers = try db.entries(kind: "cover", missingFileOnly: true).filter { entry in documentMetadata.contains(where: { $0.id == entry.documentID }) }
+        let documentIDs = Set(documentMetadata.map(\.id))
+        let covers = try db.entries(kind: "cover").filter { entry in
+            documentIDs.contains(entry.documentID) && !entry.pending
+                && (entry.filePath.map { !fileManager.fileExists(atPath: $0) } ?? true)
+        }
         let requested = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
         let assets = try db.entries(kind: "asset", missingFileOnly: true).filter { (requested.contains($0.id) || openDocumentIDs.contains($0.documentID))
         }
@@ -8393,6 +8425,7 @@ extension DrawingDocumentStore {
             payload: entry.payload, filePath: destination.path, pending: false)
         if entry.kind == "cover" {
             if let image = UIImage(contentsOfFile: destination.path) {
+                try db.setState("cover.previousFile.\(entry.documentID)", Data())
                 objectWillChange.send()
                 for key in thumbnailCache.keys where key.hasPrefix("\(entry.documentID)#\(entry.pageID)#") {
                     thumbnailCache[key] = image; dirtyThumbnailKeys.remove(key)

@@ -110,6 +110,7 @@ struct PDFDocumentReaderView: View {
                     documentStore: documentStore,
                     documentID: documentID,
                     currentPageIndex: currentPageIndex,
+                    isEditingEnabled: isAnnotationEditingEnabled,
                     practice: practice,
                     onSelectPage: requestPage,
                     onClose: {
@@ -721,6 +722,7 @@ private struct PDFPageAnnotationView: View {
                     logicalViewport: logicalViewport,
                     isCurrentPage: allowsInitialPDFRenderDuringHandwriting,
                     pagesNavigateFromSidebarOnly: documentStore.handoutWorkspace != nil,
+                    isAnnotationEditingEnabled: isAnnotationEditingEnabled,
                     onFingerPinchChanged: onFingerPinchChanged,
                     onFingerPinchEnded: onFingerPinchEnded,
                     onFingerPinchCancelled: onFingerPinchCancelled,
@@ -735,7 +737,8 @@ private struct PDFPageAnnotationView: View {
                     ForEach(pageElements.filter { $0.question != nil }.sorted(by: pageElementSort)) { element in
                         let rect = projection.displayRect(element.logicalBounds, displaySize: geometry.size)
                         QuestionMarkerView(isCompleted: element.question?.isCompleted == true)
-                            .frame(width: rect.width, height: rect.height)
+                            .frame(width: min(rect.width, QuestionMarkerView.maximumDisplaySize),
+                                   height: min(rect.height, QuestionMarkerView.maximumDisplaySize))
                             .rotationEffect(.radians(element.rotationRadians))
                             .position(x: rect.midX, y: rect.midY)
                     }
@@ -824,7 +827,15 @@ private struct PDFPageAnnotationView: View {
         .onChange(of: markerWidth) { _, _ in applySelectedTool() }
         .onChange(of: eraserSize) { _, _ in applySelectedTool() }
         .onChange(of: eraserMode) { _, _ in applySelectedTool() }
-        .onChange(of: isAnnotationEditingEnabled) { _, _ in applySelectedTool() }
+        .onChange(of: isAnnotationEditingEnabled) { _, enabled in
+            configurePageCallbacks()
+            if !enabled {
+                requestedSelection = nil
+                cancelShapeEdit()
+                croppingImageElementID = nil
+            }
+            applySelectedTool()
+        }
     }
 
     private var shapeEditorPresented: Binding<Bool> {
@@ -897,7 +908,6 @@ private struct PDFPageAnnotationView: View {
     }
 
     private func preparePageCanvas() {
-        controller.allowsPracticeFingerDrawing = documentStore.allowsPracticeFingerDrawing
         if !drawingPersistence.hasLoadedDrawing {
             let initialDrawing = documentStore.loadDrawing(
                 forPage: resolvedPageIndex,
@@ -926,8 +936,34 @@ private struct PDFPageAnnotationView: View {
             arePageElementsDirty = false
             drawingPersistence.hasLoadedDrawing = true
             normalizeQuestionMarkers()
+        } else if !arePageElementsDirty {
+            // The answering sheet saves into this document while its source canvas is retained.
+            // Refresh before reinstalling callbacks so later selection/move actions use the saved payload.
+            reloadQuestionElements()
         }
 
+        configurePageCallbacks()
+        drawingPersistence.globalInteractionObserverTask?.cancel()
+        drawingPersistence.globalInteractionObserverTask = nil
+        if Self.allowsInEditorDrawingPersistence {
+            drawingPersistence.globalInteractionObserverTask = Task { @MainActor in
+                for await notification in NotificationCenter.default.notifications(
+                    named: .tiyiDrawingInteractionActivityChanged
+                ) {
+                    guard !Task.isCancelled,
+                          let source = notification.object as? DrawingDocumentStore,
+                          source === documentStore else { continue }
+                    handleGlobalDrawingInteractionChange()
+                }
+            }
+        }
+        controller.configureAnnotationInput(isEditable: isAnnotationEditingEnabled)
+        applySelectedTool()
+        onReady(controller, pageIndex)
+        consumePageElementInsertionRequest()
+    }
+
+    private func configurePageCallbacks() {
         controller.pageElementsProvider = { pageElements }
         controller.onRequestContentSelection = { strokeIndices, elementIDs in
             guard isAnnotationEditingEnabled else { return }
@@ -981,24 +1017,6 @@ private struct PDFPageAnnotationView: View {
             guard let controller else { return }
             onReady(controller, pageIndex)
         }
-        drawingPersistence.globalInteractionObserverTask?.cancel()
-        drawingPersistence.globalInteractionObserverTask = nil
-        if Self.allowsInEditorDrawingPersistence {
-            drawingPersistence.globalInteractionObserverTask = Task { @MainActor in
-                for await notification in NotificationCenter.default.notifications(
-                    named: .tiyiDrawingInteractionActivityChanged
-                ) {
-                    guard !Task.isCancelled,
-                          let source = notification.object as? DrawingDocumentStore,
-                          source === documentStore else { continue }
-                    handleGlobalDrawingInteractionChange()
-                }
-            }
-        }
-        controller.configureAnnotationInput(isEditable: isAnnotationEditingEnabled)
-        applySelectedTool()
-        onReady(controller, pageIndex)
-        consumePageElementInsertionRequest()
     }
 
     private var canvasAccessibilityValue: String {
@@ -1080,6 +1098,7 @@ private struct PDFPageAnnotationView: View {
             controller.configureAnnotationInput(isEditable: false)
             return
         }
+        controller.configureAnnotationInput(isEditable: true)
         let width = selectedTool == .marker ? markerWidth : penWidth
         controller.updateTool(
             kind: selectedTool,
@@ -2831,7 +2850,7 @@ private struct LassoSelectionOverlay: View {
                             canOpenQuestion: selectedQuestionElement != nil,
                             showsObjectActions: !selectionContainsQuestionElement && !selection.content.isEmpty,
                             onOpenQuestion: { if let element = selectedQuestionElement { onOpenQuestion(element) } },
-                            onAskAssistant: assistantIntegration == nil ? nil : {
+                            onAskAssistant: assistantIntegration == nil || selectionContainsQuestionElement ? nil : {
                                 guard let page, let image = LassoSnapshotRenderer.render(page: page,
                                     drawing: controller.drawing, pageElements: pageElements,
                                     cropRect: (assistantSelectionBounds ?? selection.axisAlignedBounds).insetBy(dx: -4, dy: -4),
@@ -4200,7 +4219,7 @@ private struct LassoActionBar: View {
                     .accessibilityIdentifier("lasso-ask-assistant")
             }
             if canOpenQuestion {
-                actionButton(title: "进入作答", symbol: "pencil.circle", tint: TiyiNoteTheme.textPrimary, action: onOpenQuestion)
+                actionButton(title: "进入作答", symbol: CanvasToolKind.question.symbolName, tint: TiyiNoteTheme.textPrimary, action: onOpenQuestion)
                     .accessibilityIdentifier("question-selection-open")
             }
             if canEditText {
@@ -4663,9 +4682,9 @@ enum LassoSnapshotRenderer {
             height: element.logicalBounds.height
         )
         switch element.payload {
-        case .question(let payload):
+        case .question:
             let inset = (1 - QuestionMarkerView.visualScale) / 2
-            UIImage(systemName: payload.isCompleted ? "checkmark.circle.fill" : "pencil.circle.fill")?
+            UIImage(systemName: CanvasToolKind.question.symbolName)?
                 .withTintColor(.systemBlue, renderingMode: .alwaysOriginal)
                 .draw(in: rect.insetBy(dx: rect.width * inset, dy: rect.height * inset))
         case .image(let payload):
@@ -4759,6 +4778,7 @@ private struct PageThumbnailSidebar: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     let documentID: String
     let currentPageIndex: Int
+    let isEditingEnabled: Bool
     let practice: TiyiPracticeWorkspace?
     let onSelectPage: (Int) -> Void
     let onClose: () -> Void
@@ -4810,38 +4830,40 @@ private struct PageThumbnailSidebar: View {
                     .foregroundStyle(TiyiNoteTheme.textPrimary)
                 Spacer()
 
-                Menu {
-                    Button("空白页", systemImage: "doc") {
-                        insertPage(style: .blank)
+                if isEditingEnabled {
+                    Menu {
+                        Button("空白页", systemImage: "doc") {
+                            insertPage(style: .blank)
+                        }
+                        Button("横线纸", systemImage: "line.3.horizontal") {
+                            insertPage(style: .ruled)
+                        }
+                        Button("方格纸", systemImage: "square.grid.3x3") {
+                            insertPage(style: .grid)
+                        }
+                        Button("点阵纸", systemImage: "circle.grid.3x3") {
+                            insertPage(style: .dotted)
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(TiyiNoteTheme.selectionForeground)
+                            .frame(width: 34, height: 34)
                     }
-                    Button("横线纸", systemImage: "line.3.horizontal") {
-                        insertPage(style: .ruled)
-                    }
-                    Button("方格纸", systemImage: "square.grid.3x3") {
-                        insertPage(style: .grid)
-                    }
-                    Button("点阵纸", systemImage: "circle.grid.3x3") {
-                        insertPage(style: .dotted)
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(TiyiNoteTheme.selectionForeground)
-                        .frame(width: 34, height: 34)
-                }
-                .accessibilityLabel("新建页面")
-                .accessibilityIdentifier("page-add-menu")
+                    .accessibilityLabel("新建页面")
+                    .accessibilityIdentifier("page-add-menu")
 
-                Button(isSelecting ? "完成" : "选择") {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        isSelecting.toggle()
-                        if !isSelecting { selectedPageIDs.removeAll() }
+                    Button(isSelecting ? "完成" : "选择") {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            isSelecting.toggle()
+                            if !isSelecting { selectedPageIDs.removeAll() }
+                        }
                     }
-                }
-                .font(.system(size: 13, weight: .semibold))
-                .buttonStyle(.plain)
-                .foregroundStyle(TiyiNoteTheme.selectionForeground)
+                    .font(.system(size: 13, weight: .semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TiyiNoteTheme.selectionForeground)
 
+                }
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 14, weight: .semibold))
@@ -4919,6 +4941,7 @@ private struct PageThumbnailSidebar: View {
                             select(page, at: pageIndex)
                         }
                         .onDrag {
+                            guard isEditingEnabled else { return NSItemProvider() }
                             draggingPageID = page.id
                             return NSItemProvider(object: page.id as NSString)
                         }
@@ -4931,26 +4954,28 @@ private struct PageThumbnailSidebar: View {
                             )
                         )
                         .contextMenu {
-                            if filter == .deleted {
-                                Button("恢复页面", systemImage: "arrow.uturn.backward") {
-                                    restorePages([page.id])
-                                }
-                            } else {
-                                Button("复制页面", systemImage: "plus.square.on.square") {
-                                    duplicatePage(page.id)
-                                }
-                                Button("顺时针旋转", systemImage: "rotate.right") {
-                                    rotatePages([page.id], clockwise: true)
-                                }.disabled(page.handoutSourceID != nil)
-                                Button(
-                                    page.isBookmarked ? "取消书签" : "添加书签",
-                                    systemImage: page.isBookmarked ? "bookmark.slash" : "bookmark"
-                                ) {
-                                    setBookmark([page.id], isBookmarked: !page.isBookmarked)
-                                }
-                                Divider()
-                                Button("删除页面", systemImage: "trash", role: .destructive) {
-                                    requestDelete([page.id])
+                            if isEditingEnabled {
+                                if filter == .deleted {
+                                    Button("恢复页面", systemImage: "arrow.uturn.backward") {
+                                        restorePages([page.id])
+                                    }
+                                } else {
+                                    Button("复制页面", systemImage: "plus.square.on.square") {
+                                        duplicatePage(page.id)
+                                    }
+                                    Button("顺时针旋转", systemImage: "rotate.right") {
+                                        rotatePages([page.id], clockwise: true)
+                                    }.disabled(page.handoutSourceID != nil)
+                                    Button(
+                                        page.isBookmarked ? "取消书签" : "添加书签",
+                                        systemImage: page.isBookmarked ? "bookmark.slash" : "bookmark"
+                                    ) {
+                                        setBookmark([page.id], isBookmarked: !page.isBookmarked)
+                                    }
+                                    Divider()
+                                    Button("删除页面", systemImage: "trash", role: .destructive) {
+                                        requestDelete([page.id])
+                                    }
                                 }
                             }
                         }
@@ -4960,7 +4985,7 @@ private struct PageThumbnailSidebar: View {
                 .padding(.bottom, 24)
             }
 
-            if isSelecting {
+            if isSelecting && isEditingEnabled {
                 selectionActionBar
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -4988,6 +5013,15 @@ private struct PageThumbnailSidebar: View {
         }
         .onChange(of: (orderedPages + deletedPages).map(\.id)) { _, pageIDs in
             selectedPageIDs.formIntersection(pageIDs)
+        }
+        .onChange(of: isEditingEnabled) { _, enabled in
+            if !enabled {
+                isSelecting = false
+                selectedPageIDs.removeAll()
+                draggingPageID = nil
+                pendingDeletionPageIDs.removeAll()
+                showsDeleteConfirmation = false
+            }
         }
         .onChange(of: filter) { _, _ in
             selectedPageIDs.removeAll()
@@ -5068,6 +5102,7 @@ private struct PageThumbnailSidebar: View {
     }
 
     private func mutatePages(_ mutation: () throws -> Void) throws {
+        guard isEditingEnabled else { return }
         if let practice {
             try practice.performPageMutation(mutation)
         } else {
@@ -5180,7 +5215,7 @@ private struct PageThumbnailSidebar: View {
     }
 
     private func movePage(_ sourcePageID: String, _ destinationPageID: String) -> Bool {
-        guard sourcePageID != destinationPageID,
+        guard isEditingEnabled, sourcePageID != destinationPageID,
               let destinationIndex = orderedPages.firstIndex(where: {
                   $0.id == destinationPageID
               }) else { return false }

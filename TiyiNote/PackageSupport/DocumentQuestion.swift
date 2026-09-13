@@ -81,10 +81,22 @@ enum CloudOperationPayloadTransport {
     private var context: CollaborationVersionVector
 
     init(store: DrawingDocumentStore, documentID: String, pageID: String,
-         element: CanvasPageElement, isNew: Bool = false) throws {
+         element suppliedElement: CanvasPageElement, isNew: Bool = false) throws {
+        guard let index = store.pageIndex(for: pageID, in: documentID) else { throw CocoaError(.fileNoSuchFile) }
+        guard store.flushAllPendingSaves() else { throw CocoaError(.fileWriteUnknown) }
+        let element: CanvasPageElement
+        if isNew {
+            element = suppliedElement
+        } else {
+            // A retained canvas/selection can still hold the marker from before the last answer.
+            // Resolve its stable ID against the source document before restoring an editable package.
+            guard let saved = store.loadPageElements(forPage: index, in: documentID).first(where: { $0.id == suppliedElement.id }) else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            element = saved
+        }
         guard let payload = element.question, payload.isValid,
-              let image = UIImage(data: payload.snapshotPNG),
-              let index = store.pageIndex(for: pageID, in: documentID) else {
+              let image = UIImage(data: payload.snapshotPNG) else {
             throw CocoaError(.fileReadCorruptFile)
         }
         sourceStore = store
@@ -229,7 +241,7 @@ struct QuestionCaptureOverlay: View {
                     }
                 }
                 if let crop {
-                    SelectionActionButton(title: "作答", symbol: "pencil", tint: TiyiNoteTheme.textPrimary) { onConfirm(crop) }
+                    SelectionActionButton(title: "作答", symbol: CanvasToolKind.question.symbolName, tint: TiyiNoteTheme.textPrimary) { onConfirm(crop) }
                         .accessibilityIdentifier("question-confirm")
                         .modifier(SelectionActionBarChrome(identifier: "question-action-bar"))
                         .position(SelectionActionBarLayout.position(
@@ -263,10 +275,11 @@ struct QuestionCaptureOverlay: View {
 /// intercept the canvas finger-selection recognizer or Pencil drawing contacts.
 struct QuestionMarkerView: View {
     static let visualScale: CGFloat = 0.75
+    static let maximumDisplaySize: CGFloat = 24
     let isCompleted: Bool
 
     var body: some View {
-        Image(systemName: isCompleted ? "checkmark.circle.fill" : "pencil.circle.fill")
+        Image(systemName: CanvasToolKind.question.symbolName)
             .resizable()
             .scaledToFit()
             .scaleEffect(Self.visualScale)

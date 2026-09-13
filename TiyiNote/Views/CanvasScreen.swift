@@ -19,6 +19,8 @@ struct CanvasScreen: View {
     var navigation: TiyiWorkspaceNavigation?
 
     @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
+    @State private var interactionSession = CanvasInteractionSession()
+    @State private var pendingReadOnly = false
     @State private var selectedTool = CanvasToolKind.pen
     @AppStorage("canvas.penVariant") private var selectedPenVariant = CanvasToolKind.pen
     @AppStorage("canvas.color") private var selectedColor = InkPaletteColor.graphite
@@ -145,6 +147,27 @@ struct CanvasScreen: View {
             assistantPageID = pageID
         }
         .onChange(of: activeDocumentID) { _, _ in assistantSelections = []; showsAssistant = false }
+        .onChange(of: interactionContentID, initial: true) { _, id in
+            pendingReadOnly = false
+            interactionSession.enter(id)
+        }
+        .task(id: pendingReadOnly) {
+            guard pendingReadOnly else { return }
+            let contentID = interactionContentID
+            // A second hand can tap the toolbar before the Pencil has lifted. Let that
+            // transaction finish, including its final sample, before closing the editor.
+            while activeController?.isUsingTool == true {
+                do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
+            }
+            guard !Task.isCancelled, pendingReadOnly,
+                  contentID == interactionContentID, annotationEditingEnabled else { return }
+            NotificationCenter.default.post(name: .tiyiPracticeCheckpoint, object: documentStore)
+            pageElementInsertionRequest = nil
+            showsImageImporter = false
+            interactionSession.toggle(contentID: contentID, hasPermission: canToggleEditing)
+            pendingReadOnly = false
+        }
+        .onDisappear { pendingReadOnly = false }
         .onReceive(NotificationCenter.default.publisher(for: .tiyiAssistantSelection)) { notification in
             guard let value = notification.object as? TiyiAssistantSelectionEvent,
                   value.documentID == activeDocumentID else { return }
@@ -206,7 +229,8 @@ struct CanvasScreen: View {
                 onClearPage: requestClearCurrentPage,
                 allowsQuestionCapture: practice == nil && handout == nil,
                 onAssistant: onAssistant,
-                isAssistantOpen: showsAssistant
+                isAssistantOpen: showsAssistant,
+                onToggleEditing: canToggleEditing ? toggleEditing : nil
             )
         } else {
             ReadOnlyToolPaletteView(
@@ -215,7 +239,8 @@ struct CanvasScreen: View {
                 hasActiveDocument: !activeDocumentID.isEmpty,
                 onDocumentAction: handleDocumentOutput,
                 onAssistant: onAssistant,
-                isAssistantOpen: showsAssistant
+                isAssistantOpen: showsAssistant,
+                onToggleEditing: canToggleEditing ? toggleEditing : nil
             )
         }
     }
@@ -480,6 +505,7 @@ struct CanvasScreen: View {
     }
 
     private func insertShape(_ kind: PageShapeKind) {
+        guard annotationEditingEnabled else { return }
         pageElementInsertionRequest = PageElementInsertionRequest(
             pageIndex: activePageIndex,
             payload: .shape(
@@ -493,6 +519,7 @@ struct CanvasScreen: View {
     }
 
     private func handleImageImport(_ result: Result<[URL], Error>) {
+        guard annotationEditingEnabled else { return }
         switch result {
         case .success(let urls):
             guard let url = urls.first else { return }
@@ -602,8 +629,25 @@ struct CanvasScreen: View {
         printController.present(animated: true)
     }
 
+    private var interactionContentID: String {
+        "\(ObjectIdentifier(documentStore))-\(activeDocumentID)"
+    }
+
+    private var canToggleEditing: Bool {
+        PlatformCapabilities.current.canEditAnnotations && canEditActiveDocument && !activeDocumentID.isEmpty
+    }
+
     private var annotationEditingEnabled: Bool {
-        (PlatformCapabilities.current.canEditAnnotations || ((practice != nil || handout != nil) && UIDevice.current.userInterfaceIdiom == .phone)) && canEditActiveDocument
+        interactionSession.canWrite(contentID: interactionContentID, hasPermission: canToggleEditing)
+    }
+
+    private func toggleEditing() {
+        guard canToggleEditing else { return }
+        if annotationEditingEnabled {
+            pendingReadOnly = true
+        } else {
+            interactionSession.toggle(contentID: interactionContentID, hasPermission: canToggleEditing)
+        }
     }
 }
 

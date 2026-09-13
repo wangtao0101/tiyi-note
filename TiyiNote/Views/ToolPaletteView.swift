@@ -49,6 +49,7 @@ struct ToolPaletteView: View {
     var allowsQuestionCapture = false
     var onAssistant: (() -> Void)? = nil
     var isAssistantOpen = false
+    var onToggleEditing: (() -> Void)? = nil
 
     var body: some View {
         ZStack {
@@ -59,7 +60,7 @@ struct ToolPaletteView: View {
 
             GeometryReader { geometry in
                 let horizontalPadding: CGFloat = 20
-                let leadingControlsWidth: CGFloat = onSearch == nil ? 38 : 78
+                let leadingControlsWidth: CGFloat = (onSearch == nil ? 38 : 78) + 84
                 let dividerWidth: CGFloat = 5
                 let outerSpacing: CGFloat = 24
                 let trailingActionCount = onAssistant == nil ? 2 : 3
@@ -96,6 +97,7 @@ struct ToolPaletteView: View {
                         }
                     }
 
+                    CanvasModeButton(isEditing: true, onToggle: onToggleEditing)
                     DocumentToolbarDivider()
 
                     // Only the drawing-tool cluster is allowed to scroll. Keeping the document
@@ -480,6 +482,7 @@ struct ReadOnlyToolPaletteView: View {
     let onDocumentAction: (DocumentOutputAction) -> Void
     var onAssistant: (() -> Void)? = nil
     var isAssistantOpen = false
+    var onToggleEditing: (() -> Void)? = nil
 
     var body: some View {
         ZStack {
@@ -507,11 +510,9 @@ struct ReadOnlyToolPaletteView: View {
                     )
                 }
 
-                DocumentToolbarDivider()
+                CanvasModeButton(isEditing: false, onToggle: onToggleEditing)
 
-                Label("只读", systemImage: "eye")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(TiyiNoteTheme.documentChromeMuted)
+                DocumentToolbarDivider()
 
                 Spacer(minLength: 0)
 
@@ -1255,5 +1256,25 @@ private struct DocumentToolbarDivider: View {
             .fill(Color.white.opacity(0.16))
             .frame(width: 1, height: 26)
             .padding(.horizontal, 2)
+    }
+}
+
+private struct CanvasModeButton: View {
+    let isEditing: Bool
+    let onToggle: (() -> Void)?
+
+    var body: some View {
+        Button { onToggle?() } label: {
+            Label(isEditing ? "书写" : "只读", systemImage: isEditing ? "pencil.tip" : "doc.text.magnifyingglass")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(TiyiNoteTheme.documentChromeForeground)
+                .frame(width: 76, height: 38)
+                .background(Color.white.opacity(isEditing ? 0.16 : 0.08), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .disabled(onToggle == nil)
+        .accessibilityIdentifier("canvas-interaction-mode")
+        .accessibilityLabel(isEditing ? "书写" : "只读")
+        .accessibilityHint(onToggle == nil ? "当前文稿不可编辑" : (isEditing ? "切换为只读" : "开启书写"))
     }
 }

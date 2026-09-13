@@ -10,6 +10,7 @@ struct PencilCanvasView: UIViewRepresentable {
     let logicalViewport: CGRect?
     let isCurrentPage: Bool
     var pagesNavigateFromSidebarOnly: Bool = false
+    var isAnnotationEditingEnabled: Bool = true
     let onFingerPinchChanged: (CGFloat) -> Void
     let onFingerPinchEnded: (CGFloat) -> Void
     let onFingerPinchCancelled: () -> Void
@@ -20,6 +21,7 @@ struct PencilCanvasView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> PageCanvasContainerView {
+        controller.configureAnnotationInput(isEditable: isAnnotationEditingEnabled)
         let view = PageCanvasContainerView(
             controller: controller,
             logicalPageSize: logicalPageSize,
@@ -36,6 +38,7 @@ struct PencilCanvasView: UIViewRepresentable {
 
     func updateUIView(_ uiView: PageCanvasContainerView, context: Context) {
         context.coordinator.parent = self
+        controller.configureAnnotationInput(isEditable: isAnnotationEditingEnabled)
         if uiView.logicalPageSize != logicalPageSize {
             uiView.logicalPageSize = logicalPageSize
         }
@@ -67,12 +70,16 @@ struct PencilCanvasView: UIViewRepresentable {
                 return
             }
             canvasContainer = container
-            guard navigationHost !== host else { return }
+            let minimumTouches = parent.pagesNavigateFromSidebarOnly ? parent.controller.navigationTouchCount : 2
+            if navigationHost === host {
+                canvasPan?.minimumNumberOfTouches = minimumTouches
+                return
+            }
             removeCanvasNavigation()
             canvasContainer = container
             navigationHost = host
             let pan = UIPanGestureRecognizer(target: self, action: #selector(handleCanvasPan(_:)))
-            pan.minimumNumberOfTouches = parent.pagesNavigateFromSidebarOnly && UIDevice.current.userInterfaceIdiom == .pad ? 1 : 2
+            pan.minimumNumberOfTouches = minimumTouches
             pan.maximumNumberOfTouches = 2
             pan.allowedScrollTypesMask = .all
             let pinch = UIPinchGestureRecognizer(
@@ -130,7 +137,7 @@ struct PencilCanvasView: UIViewRepresentable {
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             if gestureRecognizer === canvasPan || gestureRecognizer === canvasPinch {
-                return !parent.controller.isUsingTool || CanvasController.allowsFingerDrawing
+                return !parent.controller.isUsingTool || parent.controller.allowsDirectDrawing
             }
             return true
         }
@@ -235,19 +242,23 @@ final class PageCanvasContainerView: UIView {
         canvasView.minimumZoomScale = min(0.05, targetScale)
         canvasView.maximumZoomScale = max(10, targetScale)
         let localViewport = logicalViewport.map { controller.prepareUnboundedViewport($0) }
+        // UIScrollView.contentSize is expressed AFTER zoom. Set the zoom first, then
+        // the scaled extent; otherwise UIKit multiplies an unscaled replacement by
+        // newZoom / oldZoom and the writable tiles can end before the visible camera.
+        canvasView.zoomScale = targetScale
         if let viewport = localViewport {
             // PencilKit's writable tile space must be positive. The controller translates this
             // local origin at editing/persistence boundaries; the camera stays in world space.
             canvasView.contentInsetAdjustmentBehavior = .never
             canvasView.contentSize = CGSize(
-                width: max(logicalPageSize.width - controller.canvasWorldOrigin.x, viewport.maxX + viewport.width),
-                height: max(logicalPageSize.height - controller.canvasWorldOrigin.y, viewport.maxY + viewport.height)
+                width: max(logicalPageSize.width - controller.canvasWorldOrigin.x, viewport.maxX + viewport.width) * targetScale,
+                height: max(logicalPageSize.height - controller.canvasWorldOrigin.y, viewport.maxY + viewport.height) * targetScale
             )
             canvasView.contentInset = .zero
         } else {
-            canvasView.contentSize = logicalPageSize
+            canvasView.contentSize = CGSize(width: logicalPageSize.width * targetScale,
+                                            height: logicalPageSize.height * targetScale)
         }
-        canvasView.zoomScale = targetScale
         canvasView.showsHorizontalScrollIndicator = false
         canvasView.showsVerticalScrollIndicator = false
         canvasView.contentOffset = localViewport.map {
@@ -282,7 +293,7 @@ final class PageCanvasContainerView: UIView {
                 // Simulator mouse drawing still uses one contact, so that development input mode
                 // reserves it for ink. Pencil-only tests exercise the shipping navigation policy.
                 let isPagePan = logicalViewport == nil && !hasConfiguredPagePan
-                let touchCount = isPagePan || canvasView.drawingPolicy == .anyInput ? 2 : 1
+                let touchCount = isPagePan ? 2 : controller.navigationTouchCount
                 scrollView.panGestureRecognizer.allowedTouchTypes = allowedNavigationTouches
                 scrollView.panGestureRecognizer.minimumNumberOfTouches = touchCount
                 scrollView.panGestureRecognizer.maximumNumberOfTouches = touchCount
@@ -296,6 +307,9 @@ final class PageCanvasContainerView: UIView {
                            $0 is PageMultiTouchPagingGuard
                        }) != true {
                         scrollView.addGestureRecognizer(PageMultiTouchPagingGuard(pager: scrollView))
+                    }
+                    for guardGesture in scrollView.gestureRecognizers ?? [] where guardGesture is PageMultiTouchPagingGuard {
+                        guardGesture.isEnabled = !suppressesFingerPaging && touchCount == 1
                     }
                     // Keep camera gestures inside the scroll content. HostingScrollView owns
                     // and arbitrates its own recognizers; the content host also covers objects

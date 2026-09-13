@@ -82,7 +82,6 @@ enum HandoutAttachmentError: LocalizedError {
             try store.setHandoutSource(source.id, for: page.id, in: documentID)
         }
         defaults.set(documentID, forKey: "pdfWorkspace.activeDocumentID")
-        store.allowsPracticeFingerDrawing = UIDevice.current.userInterfaceIdiom == .phone
         store.openDocument(documentID)
         store.handoutWorkspace = self
     }

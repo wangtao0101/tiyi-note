@@ -88,7 +88,6 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         // Also migrate existing local workspaces and packages restored from older app versions.
         try store.enableUnboundedCanvas(for: documentID)
         self.sections = mapped
-        store.allowsPracticeFingerDrawing = UIDevice.current.userInterfaceIdiom == .phone
         currentPageID = lastPageID ?? mapped.first?.pageIDs.first
         defaults.set(documentID, forKey: "pdfWorkspace.activeDocumentID")
         store.openDocument(documentID)

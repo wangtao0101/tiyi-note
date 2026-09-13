@@ -71,8 +71,14 @@ final class CanvasController: NSObject, ObservableObject {
     private var isShapePreviewVisible = false
     private var authoritativeSnappedDrawing: PKDrawing?
     private var isAnnotationInputEditable = true
-    var allowsPracticeFingerDrawing = false
-    var allowsDirectDrawing: Bool { Self.allowsFingerDrawing || allowsPracticeFingerDrawing }
+    var allowsDirectDrawing: Bool {
+#if targetEnvironment(macCatalyst)
+        true
+#else
+        UIDevice.current.userInterfaceIdiom == .phone || Self.allowsFingerDrawing
+#endif
+    }
+    var navigationTouchCount: Int { isAnnotationInputEditable && allowsDirectDrawing ? 2 : 1 }
 
     override init() {
         let canvasView = TiyiPencilCanvasView(frame: .zero)
@@ -262,7 +268,7 @@ final class CanvasController: NSObject, ObservableObject {
         if !kind.usesInkSettings {
             cancelHeldInkRecognition()
         }
-        canvasView.drawingGestureRecognizer.isEnabled = kind != .lasso && kind != .question && kind != .text
+        canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable && kind != .lasso && kind != .question && kind != .text
 
         switch kind {
         case .pen:
@@ -312,7 +318,9 @@ final class CanvasController: NSObject, ObservableObject {
             // Space menu, even with drawingGestureRecognizer disabled and responder actions off.
             canvasView.tool = PKInkingTool(.monoline, color: .clear, width: 1)
         }
-        if kind == .question { canvasView.drawingGestureRecognizer.isEnabled = false }
+        // PencilKit can re-enable its recognizer when the tool is assigned.
+        canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable
+            && kind != .lasso && kind != .question && kind != .text
         (canvasView as? TiyiPencilCanvasView)?.disableSystemEditingInteractions()
     }
 
@@ -331,7 +339,7 @@ final class CanvasController: NSObject, ObservableObject {
             return
         }
 
-        canvasView.drawingGestureRecognizer.isEnabled = true
+        canvasView.drawingGestureRecognizer.isEnabled = selectedToolKind != .lasso && selectedToolKind != .text && selectedToolKind != .question
         canvasView.drawingPolicy = allowsDirectDrawing ? .anyInput : .pencilOnly
         canvasView.drawingGestureRecognizer.allowedTouchTypes = allowsDirectDrawing ? [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
