@@ -3,6 +3,7 @@ import CloudKit
 import Security
 #endif
 import SwiftUI
+import Combine
 import UIKit
 
 struct RootWorkspaceView: View {
@@ -18,6 +19,7 @@ struct RootWorkspaceView: View {
     let onExit: (() -> Void)?
     let librarySidebar: AnyView?
     let libraryContainer: ((AnyView) -> AnyView)?
+    let imports: TiyiPDFImportController?
 
     @State private var libraryBrowsingState = LibraryBrowserState()
 
@@ -39,12 +41,14 @@ struct RootWorkspaceView: View {
         documentStore: DrawingDocumentStore,
         onExit: (() -> Void)? = nil,
         librarySidebar: AnyView? = nil,
-        libraryContainer: ((AnyView) -> AnyView)? = nil
+        libraryContainer: ((AnyView) -> AnyView)? = nil,
+        imports: TiyiPDFImportController? = nil
     ) {
         self.documentStore = documentStore
         self.onExit = onExit
         self.librarySidebar = librarySidebar
         self.libraryContainer = libraryContainer
+        self.imports = imports
     }
 
     var body: some View {
@@ -62,6 +66,11 @@ struct RootWorkspaceView: View {
                 )
                 .transition(.opacity)
             }
+        }
+        .onReceive(imports?.$documentToOpen.eraseToAnyPublisher() ?? Just(nil).eraseToAnyPublisher()) { id in
+            guard let id else { return }
+            openDocument(id)
+            imports?.documentToOpen = nil
         }
         .animation(.easeInOut(duration: 0.16), value: destination)
         .tint(TiyiNoteTheme.selectionBlue)

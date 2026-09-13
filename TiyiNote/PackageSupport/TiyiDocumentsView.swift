@@ -4,12 +4,14 @@ import SwiftUI
 /// this package so it can evolve without leaking the original standalone app's internal model.
 public struct TiyiDocumentsView: View {
     @StateObject private var documentStore: DrawingDocumentStore
+    private let imports: TiyiPDFImportController?
     private let onExit: () -> Void
     private let librarySidebar: AnyView?
     private let libraryContainer: ((AnyView) -> AnyView)?
 
-    public init(onExit: @escaping () -> Void) {
-        _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
+    public init(onExit: @escaping () -> Void, imports: TiyiPDFImportController? = nil) {
+        _documentStore = StateObject(wrappedValue: imports?.store ?? DrawingDocumentStore())
+        self.imports = imports
         self.onExit = onExit
         librarySidebar = nil
         libraryContainer = nil
@@ -20,9 +22,11 @@ public struct TiyiDocumentsView: View {
     /// effects around PencilKit's live surface.
     public init<Sidebar: View>(
         onExit: @escaping () -> Void,
+        imports: TiyiPDFImportController? = nil,
         @ViewBuilder librarySidebar: () -> Sidebar
     ) {
-        _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
+        _documentStore = StateObject(wrappedValue: imports?.store ?? DrawingDocumentStore())
+        self.imports = imports
         self.onExit = onExit
         self.librarySidebar = AnyView(librarySidebar())
         libraryContainer = nil
@@ -32,9 +36,11 @@ public struct TiyiDocumentsView: View {
     /// outside this container, keeping host navigation gestures away from its canvas.
     public init<LibraryContainer: View>(
         onExit: @escaping () -> Void,
+        imports: TiyiPDFImportController? = nil,
         @ViewBuilder libraryContainer: @escaping (AnyView) -> LibraryContainer
     ) {
-        _documentStore = StateObject(wrappedValue: DrawingDocumentStore())
+        _documentStore = StateObject(wrappedValue: imports?.store ?? DrawingDocumentStore())
+        self.imports = imports
         self.onExit = onExit
         librarySidebar = nil
         self.libraryContainer = { AnyView(libraryContainer($0)) }
@@ -45,7 +51,8 @@ public struct TiyiDocumentsView: View {
             documentStore: documentStore,
             onExit: onExit,
             librarySidebar: librarySidebar,
-            libraryContainer: libraryContainer
+            libraryContainer: libraryContainer,
+            imports: imports
         )
 #if targetEnvironment(macCatalyst)
         .background {

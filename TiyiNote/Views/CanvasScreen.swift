@@ -141,6 +141,24 @@ struct CanvasScreen: View {
             }
         }
         .ignoresSafeArea(.container, edges: .bottom)
+        .onReceive(NotificationCenter.default.publisher(for: .documentImportCheckpoint)) { notification in
+            guard let request = notification.object as? DocumentImportCheckpoint, request.error == nil else { return }
+            do {
+                try questionSession?.workspace.checkpoint()
+                if let practice { try practice.checkpoint() }
+                else if let handout { try handout.checkpoint() }
+                else {
+                    NotificationCenter.default.post(name: .tiyiPracticeCheckpoint, object: documentStore)
+                    guard documentStore.flushAllPendingSaves() else { throw CocoaError(.fileWriteUnknown) }
+                }
+            } catch { request.error = error }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .documentImportCompleted)) { _ in
+            if let session = questionSession {
+                closingQuestionSession = session
+                questionSession = nil
+            }
+        }
         .onReceive(practice?.$currentPageID.eraseToAnyPublisher() ?? Just(nil).eraseToAnyPublisher()) { pageID in
             let questionID = practice?.sections.first { $0.pageIDs.contains(pageID ?? "") }?.id
             if assistantQuestionID != questionID { assistantSelections = []; assistantQuestionID = questionID }
