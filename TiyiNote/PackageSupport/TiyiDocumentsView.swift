@@ -3,14 +3,14 @@ import SwiftUI
 /// The public entry point used by the Tiyi app. The document implementation stays private to
 /// this package so it can evolve without leaking the original standalone app's internal model.
 public struct TiyiDocumentsView: View {
-    @StateObject private var documentStore: DrawingDocumentStore
+    @StateObject private var libraries: DocumentLibraryManager
     private let imports: TiyiPDFImportController?
     private let onExit: () -> Void
     private let librarySidebar: AnyView?
     private let libraryContainer: ((AnyView) -> AnyView)?
 
     public init(onExit: @escaping () -> Void, imports: TiyiPDFImportController? = nil) {
-        _documentStore = StateObject(wrappedValue: imports?.store ?? DrawingDocumentStore())
+        _libraries = StateObject(wrappedValue: imports?.libraries ?? DocumentLibraryManager())
         self.imports = imports
         self.onExit = onExit
         librarySidebar = nil
@@ -25,7 +25,7 @@ public struct TiyiDocumentsView: View {
         imports: TiyiPDFImportController? = nil,
         @ViewBuilder librarySidebar: () -> Sidebar
     ) {
-        _documentStore = StateObject(wrappedValue: imports?.store ?? DrawingDocumentStore())
+        _libraries = StateObject(wrappedValue: imports?.libraries ?? DocumentLibraryManager())
         self.imports = imports
         self.onExit = onExit
         self.librarySidebar = AnyView(librarySidebar())
@@ -39,7 +39,7 @@ public struct TiyiDocumentsView: View {
         imports: TiyiPDFImportController? = nil,
         @ViewBuilder libraryContainer: @escaping (AnyView) -> LibraryContainer
     ) {
-        _documentStore = StateObject(wrappedValue: imports?.store ?? DrawingDocumentStore())
+        _libraries = StateObject(wrappedValue: imports?.libraries ?? DocumentLibraryManager())
         self.imports = imports
         self.onExit = onExit
         librarySidebar = nil
@@ -47,13 +47,28 @@ public struct TiyiDocumentsView: View {
     }
 
     public var body: some View {
+        Group {
         RootWorkspaceView(
-            documentStore: documentStore,
+            documentStore: libraries.currentStore,
             onExit: onExit,
             librarySidebar: librarySidebar,
             libraryContainer: libraryContainer,
-            imports: imports
+            imports: imports,
+            libraryManager: libraries,
+            libraryID: libraries.selectedID
         )
+        .id(libraries.selectedID)
+        }
+        .onAppear {
+            libraries.enterDocuments()
+            libraries.isPresentingDocuments = true
+        }
+        .onDisappear { libraries.isPresentingDocuments = false }
+        .task { await libraries.refresh(force: true) }
+        .alert("文稿库", isPresented: Binding(get: { libraries.errorMessage != nil },
+            set: { if !$0 { libraries.errorMessage = nil } })) {
+            Button("好", role: .cancel) { libraries.errorMessage = nil }
+        } message: { Text(libraries.errorMessage ?? "") }
 #if targetEnvironment(macCatalyst)
         .background {
             CatalystImmersiveWindowChrome()

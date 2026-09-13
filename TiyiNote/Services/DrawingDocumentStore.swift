@@ -289,6 +289,16 @@ final class DrawingDocumentStore: ObservableObject {
     private var collaborationOperationsRevisionSeed: UInt64 = 0
     private var collaborationClock: CollaborationReplicaClock
     private var readOnlySharedDocumentIDs: Set<String> = []
+    var libraryWriteAllowed = true
+    private let keepsFavoritesPersonal: Bool
+
+    func setLibraryWriteAllowed(_ allowed: Bool) { libraryWriteAllowed = allowed }
+
+    func requireLibraryWriteAccess() throws {
+        guard libraryWriteAllowed else {
+            throw FamilyLibraryCloud.failure("该家庭库已不可编辑，请重新确认成员资格和 iCloud 账号。")
+        }
+    }
     private var activeDrawingInteractionIDs: Set<UUID> = []
     /// A page sets this as soon as PencilKit reports a real mutation and clears it only after the
     /// immutable result has been handed to the durable writers. CloudKit must not race that handoff.
@@ -308,11 +318,14 @@ final class DrawingDocumentStore: ObservableObject {
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
         workspaceDirectoryOverride: URL? = nil,
-        includesBundledSamples: Bool = true
+        includesBundledSamples: Bool = true,
+        keepsFavoritesPersonal: Bool = false,
+        replicaIdentityNamespace: String? = nil
     ) {
         self.fileManager = fileManager
         self.userDefaults = userDefaults
         self.includesBundledSamples = includesBundledSamples
+        self.keepsFavoritesPersonal = keepsFavoritesPersonal
         lastCloudSyncAt = userDefaults.object(forKey: Self.lastCloudSyncAtKey) as? Date
 
         let applicationSupport = fileManager.urls(
@@ -361,7 +374,7 @@ final class DrawingDocumentStore: ObservableObject {
             return try? JSONDecoder().decode(CollaborationReplicaClock.self, from: data)
         }()
         let localActorID: String
-        if workspaceDirectoryOverride != nil {
+        if workspaceDirectoryOverride != nil, replicaIdentityNamespace == nil {
             let actorDefaultsKey = "collaboration.localActorID"
             if let existing = userDefaults.string(forKey: actorDefaultsKey), !existing.isEmpty {
                 localActorID = existing
@@ -374,8 +387,8 @@ final class DrawingDocumentStore: ObservableObject {
             // app deletion. Rotate the actor so counters can never collide with old CloudKit dots.
             localActorID = savedClock == nil
                 ? UUID().uuidString.lowercased()
-                : (Self.replicaActorIDFromKeychain() ?? UUID().uuidString.lowercased())
-            Self.storeReplicaActorIDInKeychain(localActorID)
+                : (Self.replicaActorIDFromKeychain(namespace: replicaIdentityNamespace) ?? UUID().uuidString.lowercased())
+            Self.storeReplicaActorIDInKeychain(localActorID, namespace: replicaIdentityNamespace)
         }
         if let savedClock, savedClock.actorID == localActorID {
             collaborationClock = savedClock
@@ -454,11 +467,11 @@ final class DrawingDocumentStore: ObservableObject {
         return 10.0
     }
 
-    private static func replicaActorIDFromKeychain() -> String? {
+    private static func replicaActorIDFromKeychain(namespace: String? = nil) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: replicaActorKeychainService,
-            kSecAttrAccount as String: replicaActorKeychainAccount,
+            kSecAttrAccount as String: replicaActorKeychainAccount + (namespace.map { "." + $0 } ?? ""),
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -470,11 +483,11 @@ final class DrawingDocumentStore: ObservableObject {
         return value
     }
 
-    private static func storeReplicaActorIDInKeychain(_ actorID: String) {
+    private static func storeReplicaActorIDInKeychain(_ actorID: String, namespace: String? = nil) {
         let key: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: replicaActorKeychainService,
-            kSecAttrAccount as String: replicaActorKeychainAccount
+            kSecAttrAccount as String: replicaActorKeychainAccount + (namespace.map { "." + $0 } ?? "")
         ]
         let attributes: [String: Any] = [
             kSecValueData as String: Data(actorID.utf8),
@@ -1387,6 +1400,11 @@ final class DrawingDocumentStore: ObservableObject {
         }
         guard folders[index].trashedAt == nil else { throw LibraryStoreError.itemIsInTrash }
         guard folders[index].isFavorite != isFavorite else { return }
+        if keepsFavoritesPersonal {
+            userDefaults.set(isFavorite, forKey: "library.favorite.folder." + folderID)
+            folders[index].isFavorite = isFavorite
+            return
+        }
         let stamp = collaborationClock.nextStamp()
         var updatedFolders = folders
         updatedFolders[index].isFavorite = isFavorite
@@ -1404,6 +1422,12 @@ final class DrawingDocumentStore: ObservableObject {
         }
         guard documentMetadata[index].trashedAt == nil else { throw LibraryStoreError.itemIsInTrash }
         guard documentMetadata[index].isFavorite != isFavorite else { return }
+        if keepsFavoritesPersonal {
+            userDefaults.set(isFavorite, forKey: "library.favorite.document." + documentID)
+            documentMetadata[index].isFavorite = isFavorite
+            rebuildWorkspaceDocuments()
+            return
+        }
         let stamp = collaborationClock.nextStamp()
         var updatedMetadata = documentMetadata
         updatedMetadata[index].isFavorite = isFavorite
@@ -3273,7 +3297,7 @@ final class DrawingDocumentStore: ObservableObject {
         forPage pageIndex: Int,
         in documentID: String
     ) async -> CollaborationVersionVector? {
-        guard !readOnlySharedDocumentIDs.contains(documentID) else {
+        guard libraryWriteAllowed, !readOnlySharedDocumentIDs.contains(documentID) else {
             saveState = .failed(LibraryStoreError.readOnlySharedDocument.errorDescription ?? "只读")
             return causalContext
         }
@@ -3377,7 +3401,7 @@ final class DrawingDocumentStore: ObservableObject {
         forPage pageIndex: Int,
         in documentID: String
     ) -> CollaborationVersionVector {
-        guard !readOnlySharedDocumentIDs.contains(documentID) else {
+        guard libraryWriteAllowed, !readOnlySharedDocumentIDs.contains(documentID) else {
             saveState = .failed(LibraryStoreError.readOnlySharedDocument.errorDescription ?? "只读")
             return causalContext ?? collaborationFrontier(forPage: pageIndex, in: documentID)
         }
@@ -3438,7 +3462,7 @@ final class DrawingDocumentStore: ObservableObject {
         forPage pageIndex: Int,
         in documentID: String
     ) {
-        guard !readOnlySharedDocumentIDs.contains(documentID) else { return }
+        guard libraryWriteAllowed, !readOnlySharedDocumentIDs.contains(documentID) else { return }
         let saveKey = drawingKey(documentID: documentID, pageIndex: pageIndex)
         pendingSaves[saveKey]?.cancel()
         let data = hasUnseenDrawingCollaborationOperations(
@@ -3603,7 +3627,7 @@ final class DrawingDocumentStore: ObservableObject {
         forPage pageIndex: Int,
         in documentID: String
     ) -> CollaborationVersionVector {
-        guard !readOnlySharedDocumentIDs.contains(documentID) else {
+        guard libraryWriteAllowed, !readOnlySharedDocumentIDs.contains(documentID) else {
             saveState = .failed(LibraryStoreError.readOnlySharedDocument.errorDescription ?? "只读")
             return causalContext ?? collaborationFrontier(forPage: pageIndex, in: documentID)
         }
@@ -3649,7 +3673,7 @@ final class DrawingDocumentStore: ObservableObject {
         forPage pageIndex: Int,
         in documentID: String
     ) {
-        guard !readOnlySharedDocumentIDs.contains(documentID) else {
+        guard libraryWriteAllowed, !readOnlySharedDocumentIDs.contains(documentID) else {
             saveState = .failed(LibraryStoreError.readOnlySharedDocument.errorDescription ?? "只读")
             return
         }
@@ -3709,7 +3733,7 @@ final class DrawingDocumentStore: ObservableObject {
         forPage pageIndex: Int,
         in documentID: String
     ) {
-        guard !readOnlySharedDocumentIDs.contains(documentID) else {
+        guard libraryWriteAllowed, !readOnlySharedDocumentIDs.contains(documentID) else {
             saveState = .failed(LibraryStoreError.readOnlySharedDocument.errorDescription ?? "只读")
             return
         }
@@ -4888,6 +4912,17 @@ final class DrawingDocumentStore: ObservableObject {
         documents: [LibraryDocumentMetadata],
         pages persistedPages: [LibraryPage]? = nil
     ) throws {
+        if !applyingSparseRemote { try requireLibraryWriteAccess() }
+        let folders = folders.map { value in
+            var value = value
+            if keepsFavoritesPersonal { value.isFavorite = false; value.favoriteRevision = nil }
+            return value
+        }
+        let documents = documents.map { value in
+            var value = value
+            if keepsFavoritesPersonal { value.isFavorite = false; value.favoriteRevision = nil }
+            return value
+        }
         let storedPages = (persistedPages ?? pages).filter { !isImplicitDefault($0, documents: documents) }
         let db = try sparseDatabase()
         let old = persistedRegistry
@@ -5250,6 +5285,15 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func rebuildWorkspaceDocuments() {
+        if keepsFavoritesPersonal {
+            for index in folders.indices {
+                let favorite = userDefaults.bool(forKey: "library.favorite.folder." + folders[index].id)
+                if folders[index].isFavorite != favorite { folders[index].isFavorite = favorite }
+            }
+            for index in documentMetadata.indices {
+                documentMetadata[index].isFavorite = userDefaults.bool(forKey: "library.favorite.document." + documentMetadata[index].id)
+            }
+        }
         documents = documentMetadata.compactMap { metadata in
             guard let fileURL = fileURL(for: metadata) else { return nil }
             return PDFWorkspaceDocument(
@@ -5913,6 +5957,7 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func validateParentFolder(_ parentID: String?) throws {
+        try requireLibraryWriteAccess()
         guard let parentID else { return }
         guard folders.contains(where: { $0.id == parentID && $0.trashedAt == nil }) else {
             throw LibraryStoreError.folderNotFound(parentID)
@@ -7857,6 +7902,7 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func requireEditableSharedDocument(_ documentID: String) throws {
+        try requireLibraryWriteAccess()
         if readOnlySharedDocumentIDs.contains(documentID) {
             throw LibraryStoreError.readOnlySharedDocument
         }
@@ -8382,7 +8428,7 @@ extension DrawingDocumentStore {
         sparsePageCache.removeAll()
         persistedRegistry = LibraryRegistry(schemaVersion: LibrarySnapshot.currentSchemaVersion,
             folders: folders, documents: documentMetadata, pages: pages)
-        if documentsChanged { rebuildWorkspaceDocuments() }
+        if documentsChanged || (foldersChanged && keepsFavoritesPersonal) { rebuildWorkspaceDocuments() }
         if foldersChanged || documentsChanged {
             try persistCollaborationClock()
             objectWillChange.send()

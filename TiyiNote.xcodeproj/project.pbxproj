@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		63BF45BCDDA244E184C9083A /* DocumentLibraryPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A07C34D47F549509ED9B6F3 /* DocumentLibraryPicker.swift */; };
+		E34DED9BF4BC44D3BBEBDCC1 /* DocumentLibraryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ABA3512F2FA4C47BF66DCC4 /* DocumentLibraryManager.swift */; };
 		B7C7939F3A4D4928B1C43805 /* SparseCloudLibrarySync.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C7939F3A4D4928B1C43806 /* SparseCloudLibrarySync.swift */; };
 		B7C7939F3A4D4928B1C43803 /* SparseLibraryDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C7939F3A4D4928B1C43804 /* SparseLibraryDatabase.swift */; };
 		B7C7939F3A4D4928B1C43801 /* TiyiPDFImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C7939F3A4D4928B1C43802 /* TiyiPDFImport.swift */; };
@@ -62,6 +64,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		6A07C34D47F549509ED9B6F3 /* DocumentLibraryPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DocumentLibraryPicker.swift; path = Views/DocumentLibraryPicker.swift; sourceTree = "<group>"; };
+		4ABA3512F2FA4C47BF66DCC4 /* DocumentLibraryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DocumentLibraryManager.swift; path = Services/DocumentLibraryManager.swift; sourceTree = "<group>"; };
 		B7C7939F3A4D4928B1C43806 /* SparseCloudLibrarySync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SparseCloudLibrarySync.swift; sourceTree = "<group>"; };
 		B7C7939F3A4D4928B1C43804 /* SparseLibraryDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SparseLibraryDatabase.swift; sourceTree = "<group>"; };
 		B7C7939F3A4D4928B1C43802 /* TiyiPDFImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiPDFImport.swift; path = PackageSupport/TiyiPDFImport.swift; sourceTree = "<group>"; };
@@ -144,6 +148,8 @@
 				F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */,
 				DC1000000000000000000002 /* DocumentQuestion.swift */,
 				98AD81270C2945D5911322B2 /* TiyiAssistant.swift */,
+				4ABA3512F2FA4C47BF66DCC4 /* DocumentLibraryManager.swift */,
+				6A07C34D47F549509ED9B6F3 /* DocumentLibraryPicker.swift */,
 				B7C7939F3A4D4928B1C43802 /* TiyiPDFImport.swift */,
 				DC1000000000000000000006 /* TiyiNoteQuestionUITests.swift */,
 				DC1000000000000000000004 /* DocumentQuestionChecks.swift */,
@@ -351,6 +357,8 @@
 				DC1000000000000000000003 /* DocumentQuestionChecks.swift in Sources */,
 					DC1000000000000000000001 /* DocumentQuestion.swift in Sources */,
 				98AD81270C2945D5911322B1 /* TiyiAssistant.swift in Sources */,
+				E34DED9BF4BC44D3BBEBDCC1 /* DocumentLibraryManager.swift in Sources */,
+				63BF45BCDDA244E184C9083A /* DocumentLibraryPicker.swift in Sources */,
 				B7C7939F3A4D4928B1C43801 /* TiyiPDFImport.swift in Sources */,
 				100000000000000000000101 /* TiyiNoteApp.swift in Sources */,
 				100000000000000000000102 /* CanvasTool.swift in Sources */,

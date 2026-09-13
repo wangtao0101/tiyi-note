@@ -268,6 +268,7 @@ actor CloudLibrarySyncCoordinator {
     /// the editor. RootWorkspaceView starts it only after the ten-second local checkpoint is fully
     /// durable. Manual "现在同步" and collaboration setup use explicit entry points.
     private var sparseSync: SparseCloudLibrarySync?
+    private let isFamilyLibrary: Bool
     private var automaticSyncSuspended = false
     private var excludedDocumentIDs: Set<String> = []
     private var currentParticipantID: String?
@@ -280,6 +281,7 @@ actor CloudLibrarySyncCoordinator {
         databaseScope: CKDatabase.Scope = .private,
         scopedDocumentID: String? = nil,
         shouldCreateZone: Bool = true,
+        isFamilyLibrary: Bool = false,
         reportsStatus: Bool = true,
         allowsUploads: Bool = true,
         tokenStore: UserDefaults = .standard,
@@ -293,6 +295,7 @@ actor CloudLibrarySyncCoordinator {
         zoneID = CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
         self.scopedDocumentID = scopedDocumentID
         self.shouldCreateZone = shouldCreateZone
+        self.isFamilyLibrary = isFamilyLibrary
         self.reportsStatus = reportsStatus
         self.allowsUploads = allowsUploads
         self.tokenStore = tokenStore
@@ -465,9 +468,13 @@ actor CloudLibrarySyncCoordinator {
         let accountStatus = try await container.accountStatus()
         guard accountStatus == .available else { throw SyncError.accountUnavailable }
 
-        if let store = dataSource as? DrawingDocumentStore, databaseScope == .private, scopedDocumentID == nil {
-            if sparseSync == nil { sparseSync = SparseCloudLibrarySync(database: database, zoneID: zoneID, store: store) }
-            try await sparseSync?.sync()
+        if let store = dataSource as? DrawingDocumentStore, scopedDocumentID == nil,
+           databaseScope == .private || isFamilyLibrary {
+            if sparseSync == nil {
+                sparseSync = SparseCloudLibrarySync(database: database, zoneID: zoneID, store: store,
+                    shouldCreateZone: shouldCreateZone, isFamilyLibrary: isFamilyLibrary)
+            }
+            try await sparseSync?.sync(allowsUploads: allowsUploads)
             return
         }
 

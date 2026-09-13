@@ -23,21 +23,22 @@ extension Notification.Name {
     @Published var errorMessage: String?
     @Published var documentToOpen: String?
     private let stagingDirectory: URL
-    private var documentStore: DrawingDocumentStore?
-    var store: DrawingDocumentStore {
-        if let documentStore { return documentStore }
-        let created = DrawingDocumentStore()
-        documentStore = created
-        return created
-    }
+    let libraries: DocumentLibraryManager
+    @Published var documentToOpenLibraryID = DocumentLibrary.personalID
+    var store: DrawingDocumentStore { libraries.currentStore }
+
+    public func maintainLibraries() async { await libraries.maintain() }
 
     public convenience init() {
         self.init(stagingDirectory: URL.applicationSupportDirectory.appendingPathComponent("TiyiIncomingPDFs", isDirectory: true))
     }
 
-    init(stagingDirectory: URL, store: DrawingDocumentStore? = nil) {
+    init(stagingDirectory: URL, store: DrawingDocumentStore? = nil, libraries: DocumentLibraryManager? = nil) {
         self.stagingDirectory = stagingDirectory
-        self.documentStore = store
+        self.libraries = libraries ?? DocumentLibraryManager(
+            directory: store == nil ? nil : stagingDirectory.deletingLastPathComponent()
+                .appendingPathComponent(stagingDirectory.lastPathComponent + "-libraries"),
+            defaults: store == nil ? .standard : UserDefaults(suiteName: UUID().uuidString)!, personalStore: store)
         do {
             try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
             pending = try FileManager.default.contentsOfDirectory(at: stagingDirectory, includingPropertiesForKeys: nil)
@@ -96,7 +97,8 @@ extension Notification.Name {
         pending.removeAll { $0.id == request.id }
     }
 
-    func suggestedName(_ proposed: String, folderID: String?) throws -> String {
+    func suggestedName(_ proposed: String, folderID: String?, libraryID: String? = nil) throws -> String {
+        let store = try libraries.requireImportLibrary(libraryID ?? libraries.selectedID)
         var base = proposed.trimmingCharacters(in: .whitespacesAndNewlines)
         if base.lowercased().hasSuffix(".pdf") { base = String(base.dropLast(4)) }
         guard !base.isEmpty, !base.contains("/"), !base.contains(":"), !base.contains("\\"), base != ".", base != ".." else {
@@ -120,10 +122,12 @@ extension Notification.Name {
         if let error = checkpoint.error { throw error }
     }
 
-    @discardableResult func importPDF(_ request: PendingPDFImport, name: String, folderID: String?, prepare: () throws -> Void) async throws -> String {
+    @discardableResult func importPDF(_ request: PendingPDFImport, name: String, folderID: String?, libraryID: String? = nil, prepare: () throws -> Void) async throws -> String {
+        let targetID = libraryID ?? libraries.selectedID
+        let targetStore = try libraries.requireImportLibrary(targetID)
         // Complete all checkpoints before creating a document or dismissing the current answer.
         try checkpoint(prepare: prepare)
-        let finalName = try suggestedName(name, folderID: folderID)
+        let finalName = try suggestedName(name, folderID: folderID, libraryID: targetID)
         let directory = stagingDirectory.appendingPathComponent(request.id.uuidString)
         let namedDirectory = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: namedDirectory, withIntermediateDirectories: true)
@@ -132,11 +136,17 @@ extension Notification.Name {
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.copyItem(at: directory.appendingPathComponent("source.pdf"), to: renamed)
         }.value
-        guard let document = try await store.importPDFsInBackground(from: [renamed], into: folderID).first else {
+        guard try libraries.requireImportLibrary(targetID) === targetStore else {
+            throw Self.importError("文稿库已改变，请重新选择导入位置。")
+        }
+        guard let document = try await targetStore.importPDFsInBackground(from: [renamed], into: folderID).first else {
             throw Self.importError("PDF 导入失败，请重试。")
         }
         pending.removeAll { $0.id == request.id }
         try? FileManager.default.removeItem(at: directory)
+        libraries.select(targetID)
+        if !libraries.isPresentingDocuments { libraries.pendingEntryLibraryID = targetID }
+        documentToOpenLibraryID = targetID
         return document.id
     }
 
@@ -148,7 +158,9 @@ extension Notification.Name {
 private struct PDFImportConfirmation: View {
     let request: PendingPDFImport
     @ObservedObject var controller: TiyiPDFImportController
-    @ObservedObject var store: DrawingDocumentStore
+    @ObservedObject var libraries: DocumentLibraryManager
+    @State var libraryID: String
+    private var store: DrawingDocumentStore { libraries.store(for: libraries.library(libraryID) ?? .personal) }
     let prepare: () throws -> Void
     let initialError: String?
     let finish: (String?) -> Void
@@ -166,6 +178,11 @@ private struct PDFImportConfirmation: View {
                     TextField("文稿名称", text: $name).accessibilityIdentifier("pdf-import-name")
                 }
                 Section("导入位置") {
+                    Picker("文稿库", selection: $libraryID) {
+                        ForEach(libraries.libraries) { library in
+                            Text(library.title).tag(library.id)
+                        }
+                    }.accessibilityIdentifier("pdf-import-library")
                     Picker("文件夹", selection: $folderID) {
                         Text("文稿根目录").tag(String?.none)
                         ForEach(store.folders.filter { $0.trashedAt == nil }.sorted { folderPath($0) < folderPath($1) }) { folder in
@@ -190,7 +207,7 @@ private struct PDFImportConfirmation: View {
                         Task { @MainActor in
                             await Task.yield()
                             do {
-                                let id = try await controller.importPDF(request, name: name, folderID: folderID, prepare: prepare)
+                                let id = try await controller.importPDF(request, name: name, folderID: folderID, libraryID: libraryID, prepare: prepare)
                                 finish(id)
                             } catch { self.error = error.localizedDescription; importing = false }
                         }
@@ -200,11 +217,12 @@ private struct PDFImportConfirmation: View {
             }
             .overlay { if importing { ProgressView().padding(20).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12)) } }
             .onAppear {
-                name = (try? controller.suggestedName(request.name, folderID: nil)) ?? request.name
+                name = (try? controller.suggestedName(request.name, folderID: nil, libraryID: libraryID)) ?? request.name
                 error = initialError
             }
+            .onChange(of: libraryID) { _, _ in folderID = nil }
             .onChange(of: folderID) { _, _ in
-                if let suggested = try? controller.suggestedName(name, folderID: folderID) { name = suggested }
+                if let suggested = try? controller.suggestedName(name, folderID: folderID, libraryID: libraryID) { name = suggested }
             }
         }.interactiveDismissDisabled()
     }
@@ -276,7 +294,10 @@ public struct TiyiPDFImportPresenter: UIViewControllerRepresentable {
             do { try latest.controller.checkpoint(prepare: latest.prepare); checkpointError = nil }
             catch { checkpointError = error.localizedDescription }
             let host = UIHostingController(rootView: PDFImportConfirmation(request: request, controller: latest.controller,
-                store: latest.controller.store, prepare: latest.prepare, initialError: checkpointError, finish: { [weak self] documentID in
+                libraries: latest.controller.libraries,
+                libraryID: latest.controller.libraries.isPresentingDocuments
+                    ? latest.controller.libraries.selectedID : latest.controller.libraries.defaultID,
+                prepare: latest.prepare, initialError: checkpointError, finish: { [weak self] documentID in
                     guard let self else { return }
                     self.presented?.dismiss(animated: true) {
                         self.presented = nil
@@ -290,7 +311,7 @@ public struct TiyiPDFImportPresenter: UIViewControllerRepresentable {
                 }))
             host.modalPresentationStyle = .formSheet
             host.isModalInPresentation = true
-            host.preferredContentSize = CGSize(width: 480, height: 360)
+            host.preferredContentSize = CGSize(width: 480, height: 430)
             presented = host; top.present(host, animated: true)
         }
     }

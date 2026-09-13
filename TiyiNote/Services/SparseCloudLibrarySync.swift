@@ -12,13 +12,19 @@ actor SparseCloudLibrarySync {
     private var ready = false
     private let tokenKey: String
     private var accountID: String?
+    private let shouldCreateZone: Bool
+    private let isFamilyLibrary: Bool
 
-    init(database: CKDatabase, zoneID: CKRecordZone.ID, store: DrawingDocumentStore) {
+    init(database: CKDatabase, zoneID: CKRecordZone.ID, store: DrawingDocumentStore,
+         shouldCreateZone: Bool = true, isFamilyLibrary: Bool = false) {
         self.database = database; self.zoneID = zoneID; self.store = store
-        tokenKey = "sparse-zone-token|\(zoneID.ownerName)|\(zoneID.zoneName)"
+        self.shouldCreateZone = shouldCreateZone; self.isFamilyLibrary = isFamilyLibrary
+        tokenKey = isFamilyLibrary
+            ? "sparse-zone-token|\(database.databaseScope.rawValue)|\(zoneID.ownerName)|\(zoneID.zoneName)"
+            : "sparse-zone-token|\(zoneID.ownerName)|\(zoneID.zoneName)"
     }
 
-    func sync() async throws {
+    func sync(allowsUploads: Bool = true) async throws {
         try Task.checkCancellation()
         let container = CKContainer(identifier: CloudLibrarySyncCoordinator.containerIdentifier)
         let currentAccount = try await container.userRecordID().recordName
@@ -28,16 +34,31 @@ actor SparseCloudLibrarySync {
         }
         try await store.setSparseSyncState("icloud-owner", Data(currentAccount.utf8))
         accountID = currentAccount
+        if isFamilyLibrary, database.databaseScope == .shared {
+            do {
+                let record = try await database.record(for: CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: zoneID))
+                guard let share = record as? CKShare,
+                      database.databaseScope == .private || (share.currentUserParticipant?.acceptanceStatus == .accepted
+                        && share.currentUserParticipant?.permission == .readWrite) else {
+                    throw CKError(.permissionFailure)
+                }
+            } catch let error as CKError where [.permissionFailure, .unknownItem, .zoneNotFound, .userDeletedZone].contains(error.code) {
+                await store.setLibraryWriteAllowed(false)
+                throw error
+            }
+        }
         if !ready {
-            _ = try await database.save(CKRecordZone(zoneID: zoneID))
-            let subscription = CKRecordZoneSubscription(zoneID: zoneID, subscriptionID: "sparse|\(zoneID.zoneName)")
+            if shouldCreateZone { _ = try await database.save(CKRecordZone(zoneID: zoneID)) }
+            let subscription: CKSubscription = database.databaseScope == .shared
+                ? CKDatabaseSubscription(subscriptionID: "tiyi-family-shared-database")
+                : CKRecordZoneSubscription(zoneID: zoneID, subscriptionID: "sparse|\(zoneID.zoneName)")
             let info = CKSubscription.NotificationInfo(); info.shouldSendContentAvailable = true
             subscription.notificationInfo = info
             _ = try? await database.save(subscription)
             ready = true
         }
         try await downloadHeaders()
-        try await uploadOutbox()
+        if allowsUploads { try await uploadOutbox() }
         try await downloadRequestedAssets()
     }
 
@@ -62,6 +83,8 @@ actor SparseCloudLibrarySync {
                 var entries: [SparseLibraryEntry] = []
                 for (_, change) in result.modificationResultsByID {
                     var record = try change.get().record
+                    // A zone-wide share is delivered in the same change stream as library entries.
+                    guard record.recordType != CKRecord.SystemType.share else { continue }
                     if record["payload"] == nil { record = try await database.record(for: record.recordID) }
                     guard let entry = decode(record) else { throw malformed(record.recordID.recordName) }
                     entries.append(entry)
@@ -82,6 +105,7 @@ actor SparseCloudLibrarySync {
     private func uploadOutbox() async throws {
         while true {
             try Task.checkCancellation()
+            try await store.requireLibraryWriteAccess()
             let pending = try await store.sparsePendingEntries(limit: 60)
             guard !pending.isEmpty else { return }
             // Metadata/ink precede images. PDFs have their own single-record request so a large

@@ -20,6 +20,8 @@ struct RootWorkspaceView: View {
     let librarySidebar: AnyView?
     let libraryContainer: ((AnyView) -> AnyView)?
     let imports: TiyiPDFImportController?
+    let libraryManager: DocumentLibraryManager?
+    let libraryID: String
 
     @State private var libraryBrowsingState = LibraryBrowserState()
 
@@ -42,13 +44,23 @@ struct RootWorkspaceView: View {
         onExit: (() -> Void)? = nil,
         librarySidebar: AnyView? = nil,
         libraryContainer: ((AnyView) -> AnyView)? = nil,
-        imports: TiyiPDFImportController? = nil
+        imports: TiyiPDFImportController? = nil,
+        libraryManager: DocumentLibraryManager? = nil,
+        libraryID: String = DocumentLibrary.personalID
     ) {
         self.documentStore = documentStore
         self.onExit = onExit
         self.librarySidebar = librarySidebar
         self.libraryContainer = libraryContainer
         self.imports = imports
+        self.libraryManager = libraryManager
+        self.libraryID = libraryID
+        if let libraryManager {
+            _libraryBrowsingState = State(initialValue: libraryManager.browsingState(for: libraryID))
+        }
+        if libraryID != DocumentLibrary.personalID {
+            _activeDocumentID = AppStorage(wrappedValue: "", "pdfWorkspace.activeDocumentID|" + libraryID)
+        }
     }
 
     var body: some View {
@@ -68,7 +80,7 @@ struct RootWorkspaceView: View {
             }
         }
         .onReceive(imports?.$documentToOpen.eraseToAnyPublisher() ?? Just(nil).eraseToAnyPublisher()) { id in
-            guard let id else { return }
+            guard let id, imports?.documentToOpenLibraryID == libraryID else { return }
             openDocument(id)
             imports?.documentToOpen = nil
         }
@@ -88,7 +100,12 @@ struct RootWorkspaceView: View {
                 return
             }
             if cloudSyncCoordinator == nil {
-                cloudSyncCoordinator = CloudLibrarySyncCoordinator(dataSource: documentStore)
+                if libraryID != DocumentLibrary.personalID {
+                    guard let library = libraryManager?.library(libraryID) else { return }
+                    cloudSyncCoordinator = libraryManager?.coordinator(for: library)
+                } else {
+                    cloudSyncCoordinator = CloudLibrarySyncCoordinator(dataSource: documentStore)
+                }
             }
             guard destination == .library else {
                 await resumeAutomaticCloudZones()
@@ -182,6 +199,7 @@ struct RootWorkspaceView: View {
         .onReceive(
             NotificationCenter.default.publisher(for: .tiyiCloudKitShareAcceptanceFailed)
         ) { note in
+            guard libraryManager == nil else { return }
             collaborationErrorMessage = (note.object as? Error)?.localizedDescription
                 ?? "无法接受这个 iCloud 协作邀请。"
         }
@@ -220,7 +238,8 @@ struct RootWorkspaceView: View {
                 await synchronizeAllCloudZones()
             },
             onOpenDocument: openDocument,
-            canEditDocument: canEditDocument
+            canEditDocument: canEditDocument,
+            libraryPicker: libraryManager.map { AnyView(DocumentLibraryPicker(manager: $0)) }
         )
     }
 
@@ -273,11 +292,15 @@ struct RootWorkspaceView: View {
     }
 
     private func canEditDocument(_ documentID: String) -> Bool {
-        collaborativeZonesByDocumentID[documentID]?.accessLevel.canEdit ?? true
+        documentStore.libraryWriteAllowed && (collaborativeZonesByDocumentID[documentID]?.accessLevel.canEdit ?? true)
     }
 
     @MainActor
     private func refreshSharedDocuments() async {
+        if libraryID != DocumentLibrary.personalID {
+            await libraryManager?.refresh()
+            return
+        }
         guard cloudSyncCoordinator != nil else { return }
         do {
             let zones = try await CloudDocumentShareService.discoverSharedZones()
@@ -356,6 +379,7 @@ struct RootWorkspaceView: View {
     }
 
     private func suspendAutomaticCloudZones() async {
+        _ = await libraryManager?.cancelFamilySync(suspend: true)
         if let cloudSyncCoordinator {
             _ = await cloudSyncCoordinator.suspendAutomaticSync()
         }
@@ -365,6 +389,7 @@ struct RootWorkspaceView: View {
     }
 
     private func resumeAutomaticCloudZones() async {
+        await libraryManager?.resumeFamilySync()
         if let cloudSyncCoordinator {
             await cloudSyncCoordinator.resumeAutomaticSync()
         }
@@ -375,7 +400,7 @@ struct RootWorkspaceView: View {
 
     @discardableResult
     private func cancelScheduledCloudZones() async -> Bool {
-        var cancelledAny = false
+        var cancelledAny = await libraryManager?.cancelFamilySync() ?? false
         if let cloudSyncCoordinator {
             cancelledAny = await cloudSyncCoordinator.cancelScheduledSync() || cancelledAny
         }

@@ -6,6 +6,39 @@ import AVFoundation
 import VisionKit
 #endif
 
+/// Own the provider's file before its callback returns; async import keeps this copy alive.
+final class StagedDocumentDrop: @unchecked Sendable {
+    let url: URL
+    private let directory: URL
+
+    init(copying source: URL, suggestedName: String? = nil) throws {
+        guard source.isFileURL else { throw CocoaError(.fileReadUnsupportedScheme) }
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TiyiDocumentDrop-" + UUID().uuidString, isDirectory: true)
+        let name = suggestedName.map { URL(fileURLWithPath: $0).lastPathComponent }
+        let fileName = name.flatMap { $0.isEmpty ? nil : $0 } ?? source.lastPathComponent
+        url = directory.appendingPathComponent(fileName)
+        let accessed = source.startAccessingSecurityScopedResource()
+        defer { if accessed { source.stopAccessingSecurityScopedResource() } }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var coordinationError: NSError?
+            var copyError: Error?
+            NSFileCoordinator().coordinate(readingItemAt: source, options: [], error: &coordinationError) { readableURL in
+                do { try FileManager.default.copyItem(at: readableURL, to: url) }
+                catch { copyError = error }
+            }
+            if let coordinationError { throw coordinationError }
+            if let copyError { throw copyError }
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    deinit { try? FileManager.default.removeItem(at: directory) }
+}
+
 /// Keep browsing context outside the mounted library, so entering the full-screen editor can
 /// remove its complete view tree while returning to the same folder, filter, and scroll target.
 @Observable
@@ -30,6 +63,7 @@ struct LibraryBrowserView: View {
     let onSyncNow: () async -> Void
     let onOpenDocument: (String) -> Void
     let canEditDocument: (String) -> Bool
+    var libraryPicker: AnyView? = nil
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -191,10 +225,16 @@ struct LibraryBrowserView: View {
             onEmptyTrash: {
                 destructiveAction = .emptyTrash
             },
-            onDropPDFs: { urls in
-                importDroppedPDFs(urls, into: folderID)
+            onDropPDFs: { result in
+                switch result {
+                case .success(let staged):
+                    importDroppedPDFs(staged, into: folderID)
+                case .failure(let error):
+                    present(error)
+                }
             },
-            canEditDocument: canEditDocument
+            canEditDocument: canEditDocument,
+            libraryPicker: libraryPicker
         )
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .navigationBar)
@@ -489,21 +529,24 @@ struct LibraryBrowserView: View {
     }
 
     @discardableResult
-    private func importDroppedPDFs(_ urls: [URL], into folderID: String?) -> Bool {
+    private func importDroppedPDFs(_ staged: StagedDocumentDrop, into folderID: String?) -> Bool {
         guard PlatformCapabilities.current.canImportPDF, scope == .documents else { return false }
-        let supportedURLs = urls.filter {
+        let supportedURLs = [staged.url].filter {
             $0.pathExtension.caseInsensitiveCompare("pdf") == .orderedSame
                 || $0.pathExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
         }
         guard !supportedURLs.isEmpty else { return false }
-        importDocuments(supportedURLs, into: folderID)
+        importDocuments(supportedURLs, into: folderID, stagedDrop: staged)
         return true
     }
 
-    private func importDocuments(_ urls: [URL], into folderID: String?) {
+    private func importDocuments(_ urls: [URL], into folderID: String?, stagedDrop: StagedDocumentDrop? = nil) {
         let accessedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
         Task {
-            defer { for url in accessedURLs { url.stopAccessingSecurityScopedResource() } }
+            defer {
+                for url in accessedURLs { url.stopAccessingSecurityScopedResource() }
+                withExtendedLifetime(stagedDrop) {}
+            }
             do {
                 let pdfURLs = urls.filter { $0.pathExtension.lowercased() == "pdf" }
                 if !pdfURLs.isEmpty {
@@ -642,7 +685,7 @@ private struct LibraryInlineSearchField: View {
 
 /// A compact visible control with extra vertical hit space, without automatic glass padding
 /// or a shadow that gets clipped by the phone's horizontal toolbar viewport.
-private struct LibraryCompactControlStyle: ButtonStyle {
+struct LibraryCompactControlStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
     var isProminent = false
     var horizontalPadding: CGFloat = 10
@@ -656,7 +699,7 @@ private struct LibraryCompactControlStyle: ButtonStyle {
                     : configuration.role == .destructive ? TiyiNoteTheme.danger : TiyiNoteTheme.textPrimary
             )
             .background(
-                isProminent ? TiyiNoteTheme.selectionBlue : TiyiNoteTheme.textPrimary.opacity(0.045),
+                isProminent ? Color.black : TiyiNoteTheme.textPrimary.opacity(0.045),
                 in: Capsule()
             )
             .opacity(isEnabled ? (configuration.isPressed ? 0.65 : 1) : 0.45)
@@ -689,8 +732,9 @@ private struct LibraryContentPage: View {
     let onImportPDF: () -> Void
     let onScanDocument: () -> Void
     let onEmptyTrash: () -> Void
-    let onDropPDFs: ([URL]) -> Bool
+    let onDropPDFs: (Result<StagedDocumentDrop, Error>) -> Void
     let canEditDocument: (String) -> Bool
+    var libraryPicker: AnyView? = nil
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var isDropTargeted = false
@@ -731,12 +775,9 @@ private struct LibraryContentPage: View {
         )
     }
 
-    /// `dropDestination(for: URL.self)` does not advertise a Finder file destination on
-    /// Mac Catalyst. Loading the file URL from its item provider works on both Catalyst and
-    /// iPadOS, while the store still performs the actual PDF validation and secure copy.
+    /// Copy provider-owned files inside the callback, before scheduling any asynchronous work.
     private func receiveDroppedFiles(_ providers: [NSItemProvider]) -> Bool {
         guard PlatformCapabilities.current.canImportPDF else { return false }
-
         let fileProviders = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
                 || $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier)
@@ -746,68 +787,62 @@ private struct LibraryContentPage: View {
 
         let dropHandler = onDropPDFs
         for provider in fileProviders {
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                provider.loadItem(
-                    forTypeIdentifier: UTType.fileURL.identifier,
-                    options: nil
-                ) { item, _ in
-                    let url: URL?
-                    if let data = item as? Data {
-                        url = URL(dataRepresentation: data, relativeTo: nil)
-                    } else if let itemURL = item as? URL {
-                        url = itemURL
-                    } else if let itemURL = item as? NSURL {
-                        url = itemURL as URL
-                    } else {
-                        url = nil
+            let type: UTType? = provider.hasItemConformingToTypeIdentifier(UTType.tiyiNoteDocument.identifier)
+                ? .tiyiNoteDocument : (provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) ? .pdf : nil)
+            if let type {
+                provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
+                    let result = Result {
+                        guard let url else { throw error ?? CocoaError(.fileReadUnknown) }
+                        var name = provider.suggestedName ?? url.lastPathComponent
+                        if URL(fileURLWithPath: name).pathExtension.isEmpty, let ext = type.preferredFilenameExtension {
+                            name += "." + ext
+                        }
+                        return try StagedDocumentDrop(copying: url, suggestedName: name)
                     }
-
-                    guard let url else { return }
-                    deliverDroppedURL(url, to: dropHandler)
+                    DispatchQueue.main.async { dropHandler(result) }
                 }
             } else {
-                let typeIdentifier = provider.hasItemConformingToTypeIdentifier(
-                    UTType.tiyiNoteDocument.identifier
-                ) ? UTType.tiyiNoteDocument.identifier : UTType.pdf.identifier
-                provider.loadFileRepresentation(
-                    forTypeIdentifier: typeIdentifier
-                ) { url, _ in
-                    guard let url else { return }
-                    // The provider may remove this temporary URL as soon as the completion
-                    // returns, so finish the store copy synchronously on the main thread.
-                    deliverDroppedURL(url, to: dropHandler)
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                    let result = Result {
+                        let url: URL?
+                        if let data = item as? Data {
+                            url = URL(dataRepresentation: data, relativeTo: nil)
+                        } else {
+                            url = item as? URL
+                        }
+                        guard let url else { throw error ?? CocoaError(.fileReadUnknown) }
+                        return try StagedDocumentDrop(copying: url)
+                    }
+                    DispatchQueue.main.async { dropHandler(result) }
                 }
             }
         }
         return true
     }
 
-    private func deliverDroppedURL(
-        _ url: URL,
-        to dropHandler: @escaping ([URL]) -> Bool
-    ) {
-        if Thread.isMainThread {
-            _ = dropHandler([url])
-        } else {
-            DispatchQueue.main.sync {
-                _ = dropHandler([url])
-            }
-        }
-    }
-
     private var pageHeader: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if isCompactLayout && !showsFolderPath {
+            if isCompactLayout {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
+                        if let libraryPicker { libraryPicker }
                         filterControl
                         primaryAction
                         utilityControls
                     }
                 }
                 .frame(height: 36)
+                if showsFolderPath {
+                    LibraryBreadcrumbs(
+                        folderID: folderID,
+                        folders: documentStore.folders,
+                        onNavigate: onNavigate
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             } else {
                 HStack(spacing: 8) {
+                    if let libraryPicker { libraryPicker }
                     filterControl
                         .fixedSize(horizontal: true, vertical: false)
                     if showsFolderPath {
@@ -879,7 +914,7 @@ private struct LibraryContentPage: View {
                 }
                 Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
             }
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(TiyiNoteTheme.textPrimary)
                 .padding(.horizontal, 2)
                 .frame(height: 28)
@@ -912,17 +947,17 @@ private struct LibraryContentPage: View {
                 }
             } label: {
                 Label("新建", systemImage: "plus")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .padding(.horizontal, 2)
                     .frame(height: 28)
             }
             .buttonStyle(LibraryCompactControlStyle(isProminent: true))
-            .tint(TiyiNoteTheme.selectionBlue)
+            .tint(.black)
         } else if PlatformCapabilities.current.canManageLibrary,
                   scope == .trash,
                   !folders.isEmpty || !documents.isEmpty {
             Button("清空", role: .destructive, action: onEmptyTrash)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .buttonStyle(LibraryCompactControlStyle())
                 .tint(TiyiNoteTheme.danger)
         }
@@ -1084,8 +1119,8 @@ private struct LibraryContentPage: View {
         } actions: {
             if scope == .documents, PlatformCapabilities.current.canManageLibrary {
                 Button("新建画板", action: onNewCanvas)
-                    .buttonStyle(.glassProminent)
-                    .tint(TiyiNoteTheme.selectionBlue)
+                    .font(.system(size: 14, weight: .semibold))
+                    .buttonStyle(LibraryCompactControlStyle(isProminent: true))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1774,7 +1809,7 @@ private struct LibraryBreadcrumbs: View {
                         .frame(height: 36)
                 }
             }
-            .font(.system(size: 13))
+            .font(.system(size: 14))
             .buttonStyle(.plain)
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
