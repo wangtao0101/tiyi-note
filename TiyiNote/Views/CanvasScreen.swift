@@ -617,23 +617,28 @@ struct CanvasScreen: View {
             showsConflictVersions = true
             return
         }
+        guard !isPreparingOutput else { return }
         flushPendingAnnotations()
         isPreparingOutput = true
-        defer { isPreparingOutput = false }
-        do {
-            switch action {
-            case .flattenedPDF:
-                sharePayload = DocumentSharePayload(
-                    urls: [try documentStore.exportFlattenedPDF(documentID: document.id)]
-                )
-            case .printDocument:
-                let url = try documentStore.exportFlattenedPDF(documentID: document.id)
-                presentPrintPanel(for: url, title: document.title)
-            case .conflictVersions:
-                break
+        Task { @MainActor in
+            defer { isPreparingOutput = false }
+            do {
+                try await practice?.prepareForOutput()
+                guard activeDocumentID == document.id else { return }
+                switch action {
+                case .flattenedPDF:
+                    sharePayload = DocumentSharePayload(
+                        urls: [try documentStore.exportFlattenedPDF(documentID: document.id)]
+                    )
+                case .printDocument:
+                    let url = try documentStore.exportFlattenedPDF(documentID: document.id)
+                    presentPrintPanel(for: url, title: document.title)
+                case .conflictVersions:
+                    break
+                }
+            } catch {
+                workspaceAlert = .outputFailed(error.localizedDescription)
             }
-        } catch {
-            workspaceAlert = .outputFailed(error.localizedDescription)
         }
     }
 

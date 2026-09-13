@@ -48,11 +48,25 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     @Published public var isCompleted = false
     public var onToggleCompleted: (() throws -> Void)?
     var packageExportDate: Date?
+    public var prepareQuestionPDF: ((String) async throws -> Data)?
+    @Published public private(set) var isPreparingQuestion = false
+    @Published public private(set) var questionPreparationError: String?
+    private let cachedQuestionPDFs: Bool
+    private let questionCache: URL
+    private var preparedPages: Set<String> = []
+    private var preparingPageID: String?
+    private struct PDFPreparation { let id = UUID(); let task: Task<Data, Error> }
+    private var pdfPreparations: [String: PDFPreparation] = [:]
+    @Published public private(set) var isPreparingRemainingQuestions = false
+    @Published public private(set) var backgroundPreparationError: String?
     private let layoutURL: URL
 
     public init(directory: URL, title: String, sections: [TiyiPracticeSection], packageData: Data? = nil,
-                seeds: [TiyiPracticePageSeed] = [], lastPageID: String? = nil) throws {
+                seeds: [TiyiPracticePageSeed] = [], lastPageID: String? = nil, cachedQuestionPDFs: Bool = false) throws {
         self.title = title
+        self.cachedQuestionPDFs = cachedQuestionPDFs
+        questionCache = directory.appendingPathComponent("QuestionPDFCache-v1")
+        try FileManager.default.createDirectory(at: questionCache, withIntermediateDirectories: true)
         defaults = UserDefaults(suiteName: "tiyi.practice.\(directory.lastPathComponent)")!
         store = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: directory, includesBundledSamples: false)
         layoutURL = directory.appendingPathComponent("practice-pages.json")
@@ -62,9 +76,15 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
             if let data = try? Data(contentsOf: layoutURL), let saved = try? JSONDecoder().decode([TiyiPracticeSection].self, from: data), saved.map(\.id) == sections.map(\.id) { mapped = saved }
         } else if let packageData {
             let temporary = directory.appendingPathComponent("restore.tiyinote")
-            try packageData.write(to: temporary, options: .atomic)
+            try (cachedQuestionPDFs ? Self.hydrateCachelessPackage(packageData) : packageData).write(to: temporary, options: .atomic)
             defer { try? FileManager.default.removeItem(at: temporary) }
             documentID = try store.importEditableDocumentPackage(from: temporary).id
+        } else if cachedQuestionPDFs {
+            guard !sections.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+            let document = try store.createCanvas(named: String(title.prefix(100)).replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-"), in: nil, backgroundStyle: .blank, backgroundColor: .white, size: CGSize(width: 768, height: 1086))
+            documentID = document.id
+            let pages = try store.initializePracticePages(count: mapped.count, documentID: documentID)
+            for index in mapped.indices { mapped[index].pageIDs = [pages[index].id] }
         } else {
             guard !seeds.isEmpty, !sections.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
             // PDF is only the immutable question background; writing and page objects use the
@@ -98,14 +118,127 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
 
     public var currentSection: TiyiPracticeSection? { sections.first { $0.pageIDs.contains(currentPageID ?? "") } ?? sections.first { !$0.pageIDs.isEmpty } }
     public var isWriting: Bool { store.hadRecentDrawingInteraction(within: 1.5) }
+    var cameraReferenceSize: CGSize? { cachedQuestionPDFs ? CGSize(width: 768, height: 1086) : nil }
     public var pageCount: Int { sections.reduce(0) { $0 + $1.pageIDs.count } }
 
     public func checkpoint() throws {
         NotificationCenter.default.post(name: .tiyiPracticeCheckpoint, object: store)
         guard store.flushAllPendingSaves() else { throw CocoaError(.fileWriteUnknown) }
         try reconcilePages()
-        let data = try store.editableDocumentPackageData(documentID: documentID, exportedAt: packageExportDate ?? Date())
+        let data = try store.editableDocumentPackageData(documentID: documentID, exportedAt: packageExportDate ?? Date(), includesPDFCache: !cachedQuestionPDFs)
         try onCheckpoint?(data, sections, currentPageID)
+    }
+
+    /// The host awaits this before presenting the editor, so the first visible page and
+    /// its persisted sidebar cover never start as a blank placeholder.
+    public func prepareInitialQuestion() async throws {
+        guard cachedQuestionPDFs, let pageID = currentPageID,
+              let section = currentSection,
+              let index = store.pageIndex(for: pageID, in: documentID) else { return }
+        if store.pageMetadata(at: index, in: documentID)?.sourceKind != .template {
+            try await preparePDF(pageID: pageID, questionID: section.id)
+        }
+        if index == 0 { try await store.generateSparseCover(documentID) }
+    }
+
+    /// Once the first page is visible, finish all other question PDFs without blocking writing.
+    public func prepareRemainingQuestions() async {
+        guard cachedQuestionPDFs, !isPreparingRemainingQuestions else { return }
+        isPreparingRemainingQuestions = true; backgroundPreparationError = nil
+        defer { isPreparingRemainingQuestions = false }
+        var failures: [String] = []
+        for page in store.pages(in: documentID) where page.sourceKind != .template {
+            guard !Task.isCancelled else { return }
+            guard let section = sections.first(where: { $0.pageIDs.contains(page.id) }) else { continue }
+            do {
+                while isWriting { try await Task.sleep(for: .milliseconds(250)) }
+                try await preparePDF(pageID: page.id, questionID: section.id, waitsForWriting: true)
+            } catch is CancellationError { return }
+            catch { failures.append(section.label) }
+        }
+        do { try checkpoint() } catch { errorMessage = "本机保存失败：\(error.localizedDescription)" }
+        if !failures.isEmpty { backgroundPreparationError = "\(failures.joined(separator: "、"))题面未能准备完成" }
+    }
+
+    public func cancelQuestionPreparation() {
+        for preparation in pdfPreparations.values { preparation.task.cancel() }
+        pdfPreparations.removeAll()
+    }
+
+    /// A jump to an unfinished question shares its background render instead of rendering twice.
+    public func prepareCurrentQuestion() async {
+        guard cachedQuestionPDFs, let pageID = currentPageID else { return }
+        if preparingPageID != pageID { questionPreparationError = nil; isPreparingQuestion = false }
+        guard let index = store.pageIndex(for: pageID, in: documentID),
+              store.pageMetadata(at: index, in: documentID)?.sourceKind != .template,
+              !preparedPages.contains(pageID), preparingPageID != pageID,
+              let section = currentSection else { return }
+        preparingPageID = pageID; isPreparingQuestion = true; questionPreparationError = nil
+        defer { if preparingPageID == pageID { preparingPageID = nil; isPreparingQuestion = false } }
+        do {
+            try await preparePDF(pageID: pageID, questionID: section.id)
+            try checkpoint()
+        } catch is CancellationError { }
+        catch { if currentPageID == pageID { questionPreparationError = "题面准备失败：\(error.localizedDescription)" } }
+    }
+
+    /// Explicit export/printing needs every active question, including unvisited ones.
+    func prepareForOutput() async throws {
+        guard cachedQuestionPDFs else { return }
+        for page in store.pages(in: documentID) where page.sourceKind != .template {
+            guard let section = sections.first(where: { $0.pageIDs.contains(page.id) }) else { throw CocoaError(.fileReadCorruptFile) }
+            try await preparePDF(pageID: page.id, questionID: section.id)
+        }
+        try checkpoint()
+    }
+
+    private func preparePDF(pageID: String, questionID: String, waitsForWriting: Bool = false) async throws {
+        guard !preparedPages.contains(pageID) else { return }
+        let url = questionCache.appendingPathComponent(questionID + ".pdf")
+        let data: Data
+        if let cached = try? Data(contentsOf: url), PDFDocument(data: cached)?.pageCount == 1 { data = cached }
+        else {
+            let preparation: PDFPreparation
+            if let existing = pdfPreparations[questionID] { preparation = existing }
+            else {
+                guard let prepareQuestionPDF else { throw CocoaError(.fileReadNoSuchFile) }
+                preparation = PDFPreparation(task: Task { try await prepareQuestionPDF(questionID) })
+                pdfPreparations[questionID] = preparation
+            }
+            defer { if pdfPreparations[questionID]?.id == preparation.id { pdfPreparations[questionID] = nil } }
+            data = try await preparation.task.value
+            try Task.checkCancellation()
+            try data.write(to: url, options: .atomic)
+        }
+        if waitsForWriting { while isWriting { try await Task.sleep(for: .milliseconds(250)) } }
+        try Task.checkCancellation()
+        guard !preparedPages.contains(pageID), store.pageIndex(for: pageID, in: documentID) != nil else { return }
+        try store.installPracticePDF(data, pageID: pageID, documentID: documentID)
+        preparedPages.insert(pageID)
+    }
+
+    private static func blankPDF(size: CGSize = CGSize(width: 768, height: 1086)) -> Data {
+        UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: size)).pdfData { context in
+            context.beginPage(); UIColor.white.setFill(); context.fill(CGRect(origin: .zero, size: size))
+        }
+    }
+
+    // The shared document importer requires PDF backgrounds. Supply local placeholders, then
+    // regenerate each question on demand using the immutable question snapshot.
+    private static func hydrateCachelessPackage(_ data: Data) throws -> Data {
+        guard var value = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pages = value["pages"] as? [[String: Any]],
+              var assets = value["pageAssets"] as? [[String: Any]] else { throw CocoaError(.fileReadCorruptFile) }
+        value["sourcePDFData"] = blankPDF().base64EncodedString()
+        let allPages = pages + (value["deletedPages"] as? [[String: Any]] ?? [])
+        for index in assets.indices {
+            guard let page = allPages.first(where: { ($0["id"] as? String) == (assets[index]["pageID"] as? String) }) else { continue }
+            if page["sourceKind"] as? String != "template" {
+                assets[index]["backgroundPDFData"] = blankPDF(size: CGSize(width: page["width"] as? Double ?? 768, height: page["height"] as? Double ?? 1086)).base64EncodedString()
+            }
+        }
+        value["pageAssets"] = assets
+        return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
     }
 
     public func appendPage() throws {
@@ -186,6 +319,23 @@ public struct TiyiPracticeEditor: View {
             do { try workspace.checkpoint(); onExit() } catch { workspace.errorMessage = "保存失败：\(error.localizedDescription)" }
         }, practice: workspace, navigation: navigation)
         .defaultAppStorage(workspace.defaults)
+        .task(id: workspace.currentPageID) { await workspace.prepareCurrentQuestion() }
+        .task { await workspace.prepareRemainingQuestions() }
+        .onDisappear { workspace.cancelQuestionPreparation() }
+        .overlay {
+            if workspace.isPreparingQuestion || workspace.questionPreparationError != nil {
+                ZStack {
+                    Color.white.opacity(0.96).ignoresSafeArea()
+                    VStack(spacing: 14) {
+                        if let error = workspace.questionPreparationError {
+                            Text(error).font(.callout)
+                            Button("重试") { Task { await workspace.prepareCurrentQuestion() } }
+                        } else { ProgressView("正在准备题面") }
+                        Button("保存并返回", action: onExit)
+                    }.padding(24)
+                }
+            }
+        }
         .task {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(12)) } catch { return }
@@ -231,6 +381,10 @@ public struct TiyiPracticeActions: View {
     public init(workspace: TiyiPracticeWorkspace) { self.workspace = workspace }
     public var body: some View {
             Menu {
+                if let error = workspace.backgroundPreparationError {
+                    Button("重试准备剩余题面") { Task { await workspace.prepareRemainingQuestions() } }
+                        .help(error)
+                }
                 Button("插入作答页", systemImage: "doc.badge.plus") { do { try workspace.appendPage() } catch { workspace.errorMessage = error.localizedDescription } }.accessibilityIdentifier("practice-add-page")
                 if workspace.onAnswer != nil {
                     Button("答案与解析", systemImage: "text.book.closed") { if let id = workspace.currentSection?.id { workspace.onAnswer?(id) } }

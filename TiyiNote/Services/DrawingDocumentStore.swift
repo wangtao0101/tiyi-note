@@ -2241,7 +2241,7 @@ final class DrawingDocumentStore: ObservableObject {
     /// Produces one self-contained native document snapshot without leaving a temporary export
     /// behind. Automatic backup uses this entry point so a long-running library does not slowly
     /// fill its private Exports directory.
-    func editableDocumentPackageData(documentID: String, exportedAt: Date = Date()) throws -> Data {
+    func editableDocumentPackageData(documentID: String, exportedAt: Date = Date(), includesPDFCache: Bool = true) throws -> Data {
         guard document(withID: documentID) != nil,
               let metadata = documentMetadata.first(where: { $0.id == documentID }),
               let sourceURL = fileURL(for: metadata) else {
@@ -2255,9 +2255,9 @@ final class DrawingDocumentStore: ObservableObject {
         let assets = (documentPages + archivedPages).map { page in
             EditableDocumentPageAssets(
                 pageID: page.id,
-                backgroundPDFData: try? Data(
+                backgroundPDFData: includesPDFCache ? try? Data(
                     contentsOf: pageBackgroundURL(forPageID: page.id, in: documentID)
-                ),
+                ) : nil,
                 drawingData: try? Data(
                     contentsOf: drawingURL(forPageID: page.id, in: documentID)
                 ),
@@ -2272,7 +2272,7 @@ final class DrawingDocumentStore: ObservableObject {
             document: metadata,
             pages: documentPages,
             deletedPages: archivedPages,
-            sourcePDFData: try Data(contentsOf: sourceURL),
+            sourcePDFData: includesPDFCache ? try Data(contentsOf: sourceURL) : Data(),
             pageAssets: assets,
             documentOperations: loadCollaborationOperations(
                 forPageID: CollaborationReservedID.documentMetadata,
@@ -3059,6 +3059,42 @@ final class DrawingDocumentStore: ObservableObject {
         rebuildWorkspaceDocuments()
         invalidatePagePresentation(documentID: documentID)
         signalLocalCloudChange()
+    }
+
+    /// Allocate lightweight question pages in one registry write; no question rendering here.
+    func initializePracticePages(count: Int, documentID: String) throws -> [LibraryPage] {
+        guard count > 0, let first = pages(in: documentID).first else { throw CocoaError(.fileReadCorruptFile) }
+        let placeholder = try templatePagePDFData(size: CGSize(width: 768, height: 1086), style: .blank, color: .white)
+        let pages = (0..<count).map { index in
+            LibraryPage(id: index == 0 ? first.id : UUID().uuidString.lowercased(), documentID: documentID,
+                orderIndex: index, width: 768, height: 1086, sourceKind: .pdf)
+        }
+        for page in pages { try placeholder.write(to: pageBackgroundURL(forPageID: page.id, in: documentID), options: .atomic) }
+        try commitPageMutation(pages, in: documentID)
+        return pages
+    }
+
+    /// Installs a regenerable practice background without changing ink or page identity.
+    func installPracticePDF(_ data: Data, pageID: String, documentID: String) throws {
+        guard let pdf = PDFDocument(data: data), pdf.pageCount == 1,
+              let bounds = pdf.page(at: 0)?.bounds(for: .mediaBox),
+              bounds.width > 0, bounds.height > 0 else { throw CocoaError(.fileReadCorruptFile) }
+        var ordered = pages(in: documentID)
+        guard let index = ordered.firstIndex(where: { $0.id == pageID }) else { throw LibraryStoreError.pageNotFound(pageID) }
+        let backgroundURL = pageBackgroundURL(forPageID: pageID, in: documentID)
+        let fingerprint = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        if ordered[index].sourceKind == .pdf, ordered[index].sourcePDFPageIndex == nil,
+           ordered[index].width == bounds.width, ordered[index].height == bounds.height,
+           userDefaults.string(forKey: "practice.pdf-version.\(documentID).\(pageID)") == fingerprint,
+           (try? Data(contentsOf: backgroundURL)) == data { return }
+        try data.write(to: backgroundURL, options: .atomic)
+        userDefaults.set(fingerprint, forKey: "practice.pdf-version.\(documentID).\(pageID)")
+        ordered[index].sourceKind = .pdf
+        ordered[index].sourcePDFPageIndex = nil
+        ordered[index].width = bounds.width
+        ordered[index].height = bounds.height
+        try commitPageMutation(ordered, in: documentID)
+        bumpPageAssetRevision(forPageID: pageID, in: documentID)
     }
 
     func hasSavedCanvasViewport(forPageID pageID: String, in documentID: String) -> Bool {
@@ -8104,7 +8140,11 @@ extension DrawingDocumentStore {
     }
 
     private func sparsePageVisualKey(_ page: LibraryPage) -> String {
-        "\(page.id)|\(page.sourcePDFPageIndex ?? -1)|\(page.width)|\(page.height)|\(page.rotation)|\(page.sourceKind)|\(page.backgroundStyle?.rawValue ?? "")|\(page.backgroundColor?.rawValue ?? "")"
+        let key = "\(page.id)|\(page.sourcePDFPageIndex ?? -1)|\(page.width)|\(page.height)|\(page.rotation)|\(page.sourceKind)|\(page.backgroundStyle?.rawValue ?? "")|\(page.backgroundColor?.rawValue ?? "")"
+        // The regenerable PDF is local cache data, not a change to durable page metadata.
+        // Its fingerprint also invalidates a same-size placeholder cover after relaunch.
+        guard let fingerprint = userDefaults.string(forKey: "practice.pdf-version.\(page.documentID).\(page.id)") else { return key }
+        return key + "|" + fingerprint
     }
 
     private func persistSparseEntities<T: Codable & Hashable & Identifiable>(

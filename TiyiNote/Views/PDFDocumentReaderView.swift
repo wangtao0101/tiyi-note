@@ -93,7 +93,7 @@ struct PDFDocumentReaderView: View {
                 viewports[page.id] = documentStore.canvasViewport(
                     forPageID: page.id,
                     in: documentID,
-                    referenceSize: documentStore.pageSize(at: page.orderIndex, in: documentID)
+                    referenceSize: practice?.cameraReferenceSize ?? documentStore.pageSize(at: page.orderIndex, in: documentID)
                 )
             }
         }
@@ -203,6 +203,9 @@ struct PDFDocumentReaderView: View {
                     }
                     .scrollTargetLayout()
                 }
+                // SwiftUI can re-enable its pager recognizer after a sidebar/layout update.
+                // Keep the scroll policy in SwiftUI as well as the native camera bridge.
+                .scrollDisabled(practice != nil)
                 .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
                 .scrollPosition(id: $visiblePageID, anchor: .top)
                 .accessibilityIdentifier("document-page-pager")
@@ -240,11 +243,12 @@ struct PDFDocumentReaderView: View {
             height: logicalSize.height * fittedScale * scale
         )
         let needsInitialHandoutCamera = initialHandoutCameraIDs.contains(pageMetadata.id)
-        var camera = canvasViewport(for: pageMetadata, referenceSize: logicalSize)
+        let cameraSize = practice?.cameraReferenceSize ?? logicalSize
+        var camera = canvasViewport(for: pageMetadata, referenceSize: cameraSize)
         if needsInitialHandoutCamera {
-            camera.center.y = (size.height / 2 - 24) / camera.displayScale(in: size, referenceSize: logicalSize)
+            camera.center.y = (size.height / 2 - 24) / camera.displayScale(in: size, referenceSize: cameraSize)
         }
-        let viewport = isUnboundedCanvas ? camera.logicalBounds(in: size, referenceSize: logicalSize) : nil
+        let viewport = isUnboundedCanvas ? camera.logicalBounds(in: size, referenceSize: cameraSize) : nil
         func annotatedPage(_ livePage: TiyiHandoutPageSession? = nil) -> some View {
         PDFPageAnnotationView(
             documentStore: documentStore,
@@ -267,6 +271,7 @@ struct PDFDocumentReaderView: View {
             eraserMode: eraserMode,
             isScribbleEraseEnabled: isScribbleEraseEnabled,
             isAnnotationEditingEnabled: isAnnotationEditingEnabled,
+            pagesNavigateFromSidebarOnly: practice != nil || documentStore.handoutWorkspace != nil,
             allowsQuestionCapture: practice == nil && documentStore.handoutWorkspace == nil,
             onOpenQuestionSession: onOpenQuestionSession,
             onSelectLassoTool: onSelectLassoTool,
@@ -275,7 +280,7 @@ struct PDFDocumentReaderView: View {
             onFingerPinchEnded: finishFingerPinch,
             onFingerPinchCancelled: cancelFingerPinch,
             onCanvasNavigation: { change in
-                updateCanvasViewport(change, for: pageMetadata, size: size, referenceSize: logicalSize)
+                updateCanvasViewport(change, for: pageMetadata, size: size, referenceSize: cameraSize)
             },
             onReady: registerController,
             onRelease: unregisterController
@@ -404,7 +409,7 @@ struct PDFDocumentReaderView: View {
         if isUnboundedCanvas,
            let page = documentStore.pages(in: documentID).first(where: { $0.orderIndex == currentPageIndex }) {
             var viewport = canvasViewport(
-                for: page, referenceSize: documentStore.pageSize(at: currentPageIndex, in: documentID)
+                for: page, referenceSize: practice?.cameraReferenceSize ?? documentStore.pageSize(at: currentPageIndex, in: documentID)
             )
             viewport.zoomScale = 1
             canvasViewports[page.id] = viewport
@@ -591,6 +596,7 @@ private struct PDFPageAnnotationView: View {
     let eraserMode: CanvasEraserMode
     let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
+    var pagesNavigateFromSidebarOnly: Bool = false
     let allowsQuestionCapture: Bool
     let onOpenQuestionSession: (DocumentQuestionSession) -> Void
     let onSelectLassoTool: () -> Void
@@ -721,7 +727,7 @@ private struct PDFPageAnnotationView: View {
                     logicalPageSize: logicalPageSize,
                     logicalViewport: logicalViewport,
                     isCurrentPage: allowsInitialPDFRenderDuringHandwriting,
-                    pagesNavigateFromSidebarOnly: documentStore.handoutWorkspace != nil,
+                    pagesNavigateFromSidebarOnly: pagesNavigateFromSidebarOnly,
                     isAnnotationEditingEnabled: isAnnotationEditingEnabled,
                     onFingerPinchChanged: onFingerPinchChanged,
                     onFingerPinchEnded: onFingerPinchEnded,
@@ -4924,8 +4930,11 @@ private struct PageThumbnailSidebar: View {
                                     forDeletedPage: page,
                                     size: CGSize(width: 220, height: 310)
                                 )
-                                : nil,
-                            pdfPage: filter == .deleted
+                                : practice != nil ? documentStore.thumbnail(
+                                    forPage: pageIndex, in: documentID,
+                                    size: CGSize(width: 220, height: 310)
+                                ) : nil,
+                            pdfPage: filter == .deleted || practice != nil
                                 ? nil
                                 : documentStore.page(at: pageIndex, in: documentID),
                             drawingActivitySource: documentStore,
