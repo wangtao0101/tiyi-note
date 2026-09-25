@@ -7,17 +7,20 @@ public struct TiyiPracticeSection: Codable, Hashable, Identifiable, Sendable {
     public var label: String
     public var pageIDs: [String]
     public var deletedPageIDs: [String]
-    public init(id: String, label: String, pageIDs: [String] = [], deletedPageIDs: [String] = []) {
+    public var closeReadingPageID: String?
+    public init(id: String, label: String, pageIDs: [String] = [], deletedPageIDs: [String] = [], closeReadingPageID: String? = nil) {
         self.id = id; self.label = label; self.pageIDs = pageIDs; self.deletedPageIDs = deletedPageIDs
+        self.closeReadingPageID = closeReadingPageID
     }
 
-    private enum CodingKeys: String, CodingKey { case id, label, pageIDs, deletedPageIDs }
+    private enum CodingKeys: String, CodingKey { case id, label, pageIDs, deletedPageIDs, closeReadingPageID }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
         label = try values.decode(String.self, forKey: .label)
         pageIDs = try values.decode([String].self, forKey: .pageIDs)
         deletedPageIDs = try values.decodeIfPresent([String].self, forKey: .deletedPageIDs) ?? []
+        closeReadingPageID = try values.decodeIfPresent(String.self, forKey: .closeReadingPageID)
     }
 }
 
@@ -25,6 +28,24 @@ public struct TiyiPracticePageSeed {
     public var questionID: String
     public var image: UIImage
     public init(questionID: String, image: UIImage) { self.questionID = questionID; self.image = image }
+}
+
+public struct TiyiPracticeExplanation: Sendable, Equatable {
+    public struct Row: Sendable, Equatable, Identifiable {
+        public let id: String
+        public let label: String
+        public let value: String
+        public init(id: String = UUID().uuidString, label: String, value: String) {
+            self.id = id; self.label = label; self.value = value
+        }
+    }
+    public let title: String
+    public let subtitle: String?
+    public let rows: [Row]
+    public let speechText: String?
+    public init(title: String, subtitle: String? = nil, rows: [Row], speechText: String? = nil) {
+        self.title = title; self.subtitle = subtitle; self.rows = rows; self.speechText = speechText
+    }
 }
 
 extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.Name("tiyi.practice.checkpoint") }
@@ -44,6 +65,9 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     @Published public var errorMessage: String?
     public var onCheckpoint: ((Data, [TiyiPracticeSection], String?) throws -> Void)?
     public var assistantContext: (() -> TiyiAssistantContext)?
+    @Published public var closeReadingSectionIDs: Set<String> = []
+    public var prepareCloseReadingPDF: ((String, Data) async throws -> Data)?
+    public var explainSelection: ((String, String) async throws -> TiyiPracticeExplanation)?
     public var onAnswer: ((String) -> Void)?
     @Published public var isCompleted = false
     public var onToggleCompleted: (() throws -> Void)?
@@ -53,12 +77,14 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     @Published public private(set) var questionPreparationError: String?
     private let cachedQuestionPDFs: Bool
     private let questionCache: URL
+    private let closeReadingCache: URL
     private var preparedPages: Set<String> = []
     private var preparingPageID: String?
     private struct PDFPreparation { let id = UUID(); let task: Task<Data, Error> }
     private var pdfPreparations: [String: PDFPreparation] = [:]
     @Published public private(set) var isPreparingRemainingQuestions = false
     @Published public private(set) var backgroundPreparationError: String?
+    @Published public private(set) var isPreparingCloseReading = false
     private let layoutURL: URL
 
     public init(directory: URL, title: String, sections: [TiyiPracticeSection], packageData: Data? = nil,
@@ -66,7 +92,9 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         self.title = title
         self.cachedQuestionPDFs = cachedQuestionPDFs
         questionCache = directory.appendingPathComponent("QuestionPDFCache-v1")
+        closeReadingCache = directory.appendingPathComponent("CloseReadingPDFCache-v6")
         try FileManager.default.createDirectory(at: questionCache, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: closeReadingCache, withIntermediateDirectories: true)
         defaults = UserDefaults(suiteName: "tiyi.practice.\(directory.lastPathComponent)")!
         store = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: directory, includesBundledSamples: false)
         layoutURL = directory.appendingPathComponent("practice-pages.json")
@@ -117,6 +145,13 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     }
 
     public var currentSection: TiyiPracticeSection? { sections.first { $0.pageIDs.contains(currentPageID ?? "") } ?? sections.first { !$0.pageIDs.isEmpty } }
+    public var supportsCloseReading: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+            && currentSection.map { closeReadingSectionIDs.contains($0.id) && $0.pageIDs.first == currentPageID } == true
+    }
+    public var isShowingCloseReading: Bool {
+        currentSection?.closeReadingPageID == currentPageID
+    }
     public var isWriting: Bool { store.hadRecentDrawingInteraction(within: 1.5) }
     var cameraReferenceSize: CGSize? { cachedQuestionPDFs ? CGSize(width: 768, height: 1086) : nil }
     public var pageCount: Int { sections.reduce(0) { $0 + $1.pageIDs.count } }
@@ -135,6 +170,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         guard cachedQuestionPDFs, let pageID = currentPageID,
               let section = currentSection,
               let index = store.pageIndex(for: pageID, in: documentID) else { return }
+        guard !isCloseReadingPage(pageID) else { return }
         if store.pageMetadata(at: index, in: documentID)?.sourceKind != .template {
             try await preparePDF(pageID: pageID, questionID: section.id)
         }
@@ -147,7 +183,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         isPreparingRemainingQuestions = true; backgroundPreparationError = nil
         defer { isPreparingRemainingQuestions = false }
         var failures: [String] = []
-        for page in store.pages(in: documentID) where page.sourceKind != .template {
+        for page in store.pages(in: documentID) where page.sourceKind != .template && !isCloseReadingPage(page.id) {
             guard !Task.isCancelled else { return }
             guard let section = sections.first(where: { $0.pageIDs.contains(page.id) }) else { continue }
             do {
@@ -169,6 +205,20 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     public func prepareCurrentQuestion() async {
         guard cachedQuestionPDFs, let pageID = currentPageID else { return }
         if preparingPageID != pageID { questionPreparationError = nil; isPreparingQuestion = false }
+        if isCloseReadingPage(pageID), !preparedPages.contains(pageID), let section = currentSection {
+            preparingPageID = pageID; isPreparingQuestion = true; questionPreparationError = nil
+            defer { if preparingPageID == pageID { preparingPageID = nil; isPreparingQuestion = false } }
+            do {
+                let original = try await originalQuestionPDF(questionID: section.id)
+                let data = try await closeReadingPDF(questionID: section.id, originalPDF: original)
+                try Task.checkCancellation()
+                try store.installPracticePDF(data, pageID: pageID, documentID: documentID)
+                preparedPages.insert(pageID)
+                try checkpoint()
+            } catch is CancellationError { }
+            catch { if currentPageID == pageID { questionPreparationError = "精读版准备失败：\(error.localizedDescription)" } }
+            return
+        }
         guard let index = store.pageIndex(for: pageID, in: documentID),
               store.pageMetadata(at: index, in: documentID)?.sourceKind != .template,
               !preparedPages.contains(pageID), preparingPageID != pageID,
@@ -185,7 +235,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     /// Explicit export/printing needs every active question, including unvisited ones.
     func prepareForOutput() async throws {
         guard cachedQuestionPDFs else { return }
-        for page in store.pages(in: documentID) where page.sourceKind != .template {
+        for page in store.pages(in: documentID) where page.sourceKind != .template && !isCloseReadingPage(page.id) {
             guard let section = sections.first(where: { $0.pageIDs.contains(page.id) }) else { throw CocoaError(.fileReadCorruptFile) }
             try await preparePDF(pageID: page.id, questionID: section.id)
         }
@@ -249,6 +299,90 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         }
     }
 
+    public func toggleCloseReadingVersion() async {
+        guard supportsCloseReading, !isPreparingCloseReading, let sectionIndex = sections.firstIndex(where: { $0.id == currentSection?.id }) else { return }
+        let section = sections[sectionIndex]
+        guard let pageID = currentPageID, section.pageIDs.contains(pageID) else { return }
+        let wasShowingCloseReading = isShowingCloseReading
+        isPreparingCloseReading = true
+        defer { isPreparingCloseReading = false }
+        do {
+            try checkpoint()
+            let data: Data
+            if wasShowingCloseReading {
+                data = try await originalQuestionPDF(questionID: section.id)
+            } else {
+                let original = try await originalQuestionPDF(questionID: section.id)
+                data = try await closeReadingPDF(questionID: section.id, originalPDF: original)
+            }
+            try Task.checkCancellation()
+            guard sections.indices.contains(sectionIndex), sections[sectionIndex].id == section.id,
+                  sections[sectionIndex].pageIDs.contains(pageID) else { return }
+            try store.installPracticePDF(data, pageID: pageID, documentID: documentID)
+            sections[sectionIndex].closeReadingPageID = wasShowingCloseReading ? nil : pageID
+            if !wasShowingCloseReading {
+                defaults.set(true, forKey: closeReadingHitTargetKey(section.id))
+            }
+            preparedPages.insert(pageID)
+            try checkpoint()
+        } catch is CancellationError { }
+        catch { errorMessage = "精读版生成失败：\(error.localizedDescription)" }
+    }
+
+    public func ensureCloseReadingHitTargets() async {
+        guard supportsCloseReading, isShowingCloseReading, !isPreparingCloseReading,
+              let sectionIndex = sections.firstIndex(where: { $0.id == currentSection?.id }) else { return }
+        let section = sections[sectionIndex]
+        guard let pageID = currentPageID, section.pageIDs.contains(pageID),
+              !defaults.bool(forKey: closeReadingHitTargetKey(section.id)) else { return }
+        isPreparingCloseReading = true
+        defer { isPreparingCloseReading = false }
+        do {
+            try checkpoint()
+            let original = try await originalQuestionPDF(questionID: section.id)
+            let data = try await closeReadingPDF(questionID: section.id, originalPDF: original)
+            try Task.checkCancellation()
+            guard sections.indices.contains(sectionIndex), sections[sectionIndex].id == section.id,
+                  sections[sectionIndex].pageIDs.contains(pageID), isShowingCloseReading else { return }
+            try store.installPracticePDF(data, pageID: pageID, documentID: documentID)
+            defaults.set(true, forKey: closeReadingHitTargetKey(section.id))
+            preparedPages.insert(pageID)
+            try checkpoint()
+        } catch is CancellationError { }
+        catch { errorMessage = "精读版更新失败：\(error.localizedDescription)" }
+    }
+
+    private func closeReadingHitTargetKey(_ questionID: String) -> String {
+        "closeReadingHitTargets.v6.\(questionID)"
+    }
+
+    private func originalQuestionPDF(questionID: String) async throws -> Data {
+        let url = questionCache.appendingPathComponent(questionID + ".pdf")
+        if let data = try? Data(contentsOf: url), PDFDocument(data: data)?.pageCount == 1 { return data }
+        guard let prepareQuestionPDF else { throw CocoaError(.fileReadNoSuchFile) }
+        let data = try await prepareQuestionPDF(questionID)
+        guard PDFDocument(data: data)?.pageCount == 1 else { throw CocoaError(.fileReadCorruptFile) }
+        try data.write(to: url, options: .atomic)
+        return data
+    }
+
+    private func closeReadingPDF(questionID: String, originalPDF: Data) async throws -> Data {
+        let url = closeReadingCache.appendingPathComponent(questionID + ".pdf")
+        if let data = try? Data(contentsOf: url),
+           let cachedPage = PDFDocument(data: data)?.page(at: 0),
+           let originalPage = PDFDocument(data: originalPDF)?.page(at: 0),
+           cachedPage.bounds(for: .mediaBox).size == originalPage.bounds(for: .mediaBox).size { return data }
+        guard let prepareCloseReadingPDF else { throw CocoaError(.fileReadNoSuchFile) }
+        let data = try await prepareCloseReadingPDF(questionID, originalPDF)
+        guard let refined = PDFDocument(data: data), refined.pageCount == 1,
+              let refinedPage = refined.page(at: 0), let originalPage = PDFDocument(data: originalPDF)?.page(at: 0),
+              refinedPage.bounds(for: .mediaBox).size == originalPage.bounds(for: .mediaBox).size else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        try data.write(to: url, options: .atomic)
+        return data
+    }
+
     /// The shared Note sidebar mutates the same store. Flush live editors before copying or
     /// archiving a page, then persist the page-to-question index together with its editable assets.
     func performPageMutation<Result>(_ mutation: () throws -> Result) throws -> Result {
@@ -282,7 +416,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
             (section.pageIDs + section.deletedPageIDs).map { ($0, index) }
         }, uniquingKeysWith: { first, _ in first })
         var owner = 0
-        var restored = sections.map { TiyiPracticeSection(id: $0.id, label: $0.label) }
+        var restored = sections.map { TiyiPracticeSection(id: $0.id, label: $0.label, closeReadingPageID: $0.closeReadingPageID) }
         guard !restored.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
         for id in pages {
             if let known = owners[id] { owner = known }
@@ -295,6 +429,10 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
         if restored != sections { sections = restored }
         if !pages.contains(currentPageID ?? "") { currentPageID = pages.first }
         try persistSections()
+    }
+
+    private func isCloseReadingPage(_ id: String) -> Bool {
+        sections.contains { $0.closeReadingPageID == id }
     }
 
     public static func savePDFToSharedDocuments(_ data: Data, title: String) throws {

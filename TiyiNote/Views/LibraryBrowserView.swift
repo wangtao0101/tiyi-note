@@ -531,12 +531,11 @@ struct LibraryBrowserView: View {
     @discardableResult
     private func importDroppedPDFs(_ staged: StagedDocumentDrop, into folderID: String?) -> Bool {
         guard PlatformCapabilities.current.canImportPDF, scope == .documents else { return false }
-        let supportedURLs = [staged.url].filter {
-            $0.pathExtension.caseInsensitiveCompare("pdf") == .orderedSame
-                || $0.pathExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
-        }
-        guard !supportedURLs.isEmpty else { return false }
-        importDocuments(supportedURLs, into: folderID, stagedDrop: staged)
+        let fileExtension = staged.url.pathExtension
+        let isPDF = fileExtension.caseInsensitiveCompare("pdf") == .orderedSame
+        let isEditableDocument = fileExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
+        guard isPDF || isEditableDocument else { return false }
+        importDocuments([staged.url], into: folderID, stagedDrop: staged)
         return true
     }
 

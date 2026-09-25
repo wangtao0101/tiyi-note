@@ -4,6 +4,16 @@ import PencilKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+extension Notification.Name {
+    static let tiyiPracticeTextSelection = Notification.Name("tiyi.practice.text-selection")
+}
+
+struct TiyiPracticeTextSelectionEvent {
+    let documentID: String
+    let pageID: String
+    let text: String?
+}
+
 struct PDFDocumentReaderView: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     let documentID: String
@@ -737,7 +747,19 @@ private struct PDFPageAnnotationView: View {
                 .accessibilityLabel("第 \(pageIndex + 1) 页批注画布")
                 .accessibilityIdentifier("page-canvas-\(pageIndex)")
                 .accessibilityValue(canvasAccessibilityValue)
-                .allowsHitTesting(isAnnotationEditingEnabled && selectedTool != .question)
+                .allowsHitTesting(isAnnotationEditingEnabled && selectedTool != .question && selectedTool != .explain)
+
+                if selectedTool == .explain,
+                   let page = documentStore.page(at: resolvedPageIndex, in: documentID) {
+                    let bounds = displayRect(for: CGRect(origin: .zero, size: logicalPageSize), in: geometry.size)
+                    PracticeTextSelectionOverlay(page: page) { text in
+                        NotificationCenter.default.post(name: .tiyiPracticeTextSelection,
+                            object: TiyiPracticeTextSelectionEvent(documentID: documentID, pageID: pageID, text: text))
+                    }
+                    .frame(width: bounds.width, height: bounds.height)
+                    .position(x: bounds.midX, y: bounds.midY)
+                    .accessibilityIdentifier("practice-text-selection-overlay")
+                }
 
                 if allowsQuestionCapture && isAnnotationEditingEnabled && selectedTool != .question {
                     ForEach(pageElements.filter { $0.question != nil }.sorted(by: pageElementSort)) { element in
@@ -1992,6 +2014,98 @@ private struct PDFPageAnnotationView: View {
     private func pageElementSort(_ lhs: CanvasPageElement, _ rhs: CanvasPageElement) -> Bool {
         if lhs.zIndex != rhs.zIndex { return lhs.zIndex < rhs.zIndex }
         return lhs.id.uuidString < rhs.id.uuidString
+    }
+}
+
+private struct PracticeTextSelectionOverlay: View {
+    private static let collocationAnnotationPrefix = "tiyi-close-reading-collocation:"
+    private struct CollocationMetadata: Decodable {
+        let text: String
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+        var bounds: CGRect { CGRect(x: x, y: y, width: width, height: height) }
+    }
+
+    let page: PDFPage
+    let onSelect: (String?) -> Void
+    @State private var selectedRect: CGRect?
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                Color.clear.contentShape(Rectangle())
+                if let selectedRect {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.blue.opacity(0.16))
+                        .overlay { RoundedRectangle(cornerRadius: 3).stroke(Color.blue.opacity(0.48), lineWidth: 1) }
+                        .frame(width: max(selectedRect.width, 3), height: max(selectedRect.height, 3))
+                        .position(x: selectedRect.midX, y: selectedRect.midY)
+                        .allowsHitTesting(false)
+                }
+            }
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    updateSelection(from: value.startLocation, to: value.location,
+                                    size: geometry.size, submitsSelection: false)
+                }
+                .onEnded { value in
+                    updateSelection(from: value.startLocation, to: value.location,
+                                    size: geometry.size, submitsSelection: true)
+                })
+        }
+    }
+
+    private func updateSelection(from start: CGPoint, to end: CGPoint, size: CGSize,
+                                 submitsSelection: Bool) {
+        let pageBounds = page.bounds(for: .mediaBox)
+        guard size.width > 0, size.height > 0 else { return }
+        func pagePoint(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: pageBounds.minX + point.x / size.width * pageBounds.width,
+                    y: pageBounds.maxY - point.y / size.height * pageBounds.height)
+        }
+        let distance = hypot(end.x - start.x, end.y - start.y)
+        let endPoint = pagePoint(end)
+        if distance < 8, let marker = markedCollocation(at: endPoint) {
+            selectedRect = displayRect(marker.bounds, pageBounds: pageBounds, size: size)
+            if submitsSelection { onSelect(marker.text) }
+            return
+        }
+        let selection = distance < 8
+            ? page.selectionForWord(at: endPoint)
+            : page.selection(from: pagePoint(start), to: endPoint)
+        guard let selection,
+              let text = selection.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            selectedRect = nil
+            if submitsSelection { onSelect(nil) }
+            return
+        }
+        selectedRect = displayRect(selection.bounds(for: page), pageBounds: pageBounds, size: size)
+        if submitsSelection { onSelect(text) }
+    }
+
+    private func displayRect(_ rect: CGRect, pageBounds: CGRect, size: CGSize) -> CGRect {
+        CGRect(
+            x: (rect.minX - pageBounds.minX) / pageBounds.width * size.width,
+            y: (pageBounds.maxY - rect.maxY) / pageBounds.height * size.height,
+            width: rect.width / pageBounds.width * size.width,
+            height: rect.height / pageBounds.height * size.height
+        )
+    }
+
+    private func markedCollocation(at point: CGPoint) -> (bounds: CGRect, text: String)? {
+        let keywordsKey = AnyHashable(PDFDocumentAttribute.keywordsAttribute)
+        guard let keywords = page.document?.documentAttributes?[keywordsKey] as? [String] else { return nil }
+        for value in keywords.reversed() where value.hasPrefix(Self.collocationAnnotationPrefix) {
+            let encoded = String(value.dropFirst(Self.collocationAnnotationPrefix.count))
+            guard let data = Data(base64Encoded: encoded),
+                  let metadata = try? JSONDecoder().decode(CollocationMetadata.self, from: data),
+                  metadata.bounds.contains(point), !metadata.text.isEmpty else { continue }
+            return (metadata.bounds, metadata.text)
+        }
+        return nil
     }
 }
 

@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import Combine
 import UniformTypeIdentifiers
+import AVFoundation
 
 struct CanvasScreen: View {
     @Environment(\.tiyiAssistant) private var assistantIntegration
@@ -48,6 +49,11 @@ struct CanvasScreen: View {
     @State private var workspaceAlert: WorkspaceAlert?
     @State private var questionSession: DocumentQuestionSession?
     @State private var closingQuestionSession: DocumentQuestionSession?
+    @State private var explanation: TiyiPracticeExplanation?
+    @State private var explanationSelection = ""
+    @State private var explanationError: String?
+    @State private var isLoadingExplanation = false
+    @State private var explanationTask: Task<Void, Never>?
 
     private var thumbnailVisibility: Binding<Bool> {
         practice.map { workspace in
@@ -119,6 +125,28 @@ struct CanvasScreen: View {
     private var onAssistant: (() -> Void)? {
         guard assistantIntegration != nil else { return nil }
         return { showsAssistant.toggle() }
+    }
+
+    private var practiceVersionTitle: String? {
+        guard practice?.supportsCloseReading == true else { return nil }
+        return practice?.isShowingCloseReading == true ? "精读" : "原题"
+    }
+
+    private var onTogglePracticeVersion: (() -> Void)? {
+        guard let practice, practice.supportsCloseReading else { return nil }
+        return { Task { await practice.toggleCloseReadingVersion() } }
+    }
+
+    private var onExplanation: (() -> Void)? {
+        guard let practice, practice.supportsCloseReading, practice.explainSelection != nil else { return nil }
+        return {
+            selectedTool = selectedTool == .explain ? (selectedPenVariant.isPenVariant ? selectedPenVariant : .pen) : .explain
+            if selectedTool == .explain {
+                Task { await practice.ensureCloseReadingHitTargets() }
+            } else {
+                clearExplanation()
+            }
+        }
     }
 
     var body: some View {
@@ -193,6 +221,24 @@ struct CanvasScreen: View {
             assistantSelections = Array(assistantSelections.suffix(6))
             showsAssistant = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .tiyiPracticeTextSelection)) { notification in
+            guard let event = notification.object as? TiyiPracticeTextSelectionEvent,
+                  event.documentID == activeDocumentID,
+                  selectedTool == .explain else { return }
+            guard let selectedText = event.text, !selectedText.isEmpty else { return }
+            guard
+                  let practice, let section = practice.currentSection,
+                  section.pageIDs.contains(event.pageID), let explain = practice.explainSelection else { return }
+            explanationTask?.cancel()
+            explanationSelection = selectedText
+            explanation = nil; explanationError = nil; isLoadingExplanation = true
+            explanationTask = Task { @MainActor in
+                defer { if !Task.isCancelled { isLoadingExplanation = false } }
+                do { explanation = try await explain(section.id, selectedText) }
+                catch is CancellationError { }
+                catch { explanationError = error.localizedDescription }
+            }
+        }
     }
 
     private var assistantPanel: AnyView? {
@@ -248,6 +294,10 @@ struct CanvasScreen: View {
                 allowsQuestionCapture: practice == nil && handout == nil,
                 onAssistant: onAssistant,
                 isAssistantOpen: showsAssistant,
+                practiceVersionTitle: practiceVersionTitle,
+                isPreparingPracticeVersion: practice?.isPreparingCloseReading == true,
+                onTogglePracticeVersion: onTogglePracticeVersion,
+                allowsExplanation: onExplanation != nil,
                 onToggleEditing: canToggleEditing ? toggleEditing : nil
             )
         } else {
@@ -258,6 +308,11 @@ struct CanvasScreen: View {
                 onDocumentAction: handleDocumentOutput,
                 onAssistant: onAssistant,
                 isAssistantOpen: showsAssistant,
+                practiceVersionTitle: practiceVersionTitle,
+                isPreparingPracticeVersion: practice?.isPreparingCloseReading == true,
+                onTogglePracticeVersion: onTogglePracticeVersion,
+                onExplanation: onExplanation,
+                isExplanationSelected: selectedTool == .explain,
                 onToggleEditing: canToggleEditing ? toggleEditing : nil
             )
         }
@@ -331,6 +386,20 @@ struct CanvasScreen: View {
                             canImportPDF: PlatformCapabilities.current.canImportPDF,
                             onImportPDF: { showsPDFImporter = true }
                         )
+                    }
+
+                    if selectedTool == .explain,
+                       isLoadingExplanation || explanation != nil || explanationError != nil {
+                        PracticeExplanationCard(selection: explanationSelection,
+                                                explanation: explanation,
+                                                error: explanationError,
+                                                isLoading: isLoadingExplanation,
+                                                onClose: clearExplanation)
+                            .frame(width: 360)
+                            .padding(.top, 18)
+                            .padding(.trailing, 22)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                            .zIndex(40)
                     }
                 }
             }
@@ -477,6 +546,11 @@ struct CanvasScreen: View {
         if !documentStore.openDocumentIDs.contains(activeDocumentID) {
             activeDocumentID = documentStore.openDocuments.first?.id ?? ""
         }
+    }
+
+    private func clearExplanation() {
+        explanationTask?.cancel(); explanationTask = nil
+        explanation = nil; explanationError = nil; explanationSelection = ""; isLoadingExplanation = false
     }
 
     private func selectDocument(_ documentID: String) {
@@ -671,6 +745,137 @@ struct CanvasScreen: View {
         } else {
             interactionSession.toggle(contentID: interactionContentID, hasPermission: canToggleEditing)
         }
+    }
+}
+
+private struct PracticeExplanationCard: View {
+    let selection: String
+    let explanation: TiyiPracticeExplanation?
+    let error: String?
+    let isLoading: Bool
+    let onClose: () -> Void
+    @StateObject private var speech = PracticeExplanationSpeech()
+    @State private var cardOffset = CGSize.zero
+    @State private var dragOrigin: CGSize?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "character.book.closed")
+                    Text("词句解释").font(.system(size: 14, weight: .semibold))
+                    Spacer(minLength: 12)
+                    Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(TiyiNoteTheme.textSecondary)
+                }
+                .contentShape(Rectangle())
+                .gesture(cardDragGesture)
+                .accessibilityLabel("拖动词句解释框")
+
+                if let speechText = explanation?.speechText {
+                    Button { speech.toggle(speechText) } label: {
+                        Image(systemName: speech.isSpeaking ? "speaker.wave.3.fill" : "speaker.wave.2")
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(speech.isSpeaking ? TiyiNoteTheme.selectionForeground : TiyiNoteTheme.textPrimary)
+                    .accessibilityLabel(speech.isSpeaking ? "停止朗读" : "朗读选中内容")
+                }
+                Button(action: onClose) { Image(systemName: "xmark").frame(width: 28, height: 28) }
+                    .buttonStyle(.plain).accessibilityLabel("关闭词句解释")
+            }
+            .foregroundStyle(TiyiNoteTheme.textPrimary)
+            .padding(.horizontal, 14).frame(height: 44)
+
+            Divider().overlay(TiyiNoteTheme.hairline)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(selection).font(.system(size: 16, weight: .semibold, design: .serif))
+                        .textSelection(.enabled)
+                    if isLoading {
+                        HStack(spacing: 8) { ProgressView().controlSize(.small); Text("正在解释…") }
+                            .font(.caption).foregroundStyle(TiyiNoteTheme.textSecondary)
+                    } else if let error {
+                        Text(error).font(.caption).foregroundStyle(.red)
+                    } else if let explanation {
+                        if let subtitle = explanation.subtitle, !subtitle.isEmpty {
+                            Text(subtitle).font(.caption).foregroundStyle(TiyiNoteTheme.textSecondary)
+                        }
+                        ForEach(explanation.rows) { row in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(row.label).font(.caption.weight(.semibold)).foregroundStyle(TiyiNoteTheme.textSecondary)
+                                    .frame(width: 48, alignment: .leading)
+                                Text(row.value).font(.system(size: 13)).lineSpacing(3)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+                .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 300)
+        }
+        .background(TiyiNoteTheme.chrome, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(TiyiNoteTheme.hairline, lineWidth: 1) }
+        .shadow(color: .black.opacity(0.16), radius: 14, y: 6)
+        .offset(cardOffset)
+        .transaction { $0.animation = nil }
+        .accessibilityIdentifier("practice-explanation-card")
+    }
+
+    private var cardDragGesture: some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+            .onChanged { value in
+                let origin = dragOrigin ?? cardOffset
+                if dragOrigin == nil { dragOrigin = origin }
+                cardOffset = CGSize(width: origin.width + value.translation.width,
+                                    height: origin.height + value.translation.height)
+            }
+            .onEnded { _ in dragOrigin = nil }
+    }
+}
+
+@MainActor private final class PracticeExplanationSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
+    @Published private(set) var isSpeaking = false
+    private let synthesizer = AVSpeechSynthesizer()
+
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+
+    func toggle(_ text: String) {
+        if synthesizer.isSpeaking {
+            synthesizer.stopSpeaking(at: .immediate)
+            finishSpeaking()
+            return
+        }
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+        try? audioSession.setActive(true)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        utterance.rate = 0.45
+        utterance.volume = 1
+        isSpeaking = true
+        synthesizer.speak(utterance)
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor in self.finishSpeaking() }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                                       didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor in self.finishSpeaking() }
+    }
+
+    private func finishSpeaking() {
+        isSpeaking = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
     }
 }
 

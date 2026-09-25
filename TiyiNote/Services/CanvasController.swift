@@ -268,7 +268,7 @@ final class CanvasController: NSObject, ObservableObject {
         if !kind.usesInkSettings {
             cancelHeldInkRecognition()
         }
-        canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable && kind != .lasso && kind != .question && kind != .text
+        canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable && kind != .lasso && kind != .question && kind != .text && kind != .explain
 
         switch kind {
         case .pen:
@@ -312,7 +312,7 @@ final class CanvasController: NSObject, ObservableObject {
             canvasView.tool = eraserMode == .stroke
                 ? PKEraserTool(.vector)
                 : PKEraserTool(.fixedWidthBitmap, width: eraserSize.width)
-        case .lasso, .question, .text:
+        case .lasso, .question, .text, .explain:
             // Both modes belong to our object interaction layer. Installing PKLassoTool also
             // activates PencilKit's separate selection recognizers and its Select All / Insert
             // Space menu, even with drawingGestureRecognizer disabled and responder actions off.
@@ -320,7 +320,7 @@ final class CanvasController: NSObject, ObservableObject {
         }
         // PencilKit can re-enable its recognizer when the tool is assigned.
         canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable
-            && kind != .lasso && kind != .question && kind != .text
+            && kind != .lasso && kind != .question && kind != .text && kind != .explain
         (canvasView as? TiyiPencilCanvasView)?.disableSystemEditingInteractions()
     }
 
@@ -339,7 +339,7 @@ final class CanvasController: NSObject, ObservableObject {
             return
         }
 
-        canvasView.drawingGestureRecognizer.isEnabled = selectedToolKind != .lasso && selectedToolKind != .text && selectedToolKind != .question
+        canvasView.drawingGestureRecognizer.isEnabled = selectedToolKind != .lasso && selectedToolKind != .text && selectedToolKind != .question && selectedToolKind != .explain
         canvasView.drawingPolicy = allowsDirectDrawing ? .anyInput : .pencilOnly
         canvasView.drawingGestureRecognizer.allowedTouchTypes = allowsDirectDrawing ? [
             NSNumber(value: UITouch.TouchType.direct.rawValue),

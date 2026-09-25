@@ -49,6 +49,10 @@ struct ToolPaletteView: View {
     var allowsQuestionCapture = false
     var onAssistant: (() -> Void)? = nil
     var isAssistantOpen = false
+    var practiceVersionTitle: String? = nil
+    var isPreparingPracticeVersion = false
+    var onTogglePracticeVersion: (() -> Void)? = nil
+    var allowsExplanation = false
     var onToggleEditing: (() -> Void)? = nil
 
     var body: some View {
@@ -61,6 +65,8 @@ struct ToolPaletteView: View {
             GeometryReader { geometry in
                 let horizontalPadding: CGFloat = 20
                 let leadingControlsWidth: CGFloat = (onSearch == nil ? 38 : 78) + 84
+                    + (practiceVersionTitle == nil ? 0 : 92)
+                    + (allowsExplanation ? 92 : 0)
                 let dividerWidth: CGFloat = 5
                 let outerSpacing: CGFloat = 24
                 let trailingActionCount = onAssistant == nil ? 2 : 3
@@ -98,6 +104,19 @@ struct ToolPaletteView: View {
                     }
 
                     CanvasModeButton(isEditing: true, onToggle: onToggleEditing)
+                    if let practiceVersionTitle {
+                        PracticeVersionButton(title: practiceVersionTitle,
+                                              isLoading: isPreparingPracticeVersion,
+                                              action: onTogglePracticeVersion)
+                    }
+                    if allowsExplanation {
+                        DocumentToolbarButton(symbol: CanvasToolKind.explain.symbolName,
+                                              title: "词句解释",
+                                              isSelected: selectedTool == .explain) {
+                            selectFirstLevelTool(.explain)
+                        }
+                        .accessibilityIdentifier("tool-explain-selection")
+                    }
                     DocumentToolbarDivider()
 
                     // Only the drawing-tool cluster is allowed to scroll. Keeping the document
@@ -482,6 +501,11 @@ struct ReadOnlyToolPaletteView: View {
     let onDocumentAction: (DocumentOutputAction) -> Void
     var onAssistant: (() -> Void)? = nil
     var isAssistantOpen = false
+    var practiceVersionTitle: String? = nil
+    var isPreparingPracticeVersion = false
+    var onTogglePracticeVersion: (() -> Void)? = nil
+    var onExplanation: (() -> Void)? = nil
+    var isExplanationSelected = false
     var onToggleEditing: (() -> Void)? = nil
 
     var body: some View {
@@ -511,6 +535,16 @@ struct ReadOnlyToolPaletteView: View {
                 }
 
                 CanvasModeButton(isEditing: false, onToggle: onToggleEditing)
+                if let practiceVersionTitle {
+                    PracticeVersionButton(title: practiceVersionTitle,
+                                          isLoading: isPreparingPracticeVersion,
+                                          action: onTogglePracticeVersion)
+                }
+                if let onExplanation {
+                    DocumentToolbarButton(symbol: CanvasToolKind.explain.symbolName, title: "词句解释",
+                                          isSelected: isExplanationSelected, action: onExplanation)
+                        .accessibilityIdentifier("tool-explain-selection")
+                }
 
                 DocumentToolbarDivider()
 
@@ -1276,5 +1310,33 @@ private struct CanvasModeButton: View {
         .accessibilityIdentifier("canvas-interaction-mode")
         .accessibilityLabel(isEditing ? "书写" : "只读")
         .accessibilityHint(onToggle == nil ? "当前文稿不可编辑" : (isEditing ? "切换为只读" : "开启书写"))
+    }
+}
+
+private struct PracticeVersionButton: View {
+    let title: String
+    let isLoading: Bool
+    let action: (() -> Void)?
+
+    var body: some View {
+        Button { action?() } label: {
+            HStack(spacing: 6) {
+                if isLoading { ProgressView().controlSize(.mini).tint(TiyiNoteTheme.documentChromeForeground) }
+                else { Image(systemName: title == "精读" ? "text.book.closed.fill" : "doc.text") }
+                Text(title)
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .opacity(0.58)
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(TiyiNoteTheme.documentChromeForeground)
+            .frame(width: 84, height: 38)
+            .background(Color.white.opacity(title == "精读" ? 0.16 : 0.08), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .disabled(action == nil || isLoading)
+        .accessibilityIdentifier("practice-close-reading-version")
+        .accessibilityLabel("当前版本：\(title)")
+        .accessibilityHint("切换题面版本，笔记和缩放保持不变")
     }
 }
