@@ -10,6 +10,7 @@ struct PencilCanvasView: UIViewRepresentable {
     let logicalViewport: CGRect?
     let isCurrentPage: Bool
     var pagesNavigateFromSidebarOnly: Bool = false
+    var usesContinuousPDFScrolling: Bool = false
     var isAnnotationEditingEnabled: Bool = true
     let onFingerPinchChanged: (CGFloat) -> Void
     let onFingerPinchEnded: (CGFloat) -> Void
@@ -28,6 +29,7 @@ struct PencilCanvasView: UIViewRepresentable {
             logicalViewport: logicalViewport
         )
         view.suppressesFingerPaging = pagesNavigateFromSidebarOnly
+        view.usesContinuousPDFScrolling = usesContinuousPDFScrolling
         let coordinator = context.coordinator
         view.onNavigationAncestorFound = { [weak coordinator, weak view] pager in
             guard let view else { return }
@@ -44,6 +46,7 @@ struct PencilCanvasView: UIViewRepresentable {
         }
         uiView.logicalViewport = logicalViewport
         uiView.suppressesFingerPaging = pagesNavigateFromSidebarOnly
+        uiView.usesContinuousPDFScrolling = usesContinuousPDFScrolling
         uiView.configureAncestorNavigation()
     }
 
@@ -65,7 +68,7 @@ struct PencilCanvasView: UIViewRepresentable {
         }
 
         func configureCanvasNavigation(on host: UIView, container: UIView) {
-            guard parent.isCurrentPage else {
+            guard parent.isCurrentPage && !parent.usesContinuousPDFScrolling else {
                 removeCanvasNavigation()
                 return
             }
@@ -191,6 +194,7 @@ final class PageCanvasContainerView: UIView {
     }
     var onNavigationAncestorFound: ((UIView) -> Void)?
     var suppressesFingerPaging = false
+    var usesContinuousPDFScrolling = false
 
     init(controller: CanvasController, logicalPageSize: CGSize, logicalViewport: CGRect?) {
         self.controller = controller
@@ -288,11 +292,11 @@ final class PageCanvasContainerView: UIView {
         var hasConfiguredPagePan = false
         while let view = ancestor {
             if let scrollView = view as? UIScrollView, scrollView !== canvasView {
-                // The nearest scroll view pans the zoomed paper with two fingers. Its parent is
-                // the fixed-height pager: one finger turns pages, never zooms or shifts the paper.
+                // Continuous PDFs have one document scroll surface, including when zoomed.
+                // Other bounded workspaces nest a two-finger paper pan inside a one-finger pager.
                 // Simulator mouse drawing still uses one contact, so that development input mode
                 // reserves it for ink. Pencil-only tests exercise the shipping navigation policy.
-                let isPagePan = logicalViewport == nil && !hasConfiguredPagePan
+                let isPagePan = !usesContinuousPDFScrolling && logicalViewport == nil && !hasConfiguredPagePan
                 let touchCount = isPagePan ? 2 : controller.navigationTouchCount
                 scrollView.panGestureRecognizer.allowedTouchTypes = allowedNavigationTouches
                 scrollView.panGestureRecognizer.minimumNumberOfTouches = touchCount
@@ -301,7 +305,7 @@ final class PageCanvasContainerView: UIView {
                     // A handout page is an infinite world. Fingers move its camera; only the
                     // page sidebar changes chapters. Keep the pager for programmatic selection.
                     if suppressesFingerPaging { scrollView.panGestureRecognizer.isEnabled = false }
-                    scrollView.isDirectionalLockEnabled = true
+                    scrollView.isDirectionalLockEnabled = !usesContinuousPDFScrolling
                     if !suppressesFingerPaging, (touchCount == 1 || logicalViewport != nil),
                        scrollView.gestureRecognizers?.contains(where: {
                            $0 is PageMultiTouchPagingGuard
@@ -400,6 +404,99 @@ private final class PageMultiTouchPagingGuard: UIGestureRecognizer {
         if shouldRestorePan {
             pager?.panGestureRecognizer.isEnabled = true
             shouldRestorePan = false
+        }
+    }
+}
+
+/// The continuous document owns one pinch recognizer. A page may become partially visible or
+/// leave the lazy stack during a zoom, so its lifecycle cannot own the document's gesture.
+struct PDFContinuousPinchBridge: UIViewRepresentable {
+    var onChanged: (CGFloat) -> Void
+    var onEnded: (CGFloat) -> Void
+    var onCancelled: () -> Void
+    var canBegin: () -> Bool
+
+    func makeUIView(context: Context) -> PinchHost {
+        let view = PinchHost()
+        view.isUserInteractionEnabled = false
+        view.onChanged = onChanged
+        view.onEnded = onEnded
+        view.onCancelled = onCancelled
+        view.canBegin = canBegin
+        return view
+    }
+
+    func updateUIView(_ view: PinchHost, context: Context) {
+        view.onChanged = onChanged
+        view.onEnded = onEnded
+        view.onCancelled = onCancelled
+        view.canBegin = canBegin
+        view.installGesture()
+    }
+
+    static func dismantleUIView(_ view: PinchHost, coordinator: ()) {
+        view.removeGesture()
+    }
+
+    final class PinchHost: UIView, UIGestureRecognizerDelegate {
+        var onChanged: ((CGFloat) -> Void)?
+        var onEnded: ((CGFloat) -> Void)?
+        var onCancelled: (() -> Void)?
+        var canBegin: (() -> Bool)?
+        private weak var gestureHost: UIView?
+        private lazy var pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            installGesture()
+            DispatchQueue.main.async { [weak self] in self?.installGesture() }
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            installGesture()
+        }
+
+        func installGesture() {
+            guard window != nil else { return }
+            var ancestor = superview
+            while let view = ancestor {
+                if let scrollView = view as? UIScrollView {
+                    guard gestureHost !== scrollView else { return }
+                    removeGesture()
+                    pinch.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
+                                               NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+                    pinch.cancelsTouchesInView = false
+                    pinch.delegate = self
+                    scrollView.addGestureRecognizer(pinch)
+                    gestureHost = scrollView
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
+
+        func removeGesture() {
+            gestureHost?.removeGestureRecognizer(pinch)
+            gestureHost = nil
+        }
+
+        @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+            switch gesture.state {
+            case .began, .changed: onChanged?(gesture.scale)
+            case .ended: onEnded?(gesture.scale)
+            case .cancelled, .failed: onCancelled?()
+            default: break
+            }
+        }
+
+        override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            canBegin?() ?? true
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
         }
     }
 }

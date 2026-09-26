@@ -42,11 +42,15 @@ struct PDFDocumentReaderView: View {
     @State private var visibleControllers: [Int: CanvasController] = [:]
     @State private var zoomScale: CGFloat = 1
     @State private var liveFingerPinchMagnification: CGFloat = 1
+    @State private var isFingerPinching = false
     @State private var canvasViewports: [String: CanvasViewport]
     @State private var initialHandoutCameraIDs: Set<String>
 
     private var isUnboundedCanvas: Bool {
         documentStore.document(withID: documentID)?.kind == .canvas
+    }
+    private var usesContinuousPDFScrolling: Bool {
+        !isUnboundedCanvas && practice == nil && documentStore.handoutWorkspace == nil
     }
     private let minimumZoomScale = CanvasViewport.minimumZoomScale
     private let maximumZoomScale = CanvasViewport.maximumZoomScale
@@ -191,7 +195,7 @@ struct PDFDocumentReaderView: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("当前缩放 \(Int((effectiveZoomScale * 100).rounded()))%，\(isUnboundedCanvas ? "点击重置缩放" : "点击恢复适页")")
+        .accessibilityLabel("当前缩放 \(Int((effectiveZoomScale * 100).rounded()))%，\(isUnboundedCanvas ? "点击重置缩放" : "点击恢复默认缩放")")
         .accessibilityIdentifier("zoom-reset")
         .padding(.trailing, 24)
         .padding(.bottom, 24)
@@ -200,7 +204,7 @@ struct PDFDocumentReaderView: View {
     private var pagesScrollView: some View {
         GeometryReader { geometry in
             Group {
-                ScrollView(.vertical, showsIndicators: false) {
+                ScrollView(usesContinuousPDFScrolling ? [.horizontal, .vertical] : .vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
                         ForEach(documentStore.pages(in: documentID)) { pageMetadata in
                             pageViewport(
@@ -212,16 +216,27 @@ struct PDFDocumentReaderView: View {
                         }
                     }
                     .scrollTargetLayout()
+                    .modifier(PDFScrollContentModifier(
+                        continuous: usesContinuousPDFScrolling, size: geometry.size,
+                        onPinchChanged: updateFingerPinch,
+                        onPinchEnded: finishFingerPinch,
+                        onPinchCancelled: cancelFingerPinch,
+                        canBeginPinch: {
+                            !visibleControllers.values.contains { $0.isUsingTool && !$0.allowsDirectDrawing }
+                        }
+                    ))
                 }
                 // SwiftUI can re-enable its pager recognizer after a sidebar/layout update.
                 // Keep the scroll policy in SwiftUI as well as the native camera bridge.
                 .scrollDisabled(practice != nil)
-                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
+                .modifier(DocumentScrollTargetModifier(continuous: usesContinuousPDFScrolling))
                 .scrollPosition(id: $visiblePageID, anchor: .top)
                 .accessibilityIdentifier("document-page-pager")
                 .accessibilityValue("\(currentPageIndex + 1) / \(documentStore.pageCount(for: documentID))")
                 .coordinateSpace(name: "pdfVerticalScroll")
-                .onPreferenceChange(PageOffsetPreferenceKey.self, perform: updateCurrentPage)
+                .onPreferenceChange(PageOffsetPreferenceKey.self) { frames in
+                    updateCurrentPage(frames, viewport: geometry.size)
+                }
                 .onChange(of: externalPageRequest) { _, pageIndex in
                     guard let pageIndex,
                           (0..<documentStore.pageCount(for: documentID)).contains(pageIndex)
@@ -232,8 +247,8 @@ struct PDFDocumentReaderView: View {
 
             }
         }
-        // Page targets use the full scroll viewport. The zoom control belongs to the outer
-        // reader, whose layout respects the home indicator and window safe area.
+        // The document extends to the bottom edge; the outer reader keeps the zoom control
+        // clear of the home indicator and window safe area.
         .ignoresSafeArea(.container, edges: .bottom)
         .clipped()
     }
@@ -244,8 +259,9 @@ struct PDFDocumentReaderView: View {
         let logicalSize = pageMetadata.handoutSourceID != nil
             ? CGSize(width: pageMetadata.width, height: pageMetadata.height)
             : documentStore.pageSize(at: pageIndex, in: documentID)
-        let fittedScale = min(
-            max(size.width - 64, 1) / max(logicalSize.width, 1),
+        let widthScale = max(size.width - 64, 1) / max(logicalSize.width, 1)
+        let fittedScale = usesContinuousPDFScrolling ? widthScale : min(
+            widthScale,
             max(size.height - 32, 1) / max(logicalSize.height, 1)
         )
         let paperSize = CGSize(
@@ -282,6 +298,7 @@ struct PDFDocumentReaderView: View {
             isScribbleEraseEnabled: isScribbleEraseEnabled,
             isAnnotationEditingEnabled: isAnnotationEditingEnabled,
             pagesNavigateFromSidebarOnly: practice != nil || documentStore.handoutWorkspace != nil,
+            usesContinuousPDFScrolling: usesContinuousPDFScrolling,
             allowsQuestionCapture: practice == nil && documentStore.handoutWorkspace == nil,
             onOpenQuestionSession: onOpenQuestionSession,
             onSelectLassoTool: onSelectLassoTool,
@@ -293,19 +310,29 @@ struct PDFDocumentReaderView: View {
                 updateCanvasViewport(change, for: pageMetadata, size: size, referenceSize: cameraSize)
             },
             onReady: registerController,
-            onRelease: unregisterController
+            onRelease: unregisterController,
+            onActivate: activateController
         )
         }
 
-        // Each paging target occupies exactly one viewport, including the space around the paper.
-        // Zoom changes only this page's inner content, so adjacent pages cannot peek into a resting
-        // viewport or move the paging boundary when their dimensions or orientations differ.
+        // PDFs share one scroll surface, so a drag crosses page boundaries even when zoomed.
+        // Canvas and practice workspaces retain their fixed viewport and camera navigation.
         return Group {
             if pageMetadata.handoutSourceID != nil, let workspace = documentStore.handoutWorkspace {
                 HandoutPageHost(workspace: workspace, pageID: pageMetadata.id) { annotatedPage($0) }
                     .id(pageMetadata.id)
             } else if isUnboundedCanvas {
                 annotatedPage()
+            } else if usesContinuousPDFScrolling {
+                annotatedPage()
+                    .frame(width: paperSize.width, height: paperSize.height)
+                    .background(Color.white)
+                    .overlay {
+                        Rectangle().stroke(Color.black.opacity(0.08), lineWidth: 0.5)
+                            .allowsHitTesting(false)
+                    }
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 8)
             } else {
                 ScrollView([.horizontal, .vertical], showsIndicators: false) {
                     annotatedPage()
@@ -345,14 +372,17 @@ struct PDFDocumentReaderView: View {
                 documentStore.saveCanvasViewport(camera, forPageID: pageMetadata.id, in: documentID)
             }
         }
-        .frame(width: size.width, height: size.height)
+        .frame(
+            width: usesContinuousPDFScrolling ? max(size.width, paperSize.width + 64) : size.width,
+            height: usesContinuousPDFScrolling ? paperSize.height + 16 : size.height
+        )
         .clipped()
         .background {
             GeometryReader { pageGeometry in
                 Color.clear.preference(
                     key: PageOffsetPreferenceKey.self,
                     value: [
-                        pageIndex: pageGeometry.frame(in: .named("pdfVerticalScroll")).minY
+                        pageIndex: pageGeometry.frame(in: .named("pdfVerticalScroll"))
                     ]
                 )
             }
@@ -380,10 +410,12 @@ struct PDFDocumentReaderView: View {
     }
 
     private func updateFingerPinch(_ magnification: CGFloat) {
+        isFingerPinching = true
         liveFingerPinchMagnification = max(magnification, 0.01)
     }
 
     private func finishFingerPinch(_ magnification: CGFloat) {
+        isFingerPinching = false
         let restingScale = clampedZoomScale(zoomScale * max(magnification, 0.01))
         withAnimation(.snappy(duration: 0.28, extraBounce: 0.08)) {
             zoomScale = restingScale
@@ -392,6 +424,7 @@ struct PDFDocumentReaderView: View {
     }
 
     private func cancelFingerPinch() {
+        isFingerPinching = false
         withAnimation(.snappy(duration: 0.24, extraBounce: 0.06)) {
             liveFingerPinchMagnification = 1
         }
@@ -449,18 +482,43 @@ struct PDFDocumentReaderView: View {
         }
     }
 
-    private func updateCurrentPage(_ offsets: [Int: CGFloat]) {
-        guard let closestPage = offsets.min(by: {
-            abs($0.value) < abs($1.value)
-        })?.key else { return }
+    private func updateCurrentPage(_ frames: [Int: CGRect], viewport: CGSize) {
+        // Changing the active page would remove the recognizer handling this very pinch.
+        guard !isFingerPinching else { return }
+        let closestPage: Int?
+        if usesContinuousPDFScrolling {
+            // A tall page may start far above the viewport and still occupy most of the screen.
+            // Comparing page tops would switch the toolbar and saved page too early.
+            let visibleRect = CGRect(origin: .zero, size: viewport)
+            closestPage = frames.filter { $0.value.intersects(visibleRect) }.max {
+                let lhs = $0.value.intersection(visibleRect).height
+                let rhs = $1.value.intersection(visibleRect).height
+                if abs(lhs - rhs) < 1 {
+                    if $0.key == currentPageIndex { return false }
+                    if $1.key == currentPageIndex { return true }
+                    return $0.key > $1.key
+                }
+                return lhs < rhs
+            }?.key
+        } else {
+            closestPage = frames.min { abs($0.value.minY) < abs($1.value.minY) }?.key
+        }
+        guard let closestPage else { return }
 
         // Geometry reports the old visible page while an animated scroll is starting. Letting
         // that transient value win immediately made "add page" jump back to the prior page, so
         // consecutive additions were inserted in reverse order. Hold the requested page until
         // the scroll actually reaches it.
         if let pendingPage = pendingProgrammaticPageIndex {
-            guard closestPage == pendingPage else { return }
-            pendingProgrammaticPageIndex = nil
+            if usesContinuousPDFScrolling, let targetFrame = frames[pendingPage],
+               targetFrame.intersects(CGRect(origin: .zero, size: viewport)) {
+                // Short final pages cannot always align to the top of the scroll surface.
+                // Once the requested page is visible, allow the next drag to update the page.
+                pendingProgrammaticPageIndex = nil
+            } else {
+                guard closestPage == pendingPage else { return }
+                pendingProgrammaticPageIndex = nil
+            }
         }
 
         if closestPage != currentPageIndex {
@@ -479,6 +537,14 @@ struct PDFDocumentReaderView: View {
         if pageIndex == currentPageIndex {
             onActiveCanvasChanged(controller, pageIndex)
         }
+    }
+
+    private func activateController(_ controller: CanvasController, for pageIndex: Int) {
+        if usesContinuousPDFScrolling {
+            currentPageIndex = pageIndex
+            documentStore.setLastViewedPage(pageIndex, for: documentID)
+        }
+        registerController(controller, for: pageIndex)
     }
 
     private func unregisterController(_ controller: CanvasController, for pageIndex: Int) {
@@ -607,6 +673,7 @@ private struct PDFPageAnnotationView: View {
     let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
     var pagesNavigateFromSidebarOnly: Bool = false
+    var usesContinuousPDFScrolling: Bool = false
     let allowsQuestionCapture: Bool
     let onOpenQuestionSession: (DocumentQuestionSession) -> Void
     let onSelectLassoTool: () -> Void
@@ -617,6 +684,7 @@ private struct PDFPageAnnotationView: View {
     let onCanvasNavigation: (CanvasNavigationChange) -> Void
     let onReady: (CanvasController, Int) -> Void
     let onRelease: (CanvasController, Int) -> Void
+    var onActivate: ((CanvasController, Int) -> Void)? = nil
 
     @StateObject private var controllerHolder = PageCanvasControllerHolder()
     @State private var drawingPersistence = PageDrawingPersistenceState()
@@ -738,6 +806,7 @@ private struct PDFPageAnnotationView: View {
                     logicalViewport: logicalViewport,
                     isCurrentPage: allowsInitialPDFRenderDuringHandwriting,
                     pagesNavigateFromSidebarOnly: pagesNavigateFromSidebarOnly,
+                    usesContinuousPDFScrolling: usesContinuousPDFScrolling,
                     isAnnotationEditingEnabled: isAnnotationEditingEnabled,
                     onFingerPinchChanged: onFingerPinchChanged,
                     onFingerPinchEnded: onFingerPinchEnded,
@@ -785,7 +854,7 @@ private struct PDFPageAnnotationView: View {
                     pageElements: $pageElements,
                     requestedSelection: $requestedSelection,
                     onBeginInteraction: {
-                        onReady(controller, pageIndex)
+                        (onActivate ?? onReady)(controller, pageIndex)
                     },
                     onPageElementsChanged: {
                         markPageElementsChanged()
@@ -1000,7 +1069,7 @@ private struct PDFPageAnnotationView: View {
                 bounds = bounds.union(element.logicalBounds)
             }
             guard !bounds.isNull else { return }
-            onReady(controller, pageIndex)
+            (onActivate ?? onReady)(controller, pageIndex)
             onSelectLassoTool()
             requestedSelection = LassoSelectionRequest(
                 content: LassoSelectionContent(strokeIndices: strokeIndices, elementIDs: elementIDs),
@@ -1043,7 +1112,7 @@ private struct PDFPageAnnotationView: View {
         }
         controller.onBecameActive = { [weak controller] in
             guard let controller else { return }
-            onReady(controller, pageIndex)
+            (onActivate ?? onReady)(controller, pageIndex)
         }
     }
 
@@ -5528,10 +5597,44 @@ private struct PageThumbnailCard: View {
     }
 }
 
-private struct PageOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: [Int: CGFloat] = [:]
+private struct PDFScrollContentModifier: ViewModifier {
+    let continuous: Bool
+    let size: CGSize
+    let onPinchChanged: (CGFloat) -> Void
+    let onPinchEnded: (CGFloat) -> Void
+    let onPinchCancelled: () -> Void
+    let canBeginPinch: () -> Bool
 
-    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+    func body(content: Content) -> some View {
+        if continuous {
+            content
+                .frame(minWidth: size.width, minHeight: size.height, alignment: .top)
+                .background {
+                    PDFContinuousPinchBridge(onChanged: onPinchChanged, onEnded: onPinchEnded,
+                                             onCancelled: onPinchCancelled, canBegin: canBeginPinch)
+                }
+        } else {
+            content
+        }
+    }
+}
+
+private struct DocumentScrollTargetModifier: ViewModifier {
+    let continuous: Bool
+
+    func body(content: Content) -> some View {
+        if continuous {
+            content
+        } else {
+            content.scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
+        }
+    }
+}
+
+private struct PageOffsetPreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, newValue in newValue })
     }
 }

@@ -2036,10 +2036,88 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
 #endif
     }
 
+    func testPDFScrollStopsBetweenPagesAndCrossesBoundaryWhileZoomed() throws {
+#if targetEnvironment(macCatalyst)
+        throw XCTSkip("This regression covers direct finger navigation on iPad")
+#else
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "pdf-continuous-scroll",
+                                    additionalLaunchArguments: ["--pencil-only-ui-test"])
+        let reader = app.scrollViews["document-page-pager"]
+        let first = app.descendants(matching: .any)["page-canvas-0"]
+        let second = app.descendants(matching: .any)["page-canvas-1"]
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        let originalTop = first.frame.minY
+
+        func dragUp(_ distance: CGFloat) {
+            let start = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.85))
+            start.press(forDuration: 0.05,
+                        thenDragTo: start.withOffset(CGVector(dx: 0, dy: -distance)),
+                        withVelocity: .slow, thenHoldForDuration: 0.35)
+        }
+
+        // Release at the boundary: both sheets must remain visible without snapping to a page.
+        dragUp(min(reader.frame.height * 0.6, first.frame.maxY + 8 - reader.frame.midY))
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        XCTAssertLessThan(first.frame.minY, originalTop - 80)
+        XCTAssertGreaterThan(first.frame.maxY, reader.frame.minY + 60)
+        XCTAssertLessThan(second.frame.minY, reader.frame.maxY - 60)
+        XCTAssertEqual(second.frame.minY - first.frame.maxY, 16, accuracy: 2)
+        let stoppedTop = first.frame.minY
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        XCTAssertEqual(first.frame.minY, stoppedTop, accuracy: 2, "PDF must stay where the finger released")
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "PDF continuous scrolling across two pages"
+        image.lifetime = .keepAlways
+        add(image)
+
+        // Zoom uses the same document scroll surface; it must not trap drags inside one page.
+        try pinchCanvas(reader, scale: 1.4, in: app)
+        waitUntil(timeout: 4) { !app.buttons["zoom-reset"].label.contains("100%") }
+        let widthAfterZoom = first.frame.width
+        XCTAssertGreaterThan(widthAfterZoom, reader.frame.width)
+        for _ in 0..<5 where !second.exists || second.frame.minY > reader.frame.midY {
+            dragUp(reader.frame.height * 0.4)
+        }
+        XCTAssertLessThan(second.frame.minY, reader.frame.midY)
+        XCTAssertEqual(second.frame.width, widthAfterZoom, accuracy: 2)
+        waitUntil(timeout: 4) { reader.value as? String == "2 / 2" }
+#endif
+    }
+
+    func testPDFVisibleSecondPageReceivesInkAndUndo() throws {
+#if targetEnvironment(macCatalyst)
+        throw XCTSkip("This regression covers iPad drawing input")
+#else
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "pdf-continuous-ink")
+        let reader = app.scrollViews["document-page-pager"]
+        let first = app.descendants(matching: .any)["page-canvas-0"]
+        let second = app.descendants(matching: .any)["page-canvas-1"]
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        try pinchCanvas(reader, scale: 0.4, in: app)
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        XCTAssertGreaterThanOrEqual(first.frame.minY, reader.frame.minY)
+        XCTAssertLessThan(second.frame.maxY, reader.frame.maxY)
+        let frame = second.frame
+        try synthesizeTouchPath([
+            CGPoint(x: frame.minX + frame.width * 0.25, y: frame.midY),
+            CGPoint(x: frame.minX + frame.width * 0.65, y: frame.midY)
+        ], on: second, in: app, holdBeforeLift: 0.04)
+        waitForValue("笔迹 1", of: second)
+        waitForValue("笔迹 0", of: first)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 0", of: second)
+        app.buttons["重做"].tap()
+        waitForValue("笔迹 1", of: second)
+#endif
+    }
+
     func testPDFCanZoomToTenPercentAndZoomBackFromTheMargins() throws {
 #if targetEnvironment(macCatalyst)
         throw XCTSkip("This regression covers direct finger navigation on iPad")
 #else
+        XCUIDevice.shared.orientation = .portrait
         let app = launchIsolatedApp(prefix: "pdf-pinch-in-page-lock",
                                     additionalLaunchArguments: ["--pencil-only-ui-test"])
         let pager = app.scrollViews["document-page-pager"]
