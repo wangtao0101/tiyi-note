@@ -75,6 +75,7 @@ struct LibraryBrowserView: View {
     @State private var nameAction: LibraryNameAction?
     @State private var draftName = ""
     @State private var moveRequest: LibraryMoveRequest?
+    @State private var copyRequest: LibraryCopyRequest?
     @State private var destructiveAction: LibraryDestructiveAction?
     @State private var showsPDFImporter = false
     @State private var importDestinationFolderID: String?
@@ -141,6 +142,19 @@ struct LibraryBrowserView: View {
                 }
             )
         }
+        .sheet(item: $copyRequest) { request in
+            LibraryCopySheet(
+                documentStore: documentStore,
+                request: request,
+                onSyncNow: onSyncNow,
+                onFinished: finishSelecting,
+                onShowDestination: { destinationID in
+                    browsingState.searchText = ""
+                    browsingState.kindFilter = .all
+                    navigate(to: destinationID)
+                }
+            )
+        }
         .sheet(isPresented: $showsCloudSyncStatus) {
             CloudSyncStatusSheet(
                 documentStore: documentStore,
@@ -173,6 +187,8 @@ struct LibraryBrowserView: View {
         } message: {
             Text(destructiveAction?.message ?? "")
         }
+        .onChange(of: browsingState.searchText) { _, _ in finishSelecting() }
+        .onChange(of: browsingState.kindFilter) { _, _ in finishSelecting() }
         .onChange(of: scope) { _, _ in
             finishSelecting()
             browsingState.searchText = ""
@@ -246,6 +262,12 @@ struct LibraryBrowserView: View {
                 LibrarySelectionBar(
                     scope: scope,
                     selectionCount: selectedFolderIDs.count + selectedDocumentIDs.count,
+                    canCopy: !selectedDocumentIDs.isEmpty && selectedFolderIDs.isEmpty && documentStore.libraryWriteAllowed,
+                    includesFolders: !selectedFolderIDs.isEmpty,
+                    onCopy: {
+                        copyRequest = LibraryCopyRequest(documentIDs: selectedDocumentIDs.sorted(),
+                            initialFolderID: folderID)
+                    },
                     onMove: {
                         presentMovePicker(
                             folderIDs: selectedFolderIDs,
@@ -371,9 +393,13 @@ struct LibraryBrowserView: View {
                 )
             case .duplicateDocument(let id):
                 Task {
-                    do { _ = try await documentStore.duplicateDocumentInBackground(id) }
-                    catch { present(error) }
+                    do {
+                        if try documentStore.requestMissingCopyAssets([id]) { await onSyncNow() }
+                        _ = try await documentStore.duplicateDocumentInBackground(id)
+                    } catch { present(error) }
                 }
+            case .copyDocument(let id):
+                copyRequest = LibraryCopyRequest(documentIDs: [id], initialFolderID: browsingState.selectedFolderID)
             case .moveFolder(let id):
                 presentMovePicker(folderIDs: [id], documentIDs: [])
             case .moveDocument(let id):
@@ -1000,6 +1026,20 @@ private struct LibraryContentPage: View {
 
                 if PlatformCapabilities.current.canManageLibrary,
                    !folders.isEmpty || !documents.isEmpty {
+                    if isSelecting {
+                        Button(allVisibleDocumentsSelected ? "取消全选" : "全选文件") {
+                            if allVisibleDocumentsSelected {
+                                selectedDocumentIDs.removeAll()
+                            } else {
+                                selectedFolderIDs.removeAll()
+                                selectedDocumentIDs = Set(documents.map(\.id))
+                            }
+                        }
+                        .font(.system(size: 14))
+                        .buttonStyle(LibraryCompactControlStyle())
+                        .disabled(documents.isEmpty)
+                        .accessibilityIdentifier("library-select-all-documents")
+                    }
                     Button {
                         isSelecting.toggle()
                         if !isSelecting {
@@ -1019,6 +1059,10 @@ private struct LibraryContentPage: View {
                 }
             }
         }
+    }
+
+    private var allVisibleDocumentsSelected: Bool {
+        !documents.isEmpty && Set(documents.map(\.id)).isSubset(of: selectedDocumentIDs)
     }
 
     private var isCompactLayout: Bool {
@@ -1503,6 +1547,9 @@ private struct LibraryDocumentListRow: View {
                 Button { onCommand(.moveDocument(document.id)) } label: {
                     Label("移动到", systemImage: "folder.badge.arrow.forward")
                 }
+                Button { onCommand(.copyDocument(document.id)) } label: {
+                    Label("复制到…", systemImage: "doc.on.doc")
+                }
                 Button { onCommand(.duplicateDocument(document.id)) } label: {
                     Label("复制", systemImage: "doc.on.doc")
                 }
@@ -1660,6 +1707,9 @@ private struct LibraryDocumentGridCard: View {
                     }
                     Button { onCommand(.moveDocument(document.id)) } label: {
                         Label("移动到", systemImage: "folder.badge.arrow.forward")
+                    }
+                    Button { onCommand(.copyDocument(document.id)) } label: {
+                        Label("复制到…", systemImage: "doc.on.doc")
                     }
                     Button { onCommand(.duplicateDocument(document.id)) } label: {
                         Label("复制", systemImage: "doc.on.doc")
@@ -1824,6 +1874,9 @@ private struct LibraryBreadcrumbs: View {
 private struct LibrarySelectionBar: View {
     let scope: LibraryScope
     let selectionCount: Int
+    let canCopy: Bool
+    let includesFolders: Bool
+    let onCopy: () -> Void
     let onMove: () -> Void
     let onTrash: () -> Void
     let onRestore: () -> Void
@@ -1831,23 +1884,33 @@ private struct LibrarySelectionBar: View {
     let onCancel: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            Text("已选 \(selectionCount) 项")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(TiyiNoteTheme.textPrimary)
-            Spacer()
-            if scope == .trash {
-                Button("恢复", action: onRestore)
-                    .disabled(selectionCount == 0)
-                Button("永久删除", role: .destructive, action: onDeletePermanently)
-                    .disabled(selectionCount == 0)
-            } else {
-                Button("移动", action: onMove)
-                    .disabled(selectionCount == 0)
-                Button("删除", role: .destructive, action: onTrash)
-                    .disabled(selectionCount == 0)
+        VStack(spacing: 6) {
+            HStack(spacing: 12) {
+                Text("已选 \(selectionCount) 项")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(TiyiNoteTheme.textPrimary)
+                Spacer()
+                if scope == .trash {
+                    Button("恢复", action: onRestore)
+                        .disabled(selectionCount == 0)
+                    Button("永久删除", role: .destructive, action: onDeletePermanently)
+                        .disabled(selectionCount == 0)
+                } else {
+                    Button("复制到…", action: onCopy)
+                        .disabled(!canCopy)
+                        .accessibilityIdentifier("library-copy-selected")
+                    Button("移动", action: onMove)
+                        .disabled(selectionCount == 0)
+                    Button("删除", role: .destructive, action: onTrash)
+                        .disabled(selectionCount == 0)
+                }
+                Button("取消", action: onCancel)
             }
-            Button("取消", action: onCancel)
+            if includesFolders && scope != .trash {
+                Text("复制仅支持文件，请取消勾选文件夹")
+                    .font(.system(size: 12))
+                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+            }
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 18)
@@ -2107,6 +2170,422 @@ private struct CanvasBackgroundPreview: View {
                 .stroke(TiyiNoteTheme.strongHairline, lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.22), radius: 10, y: 5)
+    }
+}
+
+private struct LibraryCopyRequest: Identifiable {
+    let id = UUID()
+    let documentIDs: [String]
+    let initialFolderID: String?
+}
+
+private struct LibraryCopySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var documentStore: DrawingDocumentStore
+    let request: LibraryCopyRequest
+    let onSyncNow: () async -> Void
+    let onFinished: () -> Void
+    let onShowDestination: (String?) -> Void
+
+    @State private var destinationID: String?
+    @State private var isRunning = false
+    @State private var hasRun = false
+    @State private var completed = 0
+    @State private var total = 0
+    @State private var successCount = 0
+    @State private var isDownloading = false
+    @State private var failures: [DrawingDocumentStore.DocumentCopyFailure] = []
+    @State private var showsNewFolder = false
+    @State private var newFolderName = ""
+    @State private var errorMessage: String?
+
+    init(documentStore: DrawingDocumentStore, request: LibraryCopyRequest,
+         onSyncNow: @escaping () async -> Void, onFinished: @escaping () -> Void,
+         onShowDestination: @escaping (String?) -> Void) {
+        self.documentStore = documentStore
+        self.request = request
+        self.onSyncNow = onSyncNow
+        self.onFinished = onFinished
+        self.onShowDestination = onShowDestination
+        _destinationID = State(initialValue: request.initialFolderID)
+    }
+
+    private var destinationTitle: String {
+        destinationID.map { LibraryPath.pathTitle(for: $0, folders: documentStore.folders) } ?? "文稿根目录"
+    }
+
+    private var destinationIsValid: Bool {
+        documentStore.libraryWriteAllowed && (destinationID == nil || documentStore.folders.contains {
+            $0.id == destinationID && $0.trashedAt == nil
+        })
+    }
+
+    var body: some View {
+        Group {
+#if targetEnvironment(macCatalyst)
+            compactMacBody
+                .frame(width: 560, height: 420)
+                .presentationSizing(.fitted)
+#else
+            standardBody.presentationDetents([.large])
+#endif
+        }
+        .interactiveDismissDisabled(isRunning)
+        .alert("新建文件夹", isPresented: $showsNewFolder) {
+            TextField("文件夹名称", text: $newFolderName)
+            Button("取消", role: .cancel) { }
+            Button("创建") {
+                do {
+                    destinationID = try documentStore.createFolder(named: newFolderName, in: destinationID).id
+                } catch { errorMessage = error.localizedDescription }
+            }
+            .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .alert("无法创建文件夹", isPresented: Binding(get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+        .onDisappear { if hasRun { onFinished() } }
+    }
+
+    private var standardBody: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if !hasRun {
+                    LibraryBreadcrumbs(folderID: destinationID, folders: documentStore.folders) {
+                        destinationID = $0
+                    }
+                    .padding(.horizontal, 16)
+                    .disabled(isRunning)
+                    List {
+                        if let id = destinationID {
+                            Button {
+                                destinationID = documentStore.folder(withID: id)?.parentID
+                            } label: {
+                                Label("返回上一级", systemImage: "arrow.up")
+                            }
+                        }
+                        let children = documentStore.childFolders(in: destinationID)
+                        ForEach(children) { folder in
+                            Button {
+                                destinationID = folder.id
+                            } label: {
+                                HStack {
+                                    Image(systemName: folder.icon.systemImageName)
+                                        .foregroundStyle(folder.color.swiftUIColor)
+                                    Text(folder.title).foregroundStyle(TiyiNoteTheme.textPrimary)
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .foregroundStyle(TiyiNoteTheme.textSecondary)
+                                }
+                            }
+                            .accessibilityIdentifier("copy-destination-" + folder.id)
+                        }
+                        if children.isEmpty {
+                            Text("没有子文件夹，可直接复制到此处")
+                                .foregroundStyle(TiyiNoteTheme.textSecondary)
+                        }
+                    }
+                    .disabled(isRunning)
+                } else {
+                    List {
+                        Section {
+                            Label("已复制 \(successCount) 个文件", systemImage: "doc.on.doc")
+                            Text("目标：\(destinationTitle)")
+                            if successCount > 0 {
+                                Text("本地副本已保存，云端状态请查看 iCloud 同步。")
+                                    .font(.footnote)
+                                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+                            }
+                        }
+                        if !failures.isEmpty {
+                            Section("\(failures.count) 个文件未能复制") {
+                                ForEach(failures) { failure in
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(failure.title)
+                                        Text(failure.message)
+                                            .font(.footnote)
+                                            .foregroundStyle(TiyiNoteTheme.textSecondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+            .navigationTitle("复制 \(request.documentIDs.count) 个文件到…")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(hasRun ? "完成" : "取消") {
+                        if hasRun { onFinished() }
+                        dismiss()
+                    }
+                    .disabled(isRunning)
+                }
+                if !hasRun {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("新建文件夹") {
+                            newFolderName = ""
+                            showsNewFolder = true
+                        }
+                        .disabled(isRunning || !destinationIsValid)
+                    }
+                }
+            }
+        }
+    }
+
+    // Catalyst renders the system navigation-bar material opaque black in this sheet.
+    // Keep a compact desktop header, plain rows, and fixed actions outside the scroll area.
+    private var compactMacBody: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(hasRun ? "复制结果" : "复制到文件夹")
+                        .font(.system(size: 17, weight: .semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    Text("已选择 \(request.documentIDs.count) 个文件")
+                        .font(.system(size: 12))
+                        .foregroundStyle(TiyiNoteTheme.textSecondary)
+                }
+                Spacer(minLength: 8)
+                if !hasRun {
+                    Button("新建文件夹") {
+                        newFolderName = ""
+                        showsNewFolder = true
+                    }
+                    .buttonStyle(LibraryCopyButtonStyle())
+                    .disabled(isRunning || !destinationIsValid)
+                }
+                Button {
+                    if hasRun { onFinished() }
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel(hasRun ? "完成" : "取消")
+                .keyboardShortcut(.cancelAction)
+                .disabled(isRunning)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            Divider()
+            if !hasRun {
+                LibraryBreadcrumbs(folderID: destinationID, folders: documentStore.folders) {
+                    destinationID = $0
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 4)
+                .disabled(isRunning)
+                Divider()
+            }
+            ScrollView {
+                if hasRun {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Label("已复制 \(successCount) 个文件", systemImage: "doc.on.doc")
+                            .font(.system(size: 15, weight: .semibold))
+                        if successCount > 0 {
+                            Text("本地副本已保存，云端状态请查看 iCloud 同步。")
+                                .font(.system(size: 12))
+                                .foregroundStyle(TiyiNoteTheme.textSecondary)
+                        }
+                        ForEach(failures) { failure in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(failure.title)
+                                Text(failure.message)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(20)
+                } else {
+                    LazyVStack(spacing: 0) {
+                        if let id = destinationID {
+                            Button {
+                                destinationID = documentStore.folder(withID: id)?.parentID
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "arrow.up").frame(width: 20)
+                                    Text("返回上一级")
+                                    Spacer()
+                                }
+                                .foregroundStyle(TiyiNoteTheme.textSecondary)
+                                .padding(.horizontal, 20)
+                                .frame(minHeight: 40)
+                                .contentShape(Rectangle())
+                            }
+                        }
+                        let children = documentStore.childFolders(in: destinationID)
+                        ForEach(children) { folder in
+                            Button { destinationID = folder.id } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: folder.icon.systemImageName)
+                                        .foregroundStyle(folder.color.swiftUIColor)
+                                        .frame(width: 20)
+                                    Text(folder.title).lineLimit(1)
+                                    Spacer(minLength: 8)
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(TiyiNoteTheme.textTertiary)
+                                }
+                                .padding(.horizontal, 20)
+                                .frame(minHeight: 42)
+                                .contentShape(Rectangle())
+                            }
+                            .accessibilityIdentifier("copy-destination-" + folder.id)
+                            Divider().padding(.leading, 50)
+                        }
+                        if children.isEmpty {
+                            VStack(spacing: 10) {
+                                Image(systemName: "folder")
+                                    .font(.system(size: 28, weight: .light))
+                                    .foregroundStyle(TiyiNoteTheme.textTertiary)
+                                Text("没有子文件夹，可直接复制到此处")
+                                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 36)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .disabled(isRunning)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            if isRunning || !destinationIsValid {
+                footer
+            } else {
+                HStack(spacing: 12) {
+                    Text("目标：\(destinationTitle)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(TiyiNoteTheme.textSecondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .help(destinationTitle)
+                    Spacer(minLength: 8)
+                    if hasRun {
+                        if !failures.isEmpty {
+                            Button("仅重试失败项") { startCopy(failures.map(\.id)) }
+                                .buttonStyle(LibraryCopyButtonStyle())
+                        }
+                        if successCount > 0 {
+                            Button("查看文件夹") {
+                                onFinished()
+                                onShowDestination(destinationID)
+                                dismiss()
+                            }
+                            .buttonStyle(LibraryCopyButtonStyle(isPrimary: true))
+                        }
+                    } else {
+                        Button("复制到此文件夹") { startCopy(request.documentIDs) }
+                            .buttonStyle(LibraryCopyButtonStyle(isPrimary: true))
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+            }
+        }
+        .font(.system(size: 14))
+        .foregroundStyle(TiyiNoteTheme.textPrimary)
+        .background(TiyiNoteTheme.chrome)
+        .buttonStyle(.plain)
+        .tint(TiyiNoteTheme.selectionBlue)
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if isRunning {
+                ProgressView(value: Double(completed), total: Double(max(total, 1)))
+                Text(isDownloading ? "正在下载所需文件…" : "正在复制 \(min(completed + 1, total)) / \(total)")
+                    .font(.subheadline)
+            } else if hasRun {
+                HStack {
+                    if !failures.isEmpty {
+                        Button("仅重试失败项") { startCopy(failures.map(\.id)) }
+                            .disabled(!destinationIsValid)
+                    }
+                    Spacer()
+                    if successCount > 0 {
+                        Button("查看文件夹") {
+                            onFinished()
+                            onShowDestination(destinationID)
+                            dismiss()
+                        }
+                        .disabled(!destinationIsValid)
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            } else {
+                Text("目标：\(destinationTitle)")
+                    .font(.subheadline)
+                    .foregroundStyle(TiyiNoteTheme.textSecondary)
+                    .lineLimit(2)
+                Button("复制到此文件夹") { startCopy(request.documentIDs) }
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .disabled(!destinationIsValid)
+            }
+            if !destinationIsValid {
+                Text("目标文件夹已不可用，或当前文稿库不可编辑")
+                    .font(.footnote)
+                    .foregroundStyle(TiyiNoteTheme.danger)
+            }
+        }
+        .padding(16)
+        .background(TiyiNoteTheme.chrome)
+        .tint(TiyiNoteTheme.selectionBlue)
+    }
+
+    private func startCopy(_ ids: [String]) {
+        guard !isRunning, destinationIsValid else { return }
+        isRunning = true
+        completed = 0
+        total = ids.count
+        Task { @MainActor in
+            do {
+                if try documentStore.requestMissingCopyAssets(ids) {
+                    isDownloading = true
+                    await onSyncNow()
+                    isDownloading = false
+                }
+                let result = await documentStore.copyDocumentsInBackground(ids, to: destinationID) {
+                    completed = $0
+                    total = $1
+                }
+                successCount += result.copiedIDs.count
+                failures = result.failures
+            } catch {
+                failures = ids.map { .init(id: $0, title: documentStore.document(withID: $0)?.title ?? "文件",
+                    message: error.localizedDescription) }
+            }
+            isDownloading = false
+            isRunning = false
+            hasRun = true
+        }
+    }
+}
+
+private struct LibraryCopyButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    var isPrimary = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(isPrimary ? Color.white : TiyiNoteTheme.textPrimary)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 32)
+            .background(isPrimary ? TiyiNoteTheme.selectionBlue : TiyiNoteTheme.surfaceRaised,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
     }
 }
 
@@ -2432,6 +2911,7 @@ private enum LibraryItemCommand {
     case editFolder(String)
     case renameDocument(String)
     case duplicateDocument(String)
+    case copyDocument(String)
     case moveFolder(String)
     case moveDocument(String)
     case toggleFolderFavorite(String, Bool)

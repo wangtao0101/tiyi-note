@@ -2285,10 +2285,94 @@ final class DrawingDocumentStore: ObservableObject {
         return try encoder.encode(package)
     }
 
+    struct DocumentCopyFailure: Identifiable {
+        let id: String
+        let title: String
+        let message: String
+    }
+
+    struct DocumentCopyResult {
+        var copiedIDs: [String] = []
+        var failures: [DocumentCopyFailure] = []
+    }
+
+    /// Copies sequentially to bound disk pressure. Each document commits independently, so a
+    /// retry can use only failure IDs without duplicating the successful part of the batch.
+    func copyDocumentsInBackground(
+        _ documentIDs: [String], to parentID: String?,
+        onProgress: (Int, Int) -> Void = { _, _ in }
+    ) async -> DocumentCopyResult {
+        var result = DocumentCopyResult()
+        var seen = Set<String>()
+        let ids = documentIDs.filter { seen.insert($0).inserted }
+        for (index, id) in ids.enumerated() {
+            onProgress(index, ids.count)
+            let title = document(withID: id)?.title ?? "已不可用的文件"
+            do {
+                try Task.checkCancellation()
+                let copy = try await copyDocumentInBackground(id, to: parentID)
+                result.copiedIDs.append(copy.id)
+            } catch {
+                result.failures.append(.init(id: id, title: title, message: error.localizedDescription))
+            }
+            onProgress(index + 1, ids.count)
+            await Task.yield()
+        }
+        return result
+    }
+
+    /// Registers every missing source asset, including inserted-page backgrounds. The caller
+    /// runs the existing sync pass once before copying; the copy itself rechecks completeness.
+    @discardableResult
+    func requestMissingCopyAssets(_ documentIDs: [String]) throws -> Bool {
+        var requests = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
+        var needsDownload = false
+        for id in Set(documentIDs) {
+            guard let source = documentMetadata.first(where: { $0.id == id && $0.trashedAt == nil }) else { continue }
+            let missing = try missingCopyAssets(source)
+            if !missing.isEmpty {
+                requests.formUnion(missing.map(\.id))
+                needsDownload = true
+            }
+            if fileURL(for: source).map({ !fileManager.fileExists(atPath: $0.path) }) ?? true {
+                requests.insert(source.sourceResourceID ?? source.id)
+                needsDownload = true
+            }
+        }
+        if needsDownload {
+            userDefaults.set(Array(requests), forKey: "sparse.requestedPDFs")
+            signalLocalCloudChange()
+        }
+        return needsDownload
+    }
+
+    private func missingCopyAssets(_ source: LibraryDocumentMetadata) throws -> [SparseLibraryEntry] {
+        let db = try sparseDatabase()
+        var assets = try db.entries(kind: "asset", documentID: source.id)
+        if let original = try db.entry(kind: "asset", id: source.sourceResourceID ?? source.id),
+           !assets.contains(where: { $0.id == original.id }) {
+            assets.append(original)
+        }
+        return assets.filter { $0.filePath.map { !fileManager.fileExists(atPath: $0) } ?? true }
+    }
+
     func duplicateDocumentInBackground(_ documentID: String) async throws -> PDFWorkspaceDocument {
+        guard let source = documentMetadata.first(where: { $0.id == documentID }) else {
+            throw LibraryStoreError.documentNotFound(documentID)
+        }
+        return try await copyDocumentInBackground(documentID, to: source.parentID, alwaysAddsCopySuffix: true)
+    }
+
+    func copyDocumentInBackground(
+        _ documentID: String, to parentID: String?, alwaysAddsCopySuffix: Bool = false
+    ) async throws -> PDFWorkspaceDocument {
+        try validateParentFolder(parentID)
         guard let source = documentMetadata.first(where: { $0.id == documentID }),
               source.trashedAt == nil, let sourcePDF = fileURL(for: source) else {
             throw LibraryStoreError.documentNotFound(documentID)
+        }
+        guard fileManager.fileExists(atPath: sourcePDF.path), try missingCopyAssets(source).isEmpty else {
+            throw PDFWorkspaceError.cannotAccess("文件尚未下载完整，请检查 iCloud 同步后重试")
         }
         guard flushAllPendingSaves() else { throw PDFWorkspaceError.cannotAccess("仍有批注未能保存") }
         let newID = UUID().uuidString.lowercased()
@@ -2297,7 +2381,15 @@ final class DrawingDocumentStore: ObservableObject {
         let originalPages = hasEdits ? pages(in: documentID) : []
         let allPages = hasEdits ? originalPages + deletedPages(in: documentID) : []
         let pageMap = Dictionary(uniqueKeysWithValues: allPages.map { page in
-            (page.id, page.sourcePDFPageIndex.map { Self.implicitPageID(documentID: newID, resourceID: source.sourceResourceID ?? source.id, sourceIndex: $0) } ?? UUID().uuidString.lowercased())
+            let resourceID = source.sourceResourceID ?? source.id
+            let newPageID: String
+            if let index = page.sourcePDFPageIndex,
+               page.id == Self.implicitPageID(documentID: documentID, resourceID: resourceID, sourceIndex: index) {
+                newPageID = Self.implicitPageID(documentID: newID, resourceID: source.sourceResourceID ?? newID, sourceIndex: index)
+            } else {
+                newPageID = UUID().uuidString.lowercased()
+            }
+            return (page.id, newPageID)
         })
         let originalOperations = allPages.flatMap { loadCollaborationOperations(forPageID: $0.id, in: documentID) }
             + loadCollaborationOperations(forPageID: CollaborationReservedID.documentMetadata, in: documentID)
@@ -2344,11 +2436,19 @@ final class DrawingDocumentStore: ObservableObject {
             }
         }.value
         try Task.checkCancellation()
-        try validateParentFolder(source.parentID)
+        try validateParentFolder(parentID)
+        guard documentMetadata.contains(where: { $0.id == documentID && $0.trashedAt == nil }) else {
+            throw LibraryStoreError.documentNotFound(documentID)
+        }
         let name = source.title as NSString
-        let proposed = source.kind == .pdf && name.pathExtension.lowercased() == "pdf"
+        let occupied = folders.contains { $0.parentID == parentID && $0.trashedAt == nil
+            && normalizedComparisonKey($0.title) == normalizedComparisonKey(source.title) }
+            || documentMetadata.contains { $0.parentID == parentID && $0.trashedAt == nil
+                && normalizedComparisonKey($0.title) == normalizedComparisonKey(source.title) }
+        let copyTitle = source.kind == .pdf && name.pathExtension.lowercased() == "pdf"
             ? "\(name.deletingPathExtension)_副本.\(name.pathExtension)" : "\(source.title)_副本"
-        let title = uniqueRestoredTitle(proposed, parentID: source.parentID, excludingID: newID,
+        let proposed = alwaysAddsCopySuffix || occupied ? copyTitle : source.title
+        let title = uniqueRestoredTitle(proposed, parentID: parentID, excludingID: newID,
             folders: folders, documents: documentMetadata, isDocument: true)
         let grouped = Dictionary(grouping: operations, by: \.pageID)
         let operationURLs = Set(grouped.keys).union([CollaborationReservedID.documentMetadata]).map {
@@ -2359,7 +2459,7 @@ final class DrawingDocumentStore: ObservableObject {
         do {
             for operation in operations { collaborationClock.observe(operation.stamp) }
             let stamp = collaborationClock.nextStamp()
-            let metadata = LibraryDocumentMetadata(id: newID, title: title, parentID: source.parentID,
+            let metadata = LibraryDocumentMetadata(id: newID, title: title, parentID: parentID,
                 fileName: reusesSource ? source.fileName : "\(newID).pdf", isBundled: false, sourcePageCount: source.sourcePageCount,
                 sourceResourceID: source.sourceResourceID, createdAt: stamp.createdAt,
                 modifiedAt: stamp.createdAt, contentModifiedAt: stamp.createdAt, kind: source.kind,
@@ -8483,7 +8583,9 @@ extension DrawingDocumentStore {
                 && (entry.filePath.map { !fileManager.fileExists(atPath: $0) } ?? true)
         }
         let requested = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
-        let assets = try db.entries(kind: "asset", missingFileOnly: true).filter { (requested.contains($0.id) || openDocumentIDs.contains($0.documentID))
+        let assets = try db.entries(kind: "asset").filter {
+            (requested.contains($0.id) || openDocumentIDs.contains($0.documentID))
+                && ($0.filePath.map { !fileManager.fileExists(atPath: $0) } ?? true)
         }
         return covers + assets
     }

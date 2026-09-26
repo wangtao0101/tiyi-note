@@ -4149,6 +4149,65 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(app.buttons["排序：最近修改"].waitForExistence(timeout: 3))
     }
 
+    func testLibraryBatchCopyStorePreservesContentAndHandlesFailures() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--library-smoke", "copy-only-" + UUID().uuidString]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["批量复制验证通过"].waitForExistence(timeout: 60), app.debugDescription)
+    }
+
+    func testLibraryBatchCopyPickerSelectionAndIndependentCopies() throws {
+        let app = launchIsolatedApp(prefix: "library-batch-copy")
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 8))
+        createFolder(named: "批量副本", in: app)
+        selectLibraryKind("canvas", in: app)
+        tapHittableButton("选择项目", in: app)
+        app.buttons["library-select-all-documents"].tap()
+        XCTAssertTrue(app.staticTexts["已选 2 项"].waitForExistence(timeout: 3))
+        // Select-all deliberately excludes folders, which are not supported by file copy.
+        XCTAssertTrue(app.buttons["library-copy-selected"].isEnabled)
+        app.buttons["library-select-all-documents"].tap()
+        XCTAssertFalse(app.buttons["library-copy-selected"].isEnabled)
+        app.staticTexts["UITest One"].firstMatch.tap()
+        app.staticTexts["UITest Two"].firstMatch.tap()
+        app.buttons["library-copy-selected"].tap()
+        XCTAssertTrue(app.buttons["复制到此文件夹"].waitForExistence(timeout: 3))
+        app.buttons["批量副本"].firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["没有子文件夹，可直接复制到此处"].exists)
+        let picker = XCTAttachment(screenshot: app.screenshot())
+        picker.name = "批量复制：目标文件夹"
+        picker.lifetime = .keepAlways
+        add(picker)
+        app.buttons["新建文件夹"].tap()
+        let field = app.alerts.textFields["文件夹名称"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.typeText("子目录")
+        app.alerts.buttons["创建"].tap()
+        XCTAssertTrue(app.buttons["子目录"].waitForExistence(timeout: 3))
+        app.buttons["复制到此文件夹"].tap()
+        XCTAssertTrue(app.staticTexts["已复制 2 个文件"].waitForExistence(timeout: 15))
+        app.buttons["查看文件夹"].tap()
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["UITest Two"].exists)
+        XCTAssertTrue(app.buttons["子目录"].exists)
+        tapHittableButton("选择项目", in: app)
+        app.buttons["library-select-all-documents"].tap()
+        app.buttons["library-copy-selected"].tap()
+        app.buttons["复制到此文件夹"].tap()
+        XCTAssertTrue(app.staticTexts["已复制 2 个文件"].waitForExistence(timeout: 15))
+        app.buttons["查看文件夹"].tap()
+        XCTAssertTrue(app.staticTexts["UITest One_副本"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["UITest Two_副本"].exists)
+        let copies = XCTAttachment(screenshot: app.screenshot())
+        copies.name = "批量复制：原名和同名副本"
+        copies.lifetime = .keepAlways
+        add(copies)
+        app.buttons["文稿"].tap()
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["UITest Two"].exists)
+        XCTAssertFalse(app.staticTexts["UITest One_副本"].exists)
+    }
+
     func testLibraryBatchMoveTrashRestoreAndPermanentDeleteAffectEverySelectedItem() throws {
         let app = launchIsolatedApp(prefix: "library-batch-lifecycle")
         XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 8))
@@ -4711,12 +4770,17 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
 
     private func selectLibraryScope(_ scope: String, in app: XCUIApplication) {
         app.buttons["library-filter-menu"].tap()
-        app.buttons["library-scope-\(scope)"].tap()
+        let item = app.buttons["library-scope-\(scope)"]
+        let title = ["documents": "全部文稿", "favorites": "收藏夹", "trash": "回收站"][scope]!
+        // Native menus on newer iOS versions expose their title instead of SwiftUI IDs.
+        (item.exists ? item : app.buttons[title]).tap()
     }
 
     private func selectLibraryKind(_ kind: String, in app: XCUIApplication) {
         app.buttons["library-filter-menu"].tap()
-        app.buttons["library-kind-\(kind)"].tap()
+        let item = app.buttons["library-kind-\(kind)"]
+        let title = ["all": "全部", "pdf": "PDF", "canvas": "画板"][kind]!
+        (item.exists ? item : app.buttons[title]).tap()
     }
 
     private func tapHittableButton(

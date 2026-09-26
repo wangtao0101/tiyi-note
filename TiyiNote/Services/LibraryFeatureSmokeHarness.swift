@@ -34,7 +34,7 @@ struct LibraryFeatureSmokeHarnessView: View {
         }
         .padding(32)
         .task {
-            result = LibraryFeatureSmokeHarness.run(configuration: configuration)
+            result = await LibraryFeatureSmokeHarness.run(configuration: configuration)
         }
     }
 }
@@ -53,7 +53,7 @@ private enum LibraryFeatureSmokeHarness {
         }
     }
 
-    static func run(configuration: LibraryFeatureSmokeConfiguration) -> String {
+    static func run(configuration: LibraryFeatureSmokeConfiguration) async -> String {
         let token = configuration.token
         let fileManager = FileManager.default
         let workspace = fileManager.temporaryDirectory
@@ -66,6 +66,11 @@ private enum LibraryFeatureSmokeHarness {
         defaults.removePersistentDomain(forName: defaultsName)
 
         do {
+            try await validateBatchCopy(token: token)
+            if token.hasPrefix("copy-only-") {
+                logger.info("TIYI_LIBRARY_SMOKE_PASS token=\(token, privacy: .public)")
+                return "批量复制验证通过"
+            }
             try validateHeldLineInkPreservation()
             logger.info("TIYI_HELD_LINE_INK_PASS token=\(token, privacy: .public) cases=12")
             try validateCollaborationMerge()
@@ -1290,6 +1295,118 @@ private enum LibraryFeatureSmokeHarness {
         guard !(controller.canvasView.tool is PKLassoTool),
               !controller.canvasView.drawingGestureRecognizer.isEnabled else {
             throw SmokeError.validationFailed("自定义套索未独占交互，或仍启用了系统套索")
+        }
+    }
+
+    private static func validateBatchCopy(token: String) async throws {
+        let workspace = FileManager.default.temporaryDirectory.appendingPathComponent("CopySmoke-" + token)
+        let defaultsName = "copy-smoke." + token
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            defaults.removePersistentDomain(forName: defaultsName)
+        }
+        let store = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: workspace,
+            includesBundledSamples: false)
+        let folder = try store.createFolder(named: "目标", in: nil)
+        let canvas = try store.createCanvas(named: "批注画板", in: nil,
+            backgroundStyle: .grid, backgroundColor: .ivory)
+        let ink = makeSmokeDrawing(offset: 20, color: .systemBlue)
+        store.flush(ink, forPage: 0, in: canvas.id)
+        let firstPage = store.pages(in: canvas.id)[0]
+        _ = try store.duplicatePage(firstPage.id, in: canvas.id)
+        let pdfURL = workspace.appendingPathComponent("讲义.pdf")
+        try UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 400, height: 600))
+            .writePDF(to: pdfURL) { context in
+                context.beginPage()
+                ("copy smoke" as NSString).draw(at: CGPoint(x: 20, y: 20), withAttributes: nil)
+            }
+        let pdf = try await store.importPDFsInBackground(from: [pdfURL], into: nil)[0]
+        let pdfFirst = store.pages(in: pdf.id)[0]
+        _ = try store.duplicatePage(pdfFirst.id, in: pdf.id)
+        store.flush(ink, forPage: 0, in: pdf.id)
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20)).image { context in
+            UIColor.systemRed.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        }.pngData()!
+        let element = CanvasPageElement(logicalBounds: CGRect(x: 20, y: 20, width: 60, height: 60),
+            payload: .image(PageImagePayload(pngData: png, opacity: 0.6)))
+        store.flush([element], forPage: 0, in: pdf.id)
+        let inserted = try store.insertTemplatePage(after: store.pages(in: pdf.id).last!.id, in: pdf.id,
+            style: .ruled, color: .ivory, size: CGSize(width: 400, height: 600))
+        try store.setPageBookmark(inserted.id, isBookmarked: true, in: pdf.id)
+        try store.rotatePage(inserted.id, clockwise: true, in: pdf.id)
+        var progress: [Int] = []
+        let result = await store.copyDocumentsInBackground([canvas.id, pdf.id, canvas.id, "missing"], to: folder.id) { completed, _ in
+            progress.append(completed)
+        }
+        guard result.copiedIDs.count == 2, result.failures.map(\.id) == ["missing"], progress.last == 3,
+              store.document(withID: canvas.id)?.parentID == nil,
+              store.document(withID: pdf.id)?.parentID == nil else {
+            throw SmokeError.validationFailed("批量复制去重、部分失败或原文件位置错误")
+        }
+        for (sourceID, copiedID) in zip([canvas.id, pdf.id], result.copiedIDs) {
+            let originalPages = store.pages(in: sourceID)
+            let copiedPages = store.pages(in: copiedID)
+            guard store.document(withID: copiedID)?.parentID == folder.id,
+                  store.document(withID: copiedID)?.title == store.document(withID: sourceID)?.title,
+                  copiedPages.count == originalPages.count,
+                  Set(copiedPages.map(\.id)).count == copiedPages.count,
+                  Set(copiedPages.map(\.id)).isDisjoint(with: originalPages.map(\.id)),
+                  store.loadDrawing(forPage: 0, in: copiedID).strokes.count == ink.strokes.count else {
+                throw SmokeError.validationFailed("副本页面、笔迹或独立标识错误")
+            }
+        }
+        guard store.loadPageElements(forPage: 0, in: result.copiedIDs[1]) == [element],
+              store.pages(in: result.copiedIDs[1]).last?.isBookmarked == true,
+              store.pages(in: result.copiedIDs[1]).last?.rotation == 90 else {
+            throw SmokeError.validationFailed("图片、插入页面或书签未保留")
+        }
+        let renamedCopy = try await store.copyDocumentInBackground(pdf.id, to: folder.id)
+        let thirdCopy = try await store.copyDocumentInBackground(pdf.id, to: folder.id)
+        guard renamedCopy.title == "讲义_副本.pdf", thirdCopy.title != renamedCopy.title,
+              thirdCopy.title.hasSuffix(".pdf") else {
+            throw SmokeError.validationFailed("同名副本或扩展名错误")
+        }
+        let sameFolderCopy = try await store.copyDocumentInBackground(canvas.id, to: nil)
+        guard sameFolderCopy.title == "批注画板_副本" else {
+            throw SmokeError.validationFailed("同文件夹复制未避让名称")
+        }
+        let retry = await store.copyDocumentsInBackground(result.failures.map(\.id), to: folder.id)
+        guard retry.copiedIDs.isEmpty, store.documents(in: folder.id).count == 4 else {
+            throw SmokeError.validationFailed("重试失败项重复创建了成功副本")
+        }
+        let invalidDestination = await store.copyDocumentsInBackground([pdf.id], to: "missing-folder")
+        store.setLibraryWriteAllowed(false)
+        let readOnly = await store.copyDocumentsInBackground([pdf.id], to: nil)
+        store.setLibraryWriteAllowed(true)
+        guard invalidDestination.copiedIDs.isEmpty, invalidDestination.failures.count == 1,
+              readOnly.copiedIDs.isEmpty, readOnly.failures.count == 1 else {
+            throw SmokeError.validationFailed("无效目录或只读库产生副本")
+        }
+        // Edits to the original must not change the copy's title or drawing.
+        try store.renameDocument(canvas.id, to: "原件已改名")
+        store.flush(PKDrawing(), forPage: 0, in: canvas.id)
+        guard store.document(withID: result.copiedIDs[0])?.title == "批注画板",
+              !store.loadDrawing(forPage: 0, in: result.copiedIDs[0]).strokes.isEmpty else {
+            throw SmokeError.validationFailed("修改原件影响副本")
+        }
+        let reloaded = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: workspace,
+            includesBundledSamples: false)
+        guard reloaded.documents(in: folder.id).count == 4,
+              reloaded.pages(in: result.copiedIDs[1]).count == 3 else {
+            throw SmokeError.validationFailed("副本重启后未完整恢复")
+        }
+        let missingSource = try store.createCanvas(named: "缺失资源", in: nil,
+            backgroundStyle: .blank, backgroundColor: .white)
+        try FileManager.default.removeItem(at: missingSource.fileURL)
+        guard try store.requestMissingCopyAssets([missingSource.id]) else {
+            throw SmokeError.validationFailed("未请求缺失资源")
+        }
+        let incomplete = await store.copyDocumentsInBackground([missingSource.id], to: folder.id)
+        guard incomplete.copiedIDs.isEmpty, incomplete.failures.count == 1,
+              store.documents(in: folder.id).count == 4 else {
+            throw SmokeError.validationFailed("缺失资源生成了不完整副本")
         }
     }
 
