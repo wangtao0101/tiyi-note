@@ -3,6 +3,42 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+    func testPDFTabRestoresZoomAndBothScrollAxes() throws {
+#if targetEnvironment(macCatalyst)
+        throw XCTSkip("Direct-touch PDF navigation regression")
+#else
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "pdf-tab-viewport", additionalLaunchArguments: ["--pencil-only-ui-test"])
+        let reader = app.scrollViews["document-page-pager"]
+        let page = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(page.waitForExistence(timeout: 8))
+        try pinchCanvas(reader, scale: 1.6, in: app)
+        waitUntil(timeout: 4) { !app.buttons["zoom-reset"].label.contains("100%") }
+        let start = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.65))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: -120, dy: -200)),
+                    withVelocity: .slow, thenHoldForDuration: 0.4)
+        let savedFrame = page.frame
+        let savedZoom = app.buttons["zoom-reset"].label
+        let tabs = app.scrollViews["document-tab-scroll"]
+        let other = app.buttons["document-tab-UITest One"]
+        let pdf = app.buttons["document-tab-UITest Search.pdf"]
+        for _ in 0..<2 {
+            revealDocumentTab(other, in: tabs)
+            other.tap()
+            XCTAssertEqual(other.value as? String, "active")
+            XCTAssertTrue(app.buttons["zoom-reset"].label.contains("100%"), "Another tab must retain its own zoom")
+            revealDocumentTab(pdf, in: tabs)
+            pdf.tap()
+            XCTAssertEqual(pdf.value as? String, "active")
+            waitUntil(timeout: 5) { abs(page.frame.minY - savedFrame.minY) < 4 }
+            XCTAssertEqual(app.buttons["zoom-reset"].label, savedZoom)
+            XCTAssertEqual(page.frame.width, savedFrame.width, accuracy: 3)
+            XCTAssertEqual(page.frame.minX, savedFrame.minX, accuracy: 3)
+            XCTAssertEqual(page.frame.minY, savedFrame.minY, accuracy: 3)
+        }
+#endif
+    }
+
     func testHeldInkPreservesSelectedInkStyle() throws {
         let app = launchIsolatedApp(prefix: "shape-hold-style")
         let canvas = app.descendants(matching: .any)["page-canvas-0"]

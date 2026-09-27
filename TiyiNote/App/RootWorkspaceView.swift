@@ -73,6 +73,7 @@ struct RootWorkspaceView: View {
             case .workspace:
                 CanvasScreen(
                     documentStore: documentStore,
+                    activeDocumentID: $activeDocumentID,
                     canEditActiveDocument: canEditDocument(activeDocumentID),
                     onShowLibrary: showLibrary
                 )

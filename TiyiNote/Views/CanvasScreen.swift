@@ -19,7 +19,18 @@ struct CanvasScreen: View {
     var handout: TiyiHandoutWorkspace?
     var navigation: TiyiWorkspaceNavigation?
 
-    @AppStorage("pdfWorkspace.activeDocumentID") private var activeDocumentID = "congruence"
+    @AppStorage("pdfWorkspace.activeDocumentID") private var storedActiveDocumentID = "congruence"
+    private let documentSelection: Binding<String>?
+    private var activeDocumentID: String {
+        get { documentSelection?.wrappedValue ?? storedActiveDocumentID }
+        nonmutating set {
+            if let documentSelection {
+                documentSelection.wrappedValue = newValue
+            } else {
+                storedActiveDocumentID = newValue
+            }
+        }
+    }
     @State private var interactionSession = CanvasInteractionSession()
     @State private var pendingReadOnly = false
     @State private var selectedTool = CanvasToolKind.pen
@@ -63,6 +74,7 @@ struct CanvasScreen: View {
 
     init(
         documentStore: DrawingDocumentStore,
+        activeDocumentID: Binding<String>? = nil,
         canEditActiveDocument: Bool = true,
         onShowLibrary: @escaping () -> Void = {},
         initialPageElementInsertionRequest: PageElementInsertionRequest? = nil,
@@ -71,16 +83,17 @@ struct CanvasScreen: View {
         navigation: TiyiWorkspaceNavigation? = nil
     ) {
         self.documentStore = documentStore
+        self.documentSelection = activeDocumentID
         self.canEditActiveDocument = canEditActiveDocument
         self.onShowLibrary = onShowLibrary
         self.practice = practice
         self.handout = handout
         self.navigation = navigation
         if let handout {
-            _activeDocumentID = AppStorage(wrappedValue: handout.documentID, "pdfWorkspace.activeDocumentID", store: handout.defaults)
+            _storedActiveDocumentID = AppStorage(wrappedValue: handout.documentID, "pdfWorkspace.activeDocumentID", store: handout.defaults)
         }
         if let practice {
-            _activeDocumentID = AppStorage(wrappedValue: practice.documentID, "pdfWorkspace.activeDocumentID", store: practice.defaults)
+            _storedActiveDocumentID = AppStorage(wrappedValue: practice.documentID, "pdfWorkspace.activeDocumentID", store: practice.defaults)
         }
         _pageElementInsertionRequest = State(
             initialValue: initialPageElementInsertionRequest

@@ -43,6 +43,8 @@ final class CanvasController: NSObject, ObservableObject {
 
     private var isInstallingDrawing = false
     private var strokeTransformSession: StrokeTransformSession?
+    private var strokeTransformPreview: StrokeTransformPreview?
+    private var didInstallStrokeTransformPreview = false
     private var toolInteractionOriginDrawing: PKDrawing?
     private var toolInteractionDidChangeDrawing = false
     private var toolInteractionEndWorkItem: DispatchWorkItem?
@@ -207,6 +209,7 @@ final class CanvasController: NSObject, ObservableObject {
     var strokeCount: Int { knownStrokeCount }
 
     func installInitialDrawing(_ drawing: PKDrawing) {
+        cancelStrokeTransform()
         installCanvasDrawing(drawing)
         canvasView.undoManager?.removeAllActions()
         undoActions.removeAll()
@@ -252,6 +255,7 @@ final class CanvasController: NSObject, ObservableObject {
         eraserMode: CanvasEraserMode
     ) {
         let previousToolKind = selectedToolKind
+        if kind != previousToolKind { cancelStrokeTransform() }
         selectedToolKind = kind
         eraserRadius = eraserSize.width / 2
         usesStrokeEraser = eraserMode == .stroke
@@ -351,6 +355,7 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     func undo() {
+        cancelStrokeTransform()
         guard let action = undoActions.popLast(),
               let inverse = applyHistoryAction(action) else { return }
         redoActions.append(inverse)
@@ -359,6 +364,7 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     func redo() {
+        cancelStrokeTransform()
         guard let action = redoActions.popLast(),
               let inverse = applyHistoryAction(action) else { return }
         undoActions.append(inverse)
@@ -502,15 +508,30 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     func beginTransformingStrokes(at indices: Set<Int>) {
-        guard !indices.isEmpty else { return }
+        cancelStrokeTransform()
+        let original = self.drawing
+        let validIndices = indices.filter { original.strokes.indices.contains($0) }
+        guard !validIndices.isEmpty else { return }
+        beginToolInteraction()
         strokeTransformSession = StrokeTransformSession(
-            originalDrawing: self.drawing,
-            strokeIndices: indices.sorted()
+            originalDrawing: original,
+            strokeIndices: validIndices.sorted()
         )
+        strokeTransformPreview = StrokeTransformPreview(
+            canvas: canvasView, drawing: original,
+            selectedIndices: validIndices, worldOrigin: canvasWorldOrigin
+        )
+        didInstallStrokeTransformPreview = false
     }
 
     func previewStrokeTransform(_ transform: CGAffineTransform) {
         guard let session = strokeTransformSession else { return }
+        if let strokeTransformPreview {
+            strokeTransformPreview.update(transform)
+            return
+        }
+        // Detached canvases (including model tests) have no presentation host.
+        didInstallStrokeTransformPreview = true
         installCanvasDrawing(
             drawingByTransformingStrokes(in: session, using: transform)
         )
@@ -518,24 +539,37 @@ final class CanvasController: NSObject, ObservableObject {
 
     func commitStrokeTransform(_ transform: CGAffineTransform, actionName: String) {
         guard let session = strokeTransformSession else { return }
-        let transformedDrawing = drawingByTransformingStrokes(in: session, using: transform)
-        strokeTransformSession = nil
-
-        guard transformedDrawing != session.originalDrawing else {
-            installCanvasDrawing(session.originalDrawing)
+        guard !transform.isIdentity else {
+            cancelStrokeTransform()
             return
         }
+        let transformedDrawing = drawingByTransformingStrokes(in: session, using: transform)
+        strokeTransformPreview?.update(transform)
+        strokeTransformPreview?.isWaitingForRender = true
+        strokeTransformSession = nil
         replaceDrawing(
             transformedDrawing,
             actionName: actionName,
             previousDrawing: session.originalDrawing
         )
+        didInstallStrokeTransformPreview = false
+        setToolInteractionActive(false)
     }
 
     func cancelStrokeTransform() {
+        dismissStrokeTransformPreview()
         guard let session = strokeTransformSession else { return }
         strokeTransformSession = nil
-        installCanvasDrawing(session.originalDrawing)
+        if didInstallStrokeTransformPreview {
+            installCanvasDrawing(session.originalDrawing)
+        }
+        didInstallStrokeTransformPreview = false
+        setToolInteractionActive(false)
+    }
+
+    private func dismissStrokeTransformPreview() {
+        strokeTransformPreview?.dismiss()
+        strokeTransformPreview = nil
     }
 
     private func replaceDrawing(
@@ -592,7 +626,13 @@ final class CanvasController: NSObject, ObservableObject {
 
         for (offset, index) in session.strokeIndices.enumerated()
         where strokes.indices.contains(index) && transformedStrokes.indices.contains(offset) {
-            strokes[index] = transformedStrokes[offset]
+            var stroke = transformedStrokes[offset]
+            // iPadOS 27 can reuse old visible tiles for a changed transform with the
+            // same stroke ID, even after reporting that rendering has finished.
+            // Change identity only on commit (the live drag uses a raster preview).
+            // Setting the ID preserves the native ink, path, mask and render metadata.
+            if #available(iOS 27.0, *) { stroke.id = UUID() }
+            strokes[index] = stroke
         }
         return PKDrawing(strokes: strokes)
     }
@@ -1216,6 +1256,96 @@ private enum DrawingHistoryAction {
     case restorePageContent(drawing: PKDrawing?, elements: [CanvasPageElement], replacingIDs: Set<UUID>)
 }
 
+/// Rasterize once at gesture start, then move only a CALayer for each input sample.
+/// The native drawing stays unchanged until commit, so cancellation is lossless and
+/// autosave cannot persist a partially transformed page.
+private final class StrokeTransformPreview: UIView {
+    private weak var canvas: PKCanvasView?
+    private let originalMask: CALayer?
+    private let selectedImage: UIImageView
+    private let worldCenter: CGPoint
+    private let visibleWorldRect: CGRect
+    private let zoom: CGFloat
+    var isWaitingForRender = false
+
+    init?(canvas: PKCanvasView, drawing: PKDrawing, selectedIndices: Set<Int>, worldOrigin: CGPoint) {
+        guard let host = canvas.superview, canvas.window != nil,
+              canvas.bounds.width > 0, canvas.bounds.height > 0 else { return nil }
+        let selected = PKDrawing(strokes: drawing.strokes.enumerated().compactMap {
+            selectedIndices.contains($0.offset) ? $0.element : nil
+        })
+        let selectedBounds = selected.bounds.insetBy(dx: -2, dy: -2)
+        guard !selectedBounds.isNull, !selectedBounds.isInfinite,
+              selectedBounds.width > 0, selectedBounds.height > 0 else { return nil }
+        let remainder = PKDrawing(strokes: drawing.strokes.enumerated().compactMap {
+            selectedIndices.contains($0.offset) ? nil : $0.element
+        })
+        let zoom = max(canvas.zoomScale, 0.001)
+        let viewport = CGRect(
+            x: canvas.contentOffset.x / zoom + worldOrigin.x,
+            y: canvas.contentOffset.y / zoom + worldOrigin.y,
+            width: canvas.bounds.width / zoom, height: canvas.bounds.height / zoom
+        )
+        let desiredScale = zoom * canvas.traitCollection.displayScale
+        // Very large selections must not allocate an unbounded bitmap. The complete
+        // selected bounds are retained so offscreen ink can be dragged into view.
+        func raster(_ drawing: PKDrawing, in rect: CGRect) -> UIImage {
+            let scale = min(desiredScale, 4096 / max(rect.width, rect.height),
+                            sqrt(8_000_000 / (rect.width * rect.height)))
+            return drawing.image(from: rect, scale: scale)
+        }
+        self.canvas = canvas
+        originalMask = canvas.layer.mask
+        worldCenter = selectedBounds.center
+        visibleWorldRect = viewport
+        self.zoom = zoom
+        selectedImage = UIImageView(image: raster(selected, in: selectedBounds))
+        super.init(frame: canvas.frame)
+        clipsToBounds = true
+        isUserInteractionEnabled = false
+        isOpaque = false
+        backgroundColor = .clear
+        overrideUserInterfaceStyle = .light
+        accessibilityIdentifier = "lasso-ink-preview"
+        let background = UIImageView(image: raster(remainder, in: viewport))
+        background.frame = bounds
+        addSubview(background)
+        selectedImage.bounds = CGRect(origin: .zero, size: CGSize(
+            width: selectedBounds.width * zoom, height: selectedBounds.height * zoom
+        ))
+        addSubview(selectedImage)
+        update(.identity)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        host.insertSubview(self, aboveSubview: canvas)
+        canvas.layer.mask = CALayer()
+        CATransaction.commit()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(_ transform: CGAffineTransform) {
+        let center = worldCenter.applying(transform)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        selectedImage.transform = CGAffineTransform(
+            a: transform.a, b: transform.b, c: transform.c, d: transform.d, tx: 0, ty: 0
+        )
+        selectedImage.center = CGPoint(x: (center.x - visibleWorldRect.minX) * zoom,
+                                       y: (center.y - visibleWorldRect.minY) * zoom)
+        CATransaction.commit()
+    }
+
+    func dismiss() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        canvas?.layer.mask = originalMask
+        removeFromSuperview()
+        CATransaction.commit()
+    }
+}
+
 private struct StrokeTransformSession {
     let originalDrawing: PKDrawing
     let strokeIndices: [Int]
@@ -1229,6 +1359,9 @@ private extension CGRect {
 
 extension CanvasController: PKCanvasViewDelegate {
     func canvasViewDidFinishRendering(_ canvasView: PKCanvasView) {
+        if canvasView === self.canvasView, strokeTransformPreview?.isWaitingForRender == true {
+            dismissStrokeTransformPreview()
+        }
         guard canvasView === self.canvasView, shapePreview != nil, heldShape == nil,
               !heldInkRecognizer.isTrackingContact else { return }
         discardShapePreview()
@@ -1236,6 +1369,10 @@ extension CanvasController: PKCanvasViewDelegate {
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         guard canvasView === self.canvasView, !isInstallingDrawing else { return }
+        // Lasso commits notify persistence explicitly. Their asynchronous native callbacks
+        // must not begin/end a separate handwriting transaction during the preview handoff.
+        guard strokeTransformSession == nil,
+              selectedToolKind.usesInkSettings || selectedToolKind == .eraser else { return }
 
         // A late PencilKit delegate callback may follow the post-lift straightening transaction.
         // Until the next genuine interaction or synchronized install, the snapped drawing is the

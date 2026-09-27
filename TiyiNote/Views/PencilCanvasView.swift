@@ -51,6 +51,7 @@ struct PencilCanvasView: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: PageCanvasContainerView, coordinator: Coordinator) {
+        uiView.controller.cancelStrokeTransform()
         uiView.controller.cancelHeldInkRecognition()
         coordinator.removeCanvasNavigation()
         uiView.onNavigationAncestorFound = nil

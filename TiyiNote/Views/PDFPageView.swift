@@ -3,12 +3,18 @@ import SwiftUI
 
 struct PDFPageView: UIViewRepresentable {
     let page: PDFPage?
+    var cacheIdentity: String? = nil
+    var isThumbnail = false
+    var isRenderEnabled = true
     var queuePriority: Operation.QueuePriority = .normal
     weak var drawingActivitySource: DrawingDocumentStore?
     var allowsInitialRenderDuringHandwriting = true
 
     func makeUIView(context: Context) -> PDFPageRenderView {
         let view = PDFPageRenderView()
+        view.cacheIdentity = cacheIdentity
+        view.isThumbnail = isThumbnail
+        view.isRenderEnabled = isRenderEnabled
         view.queuePriority = queuePriority
         view.allowsInitialRenderDuringHandwriting = allowsInitialRenderDuringHandwriting
         view.drawingActivitySource = drawingActivitySource
@@ -17,6 +23,9 @@ struct PDFPageView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: PDFPageRenderView, context: Context) {
+        uiView.cacheIdentity = cacheIdentity
+        uiView.isThumbnail = isThumbnail
+        uiView.isRenderEnabled = isRenderEnabled
         uiView.queuePriority = queuePriority
         uiView.allowsInitialRenderDuringHandwriting = allowsInitialRenderDuringHandwriting
         uiView.drawingActivitySource = drawingActivitySource
@@ -27,8 +36,26 @@ struct PDFPageView: UIViewRepresentable {
 /// A PDF page is static while PencilKit is drawing over it. Rendering the PDF synchronously from
 /// `draw(_:)` made every newly visible or resized page compete with PencilKit on MainActor. This
 /// view rasterizes on one background queue, caches the result, and only installs the finished image
-/// on the main thread. A size debounce also prevents pinch zoom from starting a render per frame.
+/// on the main thread. Fixed paper resolution lets resizing and zooming reuse the same raster.
 final class PDFPageRenderView: UIView {
+    var cacheIdentity: String? {
+        didSet { if oldValue != cacheIdentity { invalidateRaster() } }
+    }
+    var isThumbnail = false {
+        didSet { if oldValue != isThumbnail { invalidateRaster() } }
+    }
+    var isRenderEnabled = true {
+        didSet {
+            guard oldValue != isRenderEnabled else { return }
+            if isRenderEnabled { scheduleRender() }
+            else {
+                debounceWorkItem?.cancel(); renderOperation?.cancel()
+                scheduledRequest = nil
+                renderGeneration &+= 1
+                pendingInstallation = nil
+            }
+        }
+    }
     var queuePriority: Operation.QueuePriority = .normal
     var allowsInitialRenderDuringHandwriting = true {
         didSet {
@@ -48,27 +75,28 @@ final class PDFPageRenderView: UIView {
     var page: PDFPage? {
         didSet {
             guard oldValue !== page else { return }
-            debounceWorkItem?.cancel()
-            debounceWorkItem = nil
-            renderOperation?.cancel()
-            renderOperation = nil
-            renderGeneration &+= 1
-            renderedRequest = nil
-            scheduledRequest = nil
-            pendingInstallation = nil
-            scheduleRender()
+            // PDFPage only weakly references its document. Keep it alive while mounted,
+            // including when the store evicts other decoded page documents during scrolling.
+            pageDocument = page?.document
+            invalidateRaster()
         }
     }
 
-    private struct RenderRequest: Equatable {
-        let pageIdentity: ObjectIdentifier
-        let pointWidth: Int
-        let pointHeight: Int
-        let pixelScaleTimes100: Int
+    private var pageDocument: PDFDocument?
 
-        var cacheKey: NSString {
-            "\(pageIdentity)-\(pointWidth)x\(pointHeight)@\(pixelScaleTimes100)" as NSString
-        }
+    private func invalidateRaster() {
+        debounceWorkItem?.cancel(); debounceWorkItem = nil
+        renderOperation?.cancel(); renderOperation = nil
+        renderGeneration &+= 1
+        renderedRequest = nil; scheduledRequest = nil; pendingInstallation = nil
+        imageView.image = nil
+        scheduleRender()
+    }
+
+    private struct RenderRequest: Equatable {
+        let identity: String
+        let isThumbnail: Bool
+        var cacheKey: NSString { "\(identity)|\(isThumbnail ? "thumbnail" : "page")" as NSString }
     }
 
     private struct PendingInstallation {
@@ -80,9 +108,8 @@ final class PDFPageRenderView: UIView {
     private static let renderQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "com.tiyi.note.pdf-page-raster"
-        // PDF rasterization is visual refinement. It must always yield to PencilKit's
-        // user-interactive render path on real hardware.
-        queue.qualityOfService = .background
+        // Visible pages take priority; handwriting gates and cancellation below protect live ink.
+        queue.qualityOfService = .userInitiated
         // PDFKit shares internal document state. Serial rendering avoids lock contention while the
         // editor is also searching or inspecting page metadata on MainActor.
         queue.maxConcurrentOperationCount = 1
@@ -92,7 +119,7 @@ final class PDFPageRenderView: UIView {
     private static let imageCache: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
         cache.name = "com.tiyi.note.pdf-page-raster-cache"
-        cache.totalCostLimit = 72 * 1_024 * 1_024
+        cache.totalCostLimit = 144 * 1_024 * 1_024
         cache.countLimit = 24
         return cache
     }()
@@ -201,18 +228,14 @@ final class PDFPageRenderView: UIView {
     }
 
     private func scheduleRender() {
-        guard window != nil,
+        guard isRenderEnabled, window != nil,
               let page,
               bounds.width >= 2,
               bounds.height >= 2 else { return }
 
-        let displayScale = window?.screen.scale ?? traitCollection.displayScale
-        let renderScale = Self.cappedRenderScale(displayScale, for: bounds.size)
         let request = RenderRequest(
-            pageIdentity: ObjectIdentifier(page),
-            pointWidth: Int(bounds.width.rounded()),
-            pointHeight: Int(bounds.height.rounded()),
-            pixelScaleTimes100: Int((renderScale * 100).rounded())
+            identity: cacheIdentity ?? "transient-\(ObjectIdentifier(page))",
+            isThumbnail: isThumbnail
         )
         guard request != renderedRequest,
               request != scheduledRequest else { return }
@@ -224,6 +247,9 @@ final class PDFPageRenderView: UIView {
         scheduledRequest = request
 
         if let cached = Self.imageCache.object(forKey: request.cacheKey) {
+            if let identity = cacheIdentity {
+                DispatchQueue.global(qos: .utility).async { PDFRasterDiskCache.shared.touch(identity) }
+            }
             install(cached, for: request, generation: generation)
             return
         }
@@ -234,19 +260,22 @@ final class PDFPageRenderView: UIView {
             return
         }
 
-        let pointSize = CGSize(width: request.pointWidth, height: request.pointHeight)
+        let persistentIdentity = cacheIdentity
+        let retainedDocument = pageDocument
         let workItem = DispatchWorkItem { [weak self, page] in
             guard let self,
                   self.scheduledRequest == request,
                   generation == self.renderGeneration else { return }
             self.debounceWorkItem = nil
             let operation = BlockOperation()
-            operation.qualityOfService = .background
+            operation.qualityOfService = self.isThumbnail ? .utility : .userInitiated
             operation.queuePriority = self.queuePriority
             operation.addExecutionBlock { [weak self, weak operation, page] in
                 guard operation?.isCancelled == false else { return }
                 let image = autoreleasepool {
-                    Self.render(page: page, size: pointSize, scale: renderScale)
+                    withExtendedLifetime(retainedDocument) {
+                        Self.cachedRaster(page: page, request: request, persistentIdentity: persistentIdentity)
+                    }
                 }
                 guard operation?.isCancelled == false else { return }
                 guard let image else {
@@ -270,9 +299,8 @@ final class PDFPageRenderView: UIView {
             Self.renderQueue.addOperation(operation)
         }
         debounceWorkItem = workItem
-        // A resize can emit several layout passes. Waiting two display frames coalesces them while
-        // still presenting a first-time page almost immediately.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.035, execute: workItem)
+        // Give visible full pages a head start over newly appearing sidebar thumbnails.
+        DispatchQueue.main.asyncAfter(deadline: .now() + (isThumbnail ? 0.12 : 0), execute: workItem)
     }
 
     private func acceptRenderedImage(
@@ -317,15 +345,51 @@ final class PDFPageRenderView: UIView {
         renderOperation = nil
     }
 
-    private static func cappedRenderScale(_ displayScale: CGFloat, for size: CGSize) -> CGFloat {
-        let safeDisplayScale = max(displayScale, 1)
-        let requestedPixels = max(
-            size.width * size.height * safeDisplayScale * safeDisplayScale,
-            1
-        )
-        let maximumPixels: CGFloat = 7_000_000
-        guard requestedPixels > maximumPixels else { return safeDisplayScale }
-        return max(1, safeDisplayScale * sqrt(maximumPixels / requestedPixels))
+    /// Fixed 300-DPI paper raster (A4 ≈ 8.7 MP), independent of window size and zoom.
+    /// Oversize sheets have a 12 MP allocation ceiling; sidebar rasters use a 440px long edge.
+    static func rasterSize(for page: PDFPage, isThumbnail: Bool) -> CGSize {
+        let size = page.bounds(for: .mediaBox).size
+        guard size.width > 0, size.height > 0 else { return .zero }
+        let scale = isThumbnail ? 440 / max(size.width, size.height)
+            : min(300 / 72, sqrt(12_000_000 / (size.width * size.height)))
+        return CGSize(width: ceil(size.width * scale), height: ceil(size.height * scale))
+    }
+
+    private static func cachedRaster(page: PDFPage, request: RenderRequest, persistentIdentity: String?) -> UIImage? {
+        if let image = imageCache.object(forKey: request.cacheKey) { return image }
+        let variant: PDFRasterDiskCache.Variant = request.isThumbnail ? .thumbnail : .page
+        if let identity = persistentIdentity,
+           let data = PDFRasterDiskCache.shared.data(for: identity, variant: variant),
+           let image = UIImage(data: data) {
+            return image.preparingForDisplay() ?? image
+        }
+        guard let image = render(page: page, size: rasterSize(for: page, isThumbnail: request.isThumbnail), scale: 1) else { return nil }
+        if let identity = persistentIdentity, let data = image.jpegData(compressionQuality: 0.92) {
+            PDFRasterDiskCache.shared.store(data, for: identity, variant: variant)
+        }
+        return image
+    }
+
+    /// Prefetch only immediate neighbours; cancellation removes work when the reading target changes.
+    static func prefetch(page: PDFPage, identity: String) -> Operation {
+        let operation = BlockOperation()
+        operation.qualityOfService = .utility
+        operation.queuePriority = .veryLow
+        let request = RenderRequest(identity: identity, isThumbnail: false)
+        let retainedDocument = page.document
+        operation.addExecutionBlock { [weak operation] in
+            guard operation?.isCancelled == false else { return }
+            autoreleasepool {
+                let image = withExtendedLifetime(retainedDocument) {
+                    cachedRaster(page: page, request: request, persistentIdentity: identity)
+                }
+                guard let image else { return }
+                imageCache.setObject(image, forKey: request.cacheKey,
+                    cost: (image.cgImage?.bytesPerRow ?? 0) * (image.cgImage?.height ?? 0))
+            }
+        }
+        renderQueue.addOperation(operation)
+        return operation
     }
 
     private static func render(page: PDFPage, size: CGSize, scale: CGFloat) -> UIImage? {

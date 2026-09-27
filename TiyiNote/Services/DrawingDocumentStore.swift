@@ -894,7 +894,7 @@ final class DrawingDocumentStore: ObservableObject {
     func deletedPages(in documentID: String) -> [LibraryPage] {
         let activePageIDs = Set(pages(in: documentID).map(\.id))
         let grouped = Dictionary(
-            grouping: ((try? sparseDatabase().entries(kind: "operation", documentID: documentID)) ?? []).compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }.filter {
+            grouping: ((try? sparseDatabase().entries(documentID: documentID, pageLifecycleOnly: true)) ?? []).compactMap { try? JSONDecoder().decode(CollaborationOperation.self, from: $0.payload) }.filter {
                 $0.documentID == documentID
                     && $0.pageID != CollaborationReservedID.documentMetadata
                     && !activePageIDs.contains($0.pageID)
@@ -2132,6 +2132,23 @@ final class DrawingDocumentStore: ObservableObject {
         return holder.page(at: 0)
     }
 
+    /// Stable across process launches and page reordering; ink is composited separately.
+    func pdfRasterIdentity(at index: Int, in documentID: String) -> String? {
+        guard let page = pageMetadata(at: index, in: documentID) else { return nil }
+        let source = page.sourcePDFPageIndex != nil ? document(withID: documentID)?.fileURL
+            : pageBackgroundURL(forPageID: page.id, in: documentID)
+        let attributes = source.flatMap { try? fileManager.attributesOfItem(atPath: $0.path) }
+        let resourceID = documentMetadata.first { $0.id == documentID }?.sourceResourceID ?? documentID
+        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+        let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        // Keep the account/library namespace, but exclude the replaceable app container UUID.
+        let workspacePath = workspaceDirectory.standardizedFileURL.path
+        let namespace = workspacePath.range(of: "/Library/Application Support/").map {
+            String(workspacePath[$0.upperBound...])
+        } ?? workspacePath
+        return "pdf-raster-v1|\(namespace)|\(documentID)|\(resourceID)|\(sparsePageVisualKey(page))|\(size)|\(modified)"
+    }
+
     func page(at index: Int, in documentID: String) -> PDFPage? {
         guard let metadata = pageMetadata(at: index, in: documentID) else { return nil }
         return resolvedPage(metadata)
@@ -3199,6 +3216,22 @@ final class DrawingDocumentStore: ObservableObject {
 
     func hasSavedCanvasViewport(forPageID pageID: String, in documentID: String) -> Bool {
         userDefaults.data(forKey: "canvas.viewport.v1.\(documentID).\(pageID)") != nil
+    }
+
+    func pdfReadingViewport(for documentID: String) -> PDFReadingViewport? {
+        guard let data = userDefaults.data(forKey: "pdf.readingViewport.v1.\(documentID)"),
+              var viewport = try? JSONDecoder().decode(PDFReadingViewport.self, from: data),
+              viewport.zoomScale.isFinite, viewport.contentOffset.x.isFinite,
+              viewport.contentOffset.y.isFinite else { return nil }
+        viewport.zoomScale = min(max(viewport.zoomScale, CanvasViewport.minimumZoomScale), CanvasViewport.maximumZoomScale)
+        return viewport
+    }
+
+    func savePDFReadingViewport(_ viewport: PDFReadingViewport, for documentID: String) {
+        guard viewport.zoomScale.isFinite, viewport.contentOffset.x.isFinite,
+              viewport.contentOffset.y.isFinite,
+              let data = try? JSONEncoder().encode(viewport) else { return }
+        userDefaults.set(data, forKey: "pdf.readingViewport.v1.\(documentID)")
     }
 
     func canvasViewport(forPageID pageID: String, in documentID: String, referenceSize: CGSize) -> CanvasViewport {

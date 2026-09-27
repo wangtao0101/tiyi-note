@@ -1,6 +1,12 @@
 import SwiftUI
 import UIKit
 
+/// Device-local PDF reading position, independent for each document tab.
+struct PDFReadingViewport: Codable, Equatable {
+    var zoomScale: CGFloat
+    var contentOffset: CGPoint
+}
+
 /// A camera over stable document coordinates. Moving or zooming never transforms the drawing.
 struct CanvasViewport: Codable, Equatable {
     static let minimumZoomScale: CGFloat = 0.1

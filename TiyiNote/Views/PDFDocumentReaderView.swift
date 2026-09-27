@@ -36,11 +36,15 @@ struct PDFDocumentReaderView: View {
     let onSelectTextTool: () -> Void
     let onActiveCanvasChanged: (CanvasController, Int) -> Void
 
+    @State private var visiblePDFPageIndices: Set<Int> = []
+    @State private var pdfPrefetchOperations: [Operation] = []
     @State private var currentPageIndex: Int
     @State private var visiblePageID: String?
     @State private var pendingProgrammaticPageIndex: Int?
     @State private var visibleControllers: [Int: CanvasController] = [:]
     @State private var zoomScale: CGFloat = 1
+    @State private var pdfScrollPosition: ScrollPosition
+    @State private var readingPosition: PDFReadingPosition
     @State private var liveFingerPinchMagnification: CGFloat = 1
     @State private var isFingerPinching = false
     @State private var canvasViewports: [String: CanvasViewport]
@@ -96,6 +100,16 @@ struct PDFDocumentReaderView: View {
         self.onSelectLassoTool = onSelectLassoTool
         self.onSelectTextTool = onSelectTextTool
         self.onActiveCanvasChanged = onActiveCanvasChanged
+        let savedViewport = documentStore.pdfReadingViewport(for: documentID)
+        _zoomScale = State(initialValue: savedViewport?.zoomScale ?? 1)
+        _readingPosition = State(initialValue: PDFReadingPosition(offset: savedViewport?.contentOffset ?? .zero))
+        if let savedViewport {
+            _pdfScrollPosition = State(initialValue: ScrollPosition(idType: String.self, point: savedViewport.contentOffset))
+        } else if let pageID = documentStore.pageID(at: initialPageIndex, in: documentID) {
+            _pdfScrollPosition = State(initialValue: ScrollPosition(id: pageID, anchor: .top))
+        } else {
+            _pdfScrollPosition = State(initialValue: ScrollPosition(idType: String.self))
+        }
         // Initial layout briefly reports page zero before scrollPosition restores its target.
         // Treat restoration like a page jump so that geometry cannot overwrite the saved page.
         _pendingProgrammaticPageIndex = State(initialValue: initialPageIndex > 0 ? initialPageIndex : nil)
@@ -155,6 +169,33 @@ struct PDFDocumentReaderView: View {
         }
         .background(TiyiNoteTheme.documentWorkspace)
         .overlay(alignment: .bottomTrailing) { zoomResetControl }
+        .task(id: "\(documentID)|\(currentPageIndex)|\(documentStore.isDrawingInteractionActive)") {
+            cancelPDFPrefetch()
+            guard !isUnboundedCanvas, !documentStore.isDrawingInteractionActive else { return }
+            do { try await Task.sleep(for: .milliseconds(650)) } catch { return }
+            guard !Task.isCancelled else { return }
+            let count = documentStore.pageCount(for: documentID)
+            for index in [currentPageIndex + 1, currentPageIndex - 1] where index >= 0 && index < count {
+                guard !visiblePDFPageIndices.contains(index),
+                      let identity = documentStore.pdfRasterIdentity(at: index, in: documentID),
+                      let page = documentStore.page(at: index, in: documentID) else { continue }
+                pdfPrefetchOperations.append(PDFPageRenderView.prefetch(page: page, identity: identity))
+            }
+        }
+        .onDisappear {
+            cancelPDFPrefetch()
+            if usesContinuousPDFScrolling {
+                documentStore.savePDFReadingViewport(
+                    PDFReadingViewport(zoomScale: effectiveZoomScale, contentOffset: readingPosition.offset),
+                    for: documentID
+                )
+            }
+        }
+    }
+
+    private func cancelPDFPrefetch() {
+        pdfPrefetchOperations.forEach { $0.cancel() }
+        pdfPrefetchOperations.removeAll()
     }
 
     private var effectiveZoomScale: CGFloat {
@@ -230,7 +271,14 @@ struct PDFDocumentReaderView: View {
                 // Keep the scroll policy in SwiftUI as well as the native camera bridge.
                 .scrollDisabled(practice != nil)
                 .modifier(DocumentScrollTargetModifier(continuous: usesContinuousPDFScrolling))
-                .scrollPosition(id: $visiblePageID, anchor: .top)
+                .modifier(DocumentScrollPositionModifier(continuous: usesContinuousPDFScrolling,
+                    position: $pdfScrollPosition, pageID: $visiblePageID))
+                .onScrollGeometryChange(for: CGPoint.self) { geometry in
+                    geometry.contentOffset
+                } action: { _, offset in
+                    // Plain reference storage avoids invalidating the entire reader per scroll frame.
+                    if usesContinuousPDFScrolling { readingPosition.offset = offset }
+                }
                 .accessibilityIdentifier("document-page-pager")
                 .accessibilityValue("\(currentPageIndex + 1) / \(documentStore.pageCount(for: documentID))")
                 .coordinateSpace(name: "pdfVerticalScroll")
@@ -286,6 +334,7 @@ struct PDFDocumentReaderView: View {
             searchHighlight: searchHighlight?.documentID == documentID
                 && searchHighlight?.pageIndex == pageIndex ? searchHighlight : nil,
             allowsInitialPDFRenderDuringHandwriting: pageIndex == currentPageIndex,
+            isPDFRenderEnabled: pageIndex == currentPageIndex || visiblePDFPageIndices.contains(pageIndex),
             logicalPageSize: logicalSize,
             logicalViewport: viewport,
             canvasBackground: isUnboundedCanvas ? pageMetadata : nil,
@@ -469,7 +518,11 @@ struct PDFDocumentReaderView: View {
         currentPageIndex = pageIndex
         pendingProgrammaticPageIndex = pageIndex
         documentStore.setLastViewedPage(pageIndex, for: documentID)
-        if documentStore.handoutWorkspace != nil {
+        if usesContinuousPDFScrolling {
+            withAnimation(.easeInOut(duration: 0.28)) {
+                pdfScrollPosition.scrollTo(id: pageID, anchor: .top)
+            }
+        } else if documentStore.handoutWorkspace != nil {
             // A chapter jump must not animate through and mount every intervening WebView.
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
@@ -483,6 +536,8 @@ struct PDFDocumentReaderView: View {
     }
 
     private func updateCurrentPage(_ frames: [Int: CGRect], viewport: CGSize) {
+        let visible = Set(frames.filter { $0.value.intersects(CGRect(origin: .zero, size: viewport)) }.keys)
+        if visible != visiblePDFPageIndices { visiblePDFPageIndices = visible }
         // Changing the active page would remove the recognizer handling this very pinch.
         guard !isFingerPinching else { return }
         let closestPage: Int?
@@ -661,6 +716,7 @@ private struct PDFPageAnnotationView: View {
     @Binding var pageElementInsertionRequest: PageElementInsertionRequest?
     let searchHighlight: PDFSearchHighlight?
     let allowsInitialPDFRenderDuringHandwriting: Bool
+    var isPDFRenderEnabled = true
     let logicalPageSize: CGSize
     let logicalViewport: CGRect?
     let canvasBackground: LibraryPage?
@@ -745,6 +801,8 @@ private struct PDFPageAnnotationView: View {
                         let bounds = displayRect(for: CGRect(origin: .zero, size: logicalPageSize), in: geometry.size)
                         PDFPageView(
                             page: documentStore.page(at: resolvedPageIndex, in: documentID),
+                            cacheIdentity: documentStore.pdfRasterIdentity(at: resolvedPageIndex, in: documentID),
+                            isRenderEnabled: isPDFRenderEnabled,
                             drawingActivitySource: documentStore,
                             allowsInitialRenderDuringHandwriting: allowsInitialPDFRenderDuringHandwriting
                         )
@@ -754,6 +812,8 @@ private struct PDFPageAnnotationView: View {
                 } else {
                     PDFPageView(
                         page: documentStore.page(at: resolvedPageIndex, in: documentID),
+                        cacheIdentity: documentStore.pdfRasterIdentity(at: resolvedPageIndex, in: documentID),
+                        isRenderEnabled: isPDFRenderEnabled,
                         drawingActivitySource: documentStore,
                         allowsInitialRenderDuringHandwriting: allowsInitialPDFRenderDuringHandwriting
                     )
@@ -5121,6 +5181,7 @@ private struct PageThumbnailSidebar: View {
                                 ? nil
                                 : documentStore.page(at: pageIndex, in: documentID),
                             drawingActivitySource: documentStore,
+                            cacheIdentity: documentStore.pdfRasterIdentity(at: pageIndex, in: documentID),
                             pageIndex: pageIndex,
                             isCurrent: filter != .deleted && pageIndex == currentPageIndex,
                             isSelected: selectedPageIDs.contains(page.id),
@@ -5203,7 +5264,9 @@ private struct PageThumbnailSidebar: View {
         } message: {
             Text(errorMessage ?? "未知错误")
         }
-        .onChange(of: (orderedPages + deletedPages).map(\.id)) { _, pageIDs in
+        // Selection only belongs to the current filter. Avoid querying the recycle bin on every
+        // scroll/zoom update while the user is browsing normal pages.
+        .onChange(of: visiblePages.map(\.id)) { _, pageIDs in
             selectedPageIDs.formIntersection(pageIDs)
         }
         .onChange(of: isEditingEnabled) { _, enabled in
@@ -5476,6 +5539,8 @@ private struct PageThumbnailCard: View {
     let image: UIImage?
     let pdfPage: PDFPage?
     let drawingActivitySource: DrawingDocumentStore?
+    var cacheIdentity: String? = nil
+    @State private var isVisible = false
     let pageIndex: Int
     let isCurrent: Bool
     let isSelected: Bool
@@ -5508,6 +5573,9 @@ private struct PageThumbnailCard: View {
                         // page. PDFKit no longer blocks MainActor while the sidebar is visible.
                         PDFPageView(
                             page: pdfPage,
+                            cacheIdentity: cacheIdentity,
+                            isThumbnail: true,
+                            isRenderEnabled: isVisible,
                             queuePriority: .low,
                             drawingActivitySource: drawingActivitySource,
                             allowsInitialRenderDuringHandwriting: false
@@ -5581,6 +5649,8 @@ private struct PageThumbnailCard: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("第 \(pageIndex + 1) 页")
+        .onScrollVisibilityChange(threshold: 0.01) { isVisible = $0 }
+        .onDisappear { isVisible = false }
         .accessibilityIdentifier("page-thumbnail-\(pageIndex)")
         .accessibilityValue(
             [
@@ -5594,6 +5664,25 @@ private struct PageThumbnailCard: View {
             .joined(separator: ",")
         )
         .accessibilityAddTraits(isCurrent || isSelected ? .isSelected : [])
+    }
+}
+
+private final class PDFReadingPosition {
+    var offset: CGPoint
+    init(offset: CGPoint) { self.offset = offset }
+}
+
+private struct DocumentScrollPositionModifier: ViewModifier {
+    let continuous: Bool
+    @Binding var position: ScrollPosition
+    @Binding var pageID: String?
+
+    func body(content: Content) -> some View {
+        if continuous {
+            content.scrollPosition($position)
+        } else {
+            content.scrollPosition(id: $pageID, anchor: .top)
+        }
     }
 }
 

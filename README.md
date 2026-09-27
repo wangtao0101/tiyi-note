@@ -180,3 +180,21 @@ iCloud 账号验收：接受邀请、shared database 自动挂载、两端离线
 恢复、读写降级为只读、撤销参与者、停止共享，以及 Release 推送的后台延迟。
 
 Mac、iPhone 模拟器和 iPad 模拟器的 iCloud 登录互不继承；要做三端 UI 验收，必须分别在每台模拟器的“设置”中登录同一个测试账户。Apple Developer 账号只负责签名和 CloudKit Console，不能代替设备上的测试 iCloud 账户。
+
+
+## PDF 页面缓存
+
+正文按固定 300 DPI 栅格化（超大纸张最多 1200 万像素），侧栏使用长边 440 像素的缩略图。普通缩放与窗口调整复用已有图片；笔迹仍由独立图层显示。缓存按文档、稳定页 ID、原文件版本及旋转/背景属性区分，改名与页面重排可继续复用。
+
+本机 `Library/Caches/TiyiPDFRasters-v1` 保存 JPEG 缓存，不参与 iCloud 同步。正文和缩略图按同一页版本计数，最多 1000 页、总计 2 GB；超限时淘汰最久未访问的页。正文内存缓存最多 144 MiB、24 张图片。
+
+阅读器仅渲染当前可见页，停留 650 ms 后低优先级预读前后各一页；切页或书写时取消待处理的预读。侧栏仅为可见缩略图提交渲染。首次打开仍需生成未缓存的页面。
+
+磁盘缓存回归检查：
+
+```sh
+swiftc TiyiNote/Services/PDFRasterDiskCache.swift Tests/PDFRasterDiskCacheChecks.swift -o /tmp/tiyi-pdf-cache-checks
+/tmp/tiyi-pdf-cache-checks
+```
+
+渲染与页面身份回归测试位于 `tiyi-ios/TiyiChatTests/HandoutTests.swift` 的 `PDFRasterRenderingTests` 和 `ImmutablePDFTests`，在 iOS 模拟器运行。
