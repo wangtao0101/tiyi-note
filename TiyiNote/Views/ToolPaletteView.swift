@@ -823,7 +823,7 @@ struct DockableToolPaletteView: View {
     }
 
     private var widthPresets: [Double] {
-        [0.7, 2.2, 5]
+        selectedPenVariant == .pen ? [0.5, 2.2, 5] : [0.7, 2.2, 5]
     }
 
     private func widthPresetTitle(at index: Int) -> String {

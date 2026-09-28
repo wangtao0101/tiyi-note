@@ -36,7 +36,7 @@ struct CanvasScreen: View {
     @State private var selectedTool = CanvasToolKind.pen
     @AppStorage("canvas.penVariant") private var selectedPenVariant = CanvasToolKind.pen
     @AppStorage("canvas.color") private var selectedColor = InkPaletteColor.graphite
-    @AppStorage("canvas.penWidth.v2") private var penWidth = 0.7
+    @AppStorage("canvas.penWidth.v2") private var penWidth = 0.5
     @AppStorage("canvas.markerWidth") private var markerWidth = 16.0
     @AppStorage("canvas.eraserSize") private var eraserSize = CanvasEraserSize.medium
     @AppStorage("canvas.eraserMode") private var eraserMode = CanvasEraserMode.precision
@@ -442,6 +442,7 @@ struct CanvasScreen: View {
         .onChange(of: selectedTool) { _, tool in
             if tool.isPenVariant {
                 selectedPenVariant = tool
+                restoreFinePenWidth(for: tool)
             }
             guard tool != .text,
                   let request = pageElementInsertionRequest,
@@ -556,8 +557,18 @@ struct CanvasScreen: View {
             selectedPenVariant = .pen
             selectedTool = .pen
         }
+        restoreFinePenWidth(for: selectedTool)
         if !documentStore.openDocumentIDs.contains(activeDocumentID) {
             activeDocumentID = documentStore.openDocuments.first?.id ?? ""
+        }
+    }
+
+    private func restoreFinePenWidth(for tool: CanvasToolKind) {
+        // Migrate the old fine ballpoint setting and keep the fine preset selected when
+        // switching between pen variants, which share the stored width.
+        let previousFineWidth = tool == .pen ? 0.7 : 0.5
+        if abs(penWidth - previousFineWidth) < 0.05 {
+            penWidth = tool == .pen ? 0.5 : 0.7
         }
     }
 
