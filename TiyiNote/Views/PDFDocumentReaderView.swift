@@ -3002,6 +3002,30 @@ private extension UIColor {
     }
 }
 
+/// The course notebook uses the document's ink selection and history implementation.
+struct CourseInkSelectionOverlay: View {
+    let controller: CanvasController
+    let page: PDFPage?
+    let logicalPageSize: CGSize
+    let logicalViewport: CGRect
+    let background: LibraryPage
+    let isActive: Bool
+    let onNavigation: (CanvasNavigationChange) -> Void
+
+    var body: some View {
+        LassoSelectionOverlay(
+            controller: controller, page: page, logicalPageSize: logicalPageSize,
+            logicalViewport: logicalViewport, canvasBackground: background,
+            isActive: isActive, allowsLassoCreation: true, isEditingText: false,
+            pageElements: .constant([]), requestedSelection: .constant(nil),
+            onBeginInteraction: {}, onPageElementsChanged: {}, onInsertTextElement: { _ in },
+            onSelectTextTool: {}, onEditTextElement: { _ in }, onCropImageElement: { _ in },
+            onEditShapeElement: { _ in }, onOpenQuestion: { _ in }, onAskAssistant: { _, _ in },
+            allowsAssistant: false, onCanvasNavigation: onNavigation)
+            .onDisappear { controller.cancelStrokeTransform() }
+    }
+}
+
 private struct LassoSelectionContent {
     var strokeIndices: Set<Int> = []
     var elementIDs: Set<UUID> = []
@@ -3038,6 +3062,8 @@ private struct LassoSelectionOverlay: View {
     let onEditShapeElement: (UUID) -> Void
     let onOpenQuestion: (CanvasPageElement) -> Void
     let onAskAssistant: (Data, CGRect) -> Void
+    var allowsAssistant = true
+    var onCanvasNavigation: ((CanvasNavigationChange) -> Void)? = nil
 
     @State private var assistantSelectionBounds: CGRect?
     @State private var liveLassoPath: [CGPoint] = []
@@ -3081,7 +3107,9 @@ private struct LassoSelectionOverlay: View {
                             // active tool. Reusing the single-tap path keeps repeated
                             // taps deterministic: lasso always selects, text always edits.
                             handleTap(at: point, displaySize: geometry.size)
-                        }
+                        },
+                        onCanvasNavigation: onCanvasNavigation,
+                        navigationTouchCount: controller.navigationTouchCount
                     )
 
                     if allowsLassoCreation {
@@ -3099,7 +3127,7 @@ private struct LassoSelectionOverlay: View {
                             canOpenQuestion: selectedQuestionElement != nil,
                             showsObjectActions: !selectionContainsQuestionElement && !selection.content.isEmpty,
                             onOpenQuestion: { if let element = selectedQuestionElement { onOpenQuestion(element) } },
-                            onAskAssistant: assistantIntegration == nil || selectionContainsQuestionElement ? nil : {
+                            onAskAssistant: !allowsAssistant || assistantIntegration == nil || selectionContainsQuestionElement ? nil : {
                                 guard let page, let image = LassoSnapshotRenderer.render(page: page,
                                     drawing: controller.drawing, pageElements: pageElements,
                                     cropRect: (assistantSelectionBounds ?? selection.axisAlignedBounds).insetBy(dx: -4, dy: -4),
@@ -4646,6 +4674,8 @@ struct LassoInputView: UIViewRepresentable {
     let onEnded: (CGPoint) -> Void
     let onTap: (CGPoint) -> Void
     let onDoubleTap: (CGPoint) -> Void
+    var onCanvasNavigation: ((CanvasNavigationChange) -> Void)? = nil
+    var navigationTouchCount = 2
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -4707,6 +4737,22 @@ struct LassoInputView: UIViewRepresentable {
         view.lassoGestureRecognizer = lassoGesture
         view.addGestureRecognizer(doubleTapGesture)
         view.addGestureRecognizer(tapGesture)
+        if onCanvasNavigation != nil {
+            // Embedded notebooks have no ancestor scroll view to supply navigation.
+            view.confinesNavigation = true
+            let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleNavigationPan(_:)))
+            pan.minimumNumberOfTouches = navigationTouchCount
+            pan.maximumNumberOfTouches = 2
+            pan.allowedScrollTypesMask = .all
+            pan.require(toFail: lassoGesture)
+            let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleNavigationPinch(_:)))
+            for gesture in [pan, pinch] as [UIGestureRecognizer] {
+                gesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
+                                            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+                gesture.delegate = context.coordinator
+                view.addGestureRecognizer(gesture)
+            }
+        }
         return view
     }
 
@@ -4719,6 +4765,23 @@ struct LassoInputView: UIViewRepresentable {
 
         init(parent: LassoInputView) {
             self.parent = parent
+        }
+
+        @objc func handleNavigationPan(_ gesture: UIPanGestureRecognizer) {
+            if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
+                let delta = gesture.translation(in: gesture.view)
+                gesture.setTranslation(.zero, in: gesture.view)
+                parent.onCanvasNavigation?(.pan(delta))
+            }
+            if gesture.state == .ended || gesture.state == .cancelled { parent.onCanvasNavigation?(.finished) }
+        }
+
+        @objc func handleNavigationPinch(_ gesture: UIPinchGestureRecognizer) {
+            if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
+                parent.onCanvasNavigation?(.zoom(gesture.scale, anchor: gesture.location(in: gesture.view)))
+                gesture.scale = 1
+            }
+            if gesture.state == .ended || gesture.state == .cancelled { parent.onCanvasNavigation?(.finished) }
         }
 
         @objc func handleLassoGesture(_ gesture: UIPanGestureRecognizer) {
@@ -4766,11 +4829,12 @@ struct LassoInputView: UIViewRepresentable {
 
 private final class LassoInputContainerView: UIView {
     weak var lassoGestureRecognizer: UIGestureRecognizer?
+    var confinesNavigation = false
     private weak var coordinatedScrollView: UIScrollView?
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        guard window != nil,
+        guard window != nil, !confinesNavigation,
               coordinatedScrollView == nil,
               let lassoGestureRecognizer else { return }
 

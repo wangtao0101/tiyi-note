@@ -662,6 +662,9 @@ struct DockableToolPaletteView: View {
     @Binding var dockProgress: Double
 
     var leadingContentInset: CGFloat = 0
+    // Embedded workspaces can supply a smaller command set while sharing the document dock.
+    var commands: AnyView? = nil
+    var commandCount = 7
 
     @GestureState private var dragTranslation = CGSize.zero
     @State private var measuredPaletteSize = CGSize(width: 48, height: 330)
@@ -711,6 +714,15 @@ struct DockableToolPaletteView: View {
             : AnyLayout(VStackLayout(spacing: 4))
 
         return layout {
+            if let commands {
+                let available = (dockEdge.isHorizontal ? containerSize.width - leadingContentInset : containerSize.height) - 84
+                let length = min(CGFloat(commandCount * 42 - 4), max(38, available))
+                ScrollView(dockEdge.isHorizontal ? .horizontal : .vertical, showsIndicators: false) {
+                    layout { commands }
+                }
+                .frame(width: dockEdge.isHorizontal ? length : 38,
+                       height: dockEdge.isHorizontal ? 38 : length)
+            } else {
             ToolContextBadge(tool: selectedTool)
 
             if selectedTool.usesInkSettings {
@@ -793,6 +805,7 @@ struct DockableToolPaletteView: View {
                 DockPaletteColorMenu(selection: $selectedColor)
             }
 
+            }
             DockPaletteDivider(isHorizontalPalette: dockEdge.isHorizontal)
             PaletteDragHandle()
                 .highPriorityGesture(
@@ -805,6 +818,14 @@ struct DockableToolPaletteView: View {
                 .tint(Color.black.opacity(0.48)),
             in: RoundedRectangle(cornerRadius: 15, style: .continuous)
         )
+        .background {
+            if commands != nil {
+                // The embedded AVKit/PencilKit surface washes out glass's dark tint.
+                // Neutral backing restores the document palette's grey over the paper.
+                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                    .fill(Color.black.opacity(0.6))
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 15, style: .continuous)
                 .stroke(Color.white.opacity(0.14), lineWidth: 0.75)
@@ -983,7 +1004,7 @@ private struct ToolContextBadge: View {
     let tool: CanvasToolKind
 
     var body: some View {
-        Group {
+        DockPaletteIcon(isSelected: true) {
             if tool == .marker {
                 HighlighterToolIcon()
             } else {
@@ -991,13 +1012,47 @@ private struct ToolContextBadge: View {
                     .font(.system(size: 16, weight: .semibold))
             }
         }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Shared geometry and selected treatment for both document and compact course palettes.
+struct DockPaletteIcon<Content: View>: View {
+    var isSelected = false
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
         .foregroundStyle(Color.white)
         .frame(width: 38, height: 38)
         .background(
-            TiyiNoteTheme.selectionBlue.opacity(0.84),
+            isSelected ? TiyiNoteTheme.selectionBlue.opacity(0.84) : Color.clear,
             in: RoundedRectangle(cornerRadius: 10)
         )
-        .accessibilityHidden(true)
+        .contentShape(Rectangle())
+    }
+}
+
+struct DockPaletteButton: View {
+    let symbol: String
+    let title: String
+    var isSelected = false
+    var isEnabled = true
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            DockPaletteIcon(isSelected: isSelected) {
+                Image(systemName: symbol)
+                    .font(.system(size: 16, weight: .semibold))
+            }
+            .opacity(isEnabled ? 1 : 0.3)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .accessibilityLabel(title)
+        .accessibilityValue(isSelected ? "selected" : "not-selected")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
@@ -1125,7 +1180,7 @@ private struct DockPaletteEraserSizeButton: View {
     }
 }
 
-private struct ToolButton: View {
+struct ToolButton: View {
     let tool: CanvasToolKind
     let isSelected: Bool
     var accessibilityTitle: String? = nil
@@ -1191,7 +1246,7 @@ private struct HighlighterToolIcon: View {
     }
 }
 
-private struct DocumentToolbarButton: View {
+struct DocumentToolbarButton: View {
     let symbol: String
     let title: String
     var isEnabled = true

@@ -12,6 +12,7 @@ struct PencilCanvasView: UIViewRepresentable {
     var pagesNavigateFromSidebarOnly: Bool = false
     var usesContinuousPDFScrolling: Bool = false
     var isAnnotationEditingEnabled: Bool = true
+    var confinesNavigationToCanvas = false
     let onFingerPinchChanged: (CGFloat) -> Void
     let onFingerPinchEnded: (CGFloat) -> Void
     let onFingerPinchCancelled: () -> Void
@@ -30,7 +31,9 @@ struct PencilCanvasView: UIViewRepresentable {
         )
         view.suppressesFingerPaging = pagesNavigateFromSidebarOnly
         view.usesContinuousPDFScrolling = usesContinuousPDFScrolling
+        view.confinesNavigationToCanvas = confinesNavigationToCanvas
         let coordinator = context.coordinator
+        if confinesNavigationToCanvas { coordinator.configureCanvasNavigation(on: view, container: view) }
         view.onNavigationAncestorFound = { [weak coordinator, weak view] pager in
             guard let view else { return }
             coordinator?.configureCanvasNavigation(on: pager, container: view)
@@ -47,6 +50,8 @@ struct PencilCanvasView: UIViewRepresentable {
         uiView.logicalViewport = logicalViewport
         uiView.suppressesFingerPaging = pagesNavigateFromSidebarOnly
         uiView.usesContinuousPDFScrolling = usesContinuousPDFScrolling
+        uiView.confinesNavigationToCanvas = confinesNavigationToCanvas
+        if confinesNavigationToCanvas { context.coordinator.configureCanvasNavigation(on: uiView, container: uiView) }
         uiView.configureAncestorNavigation()
     }
 
@@ -196,6 +201,7 @@ final class PageCanvasContainerView: UIView {
     var onNavigationAncestorFound: ((UIView) -> Void)?
     var suppressesFingerPaging = false
     var usesContinuousPDFScrolling = false
+    var confinesNavigationToCanvas = false
 
     init(controller: CanvasController, logicalPageSize: CGSize, logicalViewport: CGRect?) {
         self.controller = controller
@@ -284,6 +290,7 @@ final class PageCanvasContainerView: UIView {
     }
 
     func configureAncestorNavigation() {
+        guard !confinesNavigationToCanvas else { return }
         let allowedNavigationTouches = [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
