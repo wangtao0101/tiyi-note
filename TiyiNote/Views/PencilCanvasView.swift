@@ -30,6 +30,7 @@ struct PencilCanvasView: UIViewRepresentable {
             logicalViewport: logicalViewport
         )
         view.suppressesFingerPaging = pagesNavigateFromSidebarOnly
+        view.isCurrentPage = isCurrentPage
         view.usesContinuousPDFScrolling = usesContinuousPDFScrolling
         view.confinesNavigationToCanvas = confinesNavigationToCanvas
         let coordinator = context.coordinator
@@ -49,6 +50,7 @@ struct PencilCanvasView: UIViewRepresentable {
         }
         uiView.logicalViewport = logicalViewport
         uiView.suppressesFingerPaging = pagesNavigateFromSidebarOnly
+        uiView.isCurrentPage = isCurrentPage
         uiView.usesContinuousPDFScrolling = usesContinuousPDFScrolling
         uiView.confinesNavigationToCanvas = confinesNavigationToCanvas
         if confinesNavigationToCanvas { context.coordinator.configureCanvasNavigation(on: uiView, container: uiView) }
@@ -58,6 +60,7 @@ struct PencilCanvasView: UIViewRepresentable {
     static func dismantleUIView(_ uiView: PageCanvasContainerView, coordinator: Coordinator) {
         uiView.controller.cancelStrokeTransform()
         uiView.controller.cancelHeldInkRecognition()
+        uiView.controller.palmRejectionRecognizer.detach()
         coordinator.removeCanvasNavigation()
         uiView.onNavigationAncestorFound = nil
     }
@@ -109,6 +112,7 @@ struct PencilCanvasView: UIViewRepresentable {
             }
             canvasPan = parent.logicalViewport == nil ? nil : pan
             canvasPinch = pinch
+            parent.controller.palmRejectionRecognizer.refreshNavigationLock()
         }
 
         func removeCanvasNavigation() {
@@ -122,6 +126,11 @@ struct PencilCanvasView: UIViewRepresentable {
 
         @objc private func handleCanvasPan(_ gesture: UIPanGestureRecognizer) {
             guard let canvasContainer else { return }
+            guard !parent.controller.palmRejectionRecognizer.blocksFingerActions else {
+                gesture.setTranslation(.zero, in: canvasContainer)
+                if gesture.state == .cancelled { parent.onCanvasNavigation(.finished) }
+                return
+            }
             if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
                 let translation = gesture.translation(in: canvasContainer)
                 gesture.setTranslation(.zero, in: canvasContainer)
@@ -134,6 +143,11 @@ struct PencilCanvasView: UIViewRepresentable {
 
         @objc private func handleCanvasPinch(_ gesture: UIPinchGestureRecognizer) {
             guard let canvasContainer else { return }
+            guard !parent.controller.palmRejectionRecognizer.blocksFingerActions else {
+                gesture.scale = 1
+                if gesture.state == .cancelled { parent.onCanvasNavigation(.finished) }
+                return
+            }
             if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
                 let magnification = gesture.scale
                 gesture.scale = 1
@@ -146,13 +160,18 @@ struct PencilCanvasView: UIViewRepresentable {
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             if gestureRecognizer === canvasPan || gestureRecognizer === canvasPinch {
-                return !parent.controller.isUsingTool || parent.controller.allowsDirectDrawing
+                return !parent.controller.palmRejectionRecognizer.blocksFingerActions
+                    && (!parent.controller.isUsingTool || parent.controller.allowsDirectDrawing)
             }
             return true
         }
 
 
         @objc private func handleFingerPinch(_ gesture: UIPinchGestureRecognizer) {
+            guard !parent.controller.palmRejectionRecognizer.blocksFingerActions else {
+                parent.onFingerPinchCancelled()
+                return
+            }
             switch gesture.state {
             case .began, .changed:
                 parent.onFingerPinchChanged(gesture.scale)
@@ -169,7 +188,17 @@ struct PencilCanvasView: UIViewRepresentable {
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
         ) -> Bool {
-            true
+            !(otherGestureRecognizer is LassoPanGestureRecognizer)
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            // The custom camera pan is separate from UIScrollView's pan. Both must
+            // yield to selection editing, otherwise a finger moves the paper too.
+            (gestureRecognizer === canvasPan || gestureRecognizer === canvasPinch)
+                && otherGestureRecognizer is LassoPanGestureRecognizer
         }
     }
 }
@@ -200,6 +229,7 @@ final class PageCanvasContainerView: UIView {
     }
     var onNavigationAncestorFound: ((UIView) -> Void)?
     var suppressesFingerPaging = false
+    var isCurrentPage = true
     var usesContinuousPDFScrolling = false
     var confinesNavigationToCanvas = false
 
@@ -211,6 +241,7 @@ final class PageCanvasContainerView: UIView {
         backgroundColor = .clear
         isOpaque = false
         addSubview(canvasView)
+        controller.palmRejectionRecognizer.attach(to: self)
     }
 
     @available(*, unavailable)
@@ -236,6 +267,7 @@ final class PageCanvasContainerView: UIView {
         )
         guard appliedLayoutConfiguration != configuration else { return }
         appliedLayoutConfiguration = configuration
+        controller.prepareForViewportChange()
 
         // PKCanvasView is itself a UIScrollView and has a native tiled zoom path. Scaling its
         // complete layer with CGAffineTransform forces Core Animation to composite the transparent
@@ -290,7 +322,17 @@ final class PageCanvasContainerView: UIView {
     }
 
     func configureAncestorNavigation() {
-        guard !confinesNavigationToCanvas else { return }
+        // Offscreen notebook pages must not overwrite the active page's tool
+        // policy on their shared pager or observe the active page's Pencil.
+        guard isCurrentPage || usesContinuousPDFScrolling else {
+            controller.palmRejectionRecognizer.attach(to: self)
+            onNavigationAncestorFound?(self)
+            return
+        }
+        if confinesNavigationToCanvas {
+            onNavigationAncestorFound?(self)
+            return
+        }
         let allowedNavigationTouches = [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
@@ -312,7 +354,13 @@ final class PageCanvasContainerView: UIView {
                 if !isPagePan {
                     // A handout page is an infinite world. Fingers move its camera; only the
                     // page sidebar changes chapters. Keep the pager for programmatic selection.
-                    if suppressesFingerPaging { scrollView.panGestureRecognizer.isEnabled = false }
+                    // In writing mode two fingers move an unbounded camera;
+                    // they must not also turn its page underneath the ink.
+                    let pagingLocked = scrollView.gestureRecognizers?.contains {
+                        ($0 as? PageMultiTouchPagingGuard)?.isPagingLocked == true
+                    } == true
+                    scrollView.panGestureRecognizer.isEnabled = !suppressesFingerPaging
+                        && (usesContinuousPDFScrolling || touchCount == 1) && !pagingLocked
                     scrollView.isDirectionalLockEnabled = !usesContinuousPDFScrolling
                     if !suppressesFingerPaging, (touchCount == 1 || logicalViewport != nil),
                        scrollView.gestureRecognizers?.contains(where: {
@@ -326,6 +374,7 @@ final class PageCanvasContainerView: UIView {
                     // Keep camera gestures inside the scroll content. HostingScrollView owns
                     // and arbitrates its own recognizers; the content host also covers objects
                     // and text overlays without joining that private recognizer lifecycle.
+                    controller.palmRejectionRecognizer.attach(to: contentHost)
                     onNavigationAncestorFound?(contentHost)
                     break
                 }
@@ -345,7 +394,7 @@ private final class PageMultiTouchPagingGuard: UIGestureRecognizer {
     private weak var pager: UIScrollView?
     private var activeTouches: Set<UITouch> = []
     private var initialContentOffset: CGPoint?
-    private var isPagingLocked = false
+    private(set) var isPagingLocked = false
     private var shouldRestorePan = false
 
     init(pager: UIScrollView) {

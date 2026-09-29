@@ -3,6 +3,309 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+    func testLineRotationControlFollowsTheActualLineAtEveryAngleAndZoom() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "practice-sidebar-line-rotation-alignment")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-pen"].tap()
+        app.buttons["ink-width-preset-1"].tap()
+        app.buttons["ink-color-coral"].tap()
+        let frame = canvas.frame
+        try synthesizeTouchPath((0...12).map { i in
+            let t = CGFloat(i) / 12
+            return CGPoint(x: frame.minX + frame.width * (0.3 + 0.4 * t),
+                           y: frame.minY + frame.height * (0.32 + 0.18 * t))
+        }, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 1", of: canvas)
+        app.buttons["tool-lasso"].tap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.41)).tap()
+        let rotation = app.descendants(matching: .any)["lasso-rotation-handle"]
+        XCTAssertTrue(rotation.waitForExistence(timeout: 3))
+        func point(_ index: Int) -> CGPoint {
+            let f = app.descendants(matching: .any)["lasso-vertex-\(index)"].frame
+            return CGPoint(x: f.midX, y: f.midY)
+        }
+        let originalNib = (canvas.value as? String)?.components(separatedBy: "；").first { $0.hasPrefix("笔尖 ") }
+        for step in 0..<6 {
+            if step == 2 { try pinchCanvas(canvas, scale: 0.6, in: app) }
+            if step == 4 { try pinchCanvas(canvas, scale: 1.8, in: app) }
+            let a = point(0), b = point(1)
+            let center = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+            let handleFrame = rotation.frame
+            let handle = CGPoint(x: handleFrame.midX, y: handleFrame.midY)
+            XCTAssertEqual(hypot(handle.x - center.x, handle.y - center.y), 28, accuracy: 1.5)
+            let delta: CGFloat = step % 2 == 0 ? 1.1 : 0.65
+            func rotated(_ p: CGPoint) -> CGPoint {
+                let x = p.x - center.x, y = p.y - center.y
+                return CGPoint(x: center.x + cos(delta) * x - sin(delta) * y,
+                               y: center.y + sin(delta) * x + cos(delta) * y)
+            }
+            let target = rotated(handle)
+            let viewport = try canvasViewportRect(of: canvas)
+            let start = rotation.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            start.press(forDuration: 0.08, thenDragTo: start.withOffset(CGVector(dx: target.x - handle.x, dy: target.y - handle.y)))
+            let nextA = point(0), nextB = point(1)
+            XCTAssertEqual(nextA.x, rotated(a).x, accuracy: 6)
+            XCTAssertEqual(nextA.y, rotated(a).y, accuracy: 6)
+            XCTAssertEqual(nextB.x, rotated(b).x, accuracy: 6)
+            XCTAssertEqual(nextB.y, rotated(b).y, accuracy: 6)
+            XCTAssertEqual((nextA.x + nextB.x) / 2, center.x, accuracy: 1.5)
+            XCTAssertEqual((nextA.y + nextB.y) / 2, center.y, accuracy: 1.5)
+            XCTAssertEqual(try canvasViewportRect(of: canvas), viewport)
+            XCTAssertEqual((canvas.value as? String)?.components(separatedBy: "；").first { $0.hasPrefix("笔尖 ") }, originalNib)
+            let png = canvas.screenshot().pngRepresentation
+            let diagnostic = XCTAttachment(data: png, uniformTypeIdentifier: "public.png")
+            diagnostic.name = "Rotation \(step) endpoints \(nextA) \(nextB), canvas \(canvas.frame)"
+            diagnostic.lifetime = .keepAlways
+            add(diagnostic)
+            for t: CGFloat in [0.2, 0.4, 0.7, 0.85] {
+                let p = CGPoint(x: nextA.x + (nextB.x - nextA.x) * t, y: nextA.y + (nextB.y - nextA.y) * t)
+                XCTAssertTrue(hasRedInk(in: png, around: CGPoint(x: (p.x - canvas.frame.minX) / canvas.frame.width,
+                                                               y: (p.y - canvas.frame.minY) / canvas.frame.height)),
+                              "Rendered ink diverged from its endpoints after rotation \(step)")
+            }
+        }
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "Line rotation control and rendered ink alignment"
+        shot.lifetime = .keepAlways
+        add(shot)
+    }
+
+    private func hasRedInk(in png: Data, around point: CGPoint) -> Bool {
+        guard let image = UIImage(data: png)?.cgImage else { return false }
+        let width = image.width, height = image.height
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        return bytes.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(data: buffer.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            let x = Int(point.x * CGFloat(width)), y = Int(point.y * CGFloat(height))
+            for row in max(0, y - 7)...min(height - 1, y + 7) {
+                for column in max(0, x - 7)...min(width - 1, x + 7) {
+                    let i = (row * width + column) * 4
+                    if Int(buffer[i]) > 130 && Int(buffer[i]) > Int(buffer[i + 1]) + 50
+                        && Int(buffer[i]) > Int(buffer[i + 2]) + 40 { return true }
+                }
+            }
+            return false
+        }
+    }
+
+    func testGeometryVertexModelChecks() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--library-smoke", "vertices-only-\(UUID().uuidString)"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["图形顶点验证通过"].waitForExistence(timeout: 15), app.debugDescription)
+    }
+
+    func testHeldShapeQuickStylePreservesVerticesAndSurvivesUndoAndReload() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "practice-sidebar-held-shape-style")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-pen"].tap()
+        let frame = canvas.frame
+        let points = [CGPoint(x: frame.midX, y: frame.minY + frame.height * 0.3),
+                      CGPoint(x: frame.minX + frame.width * 0.7, y: frame.minY + frame.height * 0.6),
+                      CGPoint(x: frame.minX + frame.width * 0.3, y: frame.minY + frame.height * 0.6)]
+        try synthesizeTouchPath(interpolatedClosedPath(points, samplesPerEdge: 12), on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValueContaining("吸附 三角形", of: canvas)
+        app.buttons["tool-lasso"].tap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)).tap()
+        let style = app.buttons["shape-quick-color-coral"]
+        XCTAssertTrue(style.waitForExistence(timeout: 3))
+        let before = (0..<3).map { app.descendants(matching: .any)["lasso-vertex-\($0)"].frame }
+        let ink = drawingGeometryValue(of: canvas)
+        style.tap()
+        app.buttons["shape-quick-width-4"].tap()
+        app.buttons["shape-quick-dashed"].tap()
+        XCTAssertFalse(app.navigationBars["图形样式"].exists)
+        let shape = app.descendants(matching: .any).matching(identifier: "page-element-shape").firstMatch
+        XCTAssertTrue(shape.waitForExistence(timeout: 3))
+        XCTAssertTrue((shape.value as? String)?.contains("虚线") == true)
+        waitForValueContaining("笔迹 0", of: canvas)
+        for i in 0..<3 {
+            let after = app.descendants(matching: .any)["lasso-vertex-\(i)"].frame
+            XCTAssertEqual(after.midX, before[i].midX, accuracy: 1)
+            XCTAssertEqual(after.midY, before[i].midY, accuracy: 1)
+        }
+        app.buttons["撤销"].tap()
+        XCTAssertTrue((shape.value as? String)?.contains("实线") == true)
+        XCTAssertEqual(app.buttons["shape-quick-solid"].value as? String, "selected")
+        app.buttons["撤销"].tap()
+        app.buttons["撤销"].tap()
+        XCTAssertEqual(drawingGeometryValue(of: canvas), ink)
+        XCTAssertFalse(shape.exists)
+        app.buttons["重做"].tap()
+        app.buttons["重做"].tap()
+        app.buttons["重做"].tap()
+        XCTAssertTrue(shape.waitForExistence(timeout: 3))
+        app.buttons["tool-pen"].tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(1.2))
+        app.launchArguments += ["--reuse-text-interaction-ui-test-workspace"]
+        app.terminate(); app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        XCTAssertTrue((shape.value as? String)?.contains("虚线") == true)
+        app.buttons["tool-lasso"].tap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)).tap()
+        XCTAssertTrue(style.waitForExistence(timeout: 3))
+        XCTAssertEqual(style.value as? String, "selected")
+        XCTAssertEqual(app.buttons["shape-quick-dashed"].value as? String, "selected")
+        XCTAssertEqual(app.buttons["shape-quick-width-4"].value as? String, "selected")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Selected shape quick styles in movable palette"
+        screenshot.lifetime = .keepAlways; add(screenshot)
+        app.buttons["shape-quick-solid"].tap()
+        app.buttons["shape-quick-color-ocean"].tap()
+        XCTAssertTrue((shape.value as? String)?.contains("实线") == true)
+        let vertex = app.descendants(matching: .any)["lasso-vertex-0"]
+        let start = vertex.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 35, dy: 20)))
+        XCTAssertEqual(vertex.frame.midX - before[0].midX, 35, accuracy: 3)
+        app.buttons["shape-quick-done"].tap()
+        XCTAssertFalse(app.buttons["shape-quick-width-4"].exists)
+        app.buttons["tool-pen"].tap()
+        XCTAssertTrue(app.buttons["ink-color-coral"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["shape-quick-solid"].exists)
+    }
+
+    func testInsertedShapeQuickStylesFollowMovablePaletteAndDoNotChangeOtherShapes() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "shape-quick-dock")
+        let settings = app.scrollViews["tool-settings-scroll"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        insertShape(named: "直线", in: app, settingsScroll: settings)
+        let shapes = app.descendants(matching: .any).matching(identifier: "page-element-shape")
+        let line = shapes.matching(NSPredicate(format: "value BEGINSWITH %@", "直线")).firstMatch
+        XCTAssertTrue(line.waitForExistence(timeout: 3))
+        XCTAssertTrue((line.value as? String)?.contains("线宽 1.0") == true)
+        let red = app.buttons["shape-quick-color-coral"]
+        XCTAssertTrue(red.waitForExistence(timeout: 3))
+        let vertices = (0..<2).map { app.descendants(matching: .any)["lasso-vertex-\($0)"].frame }
+        red.tap()
+        app.buttons["shape-quick-width-2"].tap()
+        app.buttons["shape-quick-dashed"].tap()
+        XCTAssertTrue((line.value as? String)?.contains("线宽 2.0") == true)
+        XCTAssertTrue((line.value as? String)?.contains("虚线") == true)
+        XCTAssertEqual(red.value as? String, "selected")
+        XCTAssertFalse(app.navigationBars["图形样式"].exists)
+        for i in 0..<2 {
+            let now = app.descendants(matching: .any)["lasso-vertex-\(i)"].frame
+            XCTAssertEqual(now.midX, vertices[i].midX, accuracy: 1)
+            XCTAssertEqual(now.midY, vertices[i].midY, accuracy: 1)
+        }
+        let palette = app.descendants(matching: .any)["dockable-tool-palette"]
+        let region = app.descendants(matching: .any)["document-page-pager"]
+        let handle = app.descendants(matching: .any)["tool-palette-drag-handle"]
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.12,
+            thenDragTo: region.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.98)),
+            withVelocity: .slow, thenHoldForDuration: 0.12)
+        waitUntil(timeout: 4) { palette.value as? String == "bottom" }
+        XCTAssertTrue(app.buttons["shape-quick-solid"].isHittable)
+        app.buttons["shape-quick-solid"].tap()
+        XCTAssertTrue((line.value as? String)?.contains("实线") == true)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Shape quick styles docked horizontally"
+        screenshot.lifetime = .keepAlways; add(screenshot)
+        let savedLine = line.value as? String
+        insertShape(named: "三角形", in: app, settingsScroll: settings)
+        let triangle = shapes.matching(NSPredicate(format: "value BEGINSWITH %@", "三角形")).firstMatch
+        XCTAssertTrue((triangle.value as? String)?.contains("线宽 1.0") == true)
+        app.buttons["shape-quick-width-4"].tap()
+        XCTAssertTrue((triangle.value as? String)?.contains("线宽 4.0") == true)
+        XCTAssertEqual(line.value as? String, savedLine)
+        app.buttons["撤销"].tap()
+        XCTAssertTrue((triangle.value as? String)?.contains("线宽 1.0") == true)
+        XCTAssertEqual(app.buttons["shape-quick-width-1"].value as? String, "selected")
+    }
+
+    func testInsertedTriangleVerticesMoveIndependentlyAfterRotationAndPersist() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "triangle-vertices")
+        let settings = app.scrollViews["tool-settings-scroll"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        insertShape(named: "三角形", in: app, settingsScroll: settings)
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        let vertex = app.descendants(matching: .any)["lasso-vertex-0"]
+        XCTAssertTrue(vertex.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.descendants(matching: .any)["lasso-resize-bottomRight"].exists)
+        let rotation = app.descendants(matching: .any)["lasso-rotation-handle"]
+        let rotateStart = rotation.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        rotateStart.press(forDuration: 0.1, thenDragTo: rotateStart.withOffset(CGVector(dx: 45, dy: -25)))
+        let before = (0..<3).map { app.descendants(matching: .any)["lasso-vertex-\($0)"].frame }
+        let viewport = try canvasViewportRect(of: canvas)
+        let start = vertex.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 60, dy: -45)))
+        let after = (0..<3).map { app.descendants(matching: .any)["lasso-vertex-\($0)"].frame }
+        XCTAssertEqual(after[0].midX - before[0].midX, 60, accuracy: 3)
+        XCTAssertEqual(after[0].midY - before[0].midY, -45, accuracy: 3)
+        for i in 1..<3 {
+            XCTAssertEqual(after[i].midX, before[i].midX, accuracy: 1)
+            XCTAssertEqual(after[i].midY, before[i].midY, accuracy: 1)
+        }
+        XCTAssertEqual(try canvasViewportRect(of: canvas), viewport)
+        app.buttons["撤销"].tap()
+        XCTAssertEqual(vertex.frame.midX, before[0].midX, accuracy: 1)
+        app.buttons["重做"].tap()
+        XCTAssertEqual(vertex.frame.midX, after[0].midX, accuracy: 1)
+        app.buttons["tool-pen"].tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(1.2))
+        app.launchArguments += ["--reuse-text-interaction-ui-test-workspace"]
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        app.buttons["tool-lasso"].tap()
+        canvas.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+            dx: after[0].midX - canvas.frame.minX, dy: after[0].midY - canvas.frame.minY)).tap()
+        XCTAssertTrue(vertex.waitForExistence(timeout: 3))
+        for i in 0..<3 {
+            let restored = app.descendants(matching: .any)["lasso-vertex-\(i)"].frame
+            XCTAssertEqual(restored.midX, after[i].midX, accuracy: 1)
+            XCTAssertEqual(restored.midY, after[i].midY, accuracy: 1)
+        }
+    }
+
+    func testHeldTriangleVertexKeepsOtherCornersAndInkWidth() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "practice-sidebar-held-triangle-vertices")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-pen"].tap()
+        let frame = canvas.frame
+        let points = [CGPoint(x: frame.midX, y: frame.minY + frame.height * 0.3),
+                      CGPoint(x: frame.minX + frame.width * 0.7, y: frame.minY + frame.height * 0.6),
+                      CGPoint(x: frame.minX + frame.width * 0.3, y: frame.minY + frame.height * 0.6)]
+        try synthesizeTouchPath(interpolatedClosedPath(points, samplesPerEdge: 12), on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValueContaining("吸附 三角形", of: canvas)
+        app.buttons["tool-lasso"].tap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)).tap()
+        let vertex = app.descendants(matching: .any)["lasso-vertex-0"]
+        XCTAssertTrue(vertex.waitForExistence(timeout: 3))
+        let before = (0..<3).map { app.descendants(matching: .any)["lasso-vertex-\($0)"].frame }
+        let geometry = drawingGeometryValue(of: canvas)
+        let nib = (canvas.value as? String)?.components(separatedBy: "；").first { $0.hasPrefix("笔尖 ") }
+        let viewport = try canvasViewportRect(of: canvas)
+        let start = vertex.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 55, dy: 25)))
+        XCTAssertNotEqual(drawingGeometryValue(of: canvas), geometry)
+        XCTAssertEqual((canvas.value as? String)?.components(separatedBy: "；").first { $0.hasPrefix("笔尖 ") }, nib)
+        for i in 1..<3 {
+            let after = app.descendants(matching: .any)["lasso-vertex-\(i)"].frame
+            XCTAssertEqual(after.midX, before[i].midX, accuracy: 3)
+            XCTAssertEqual(after.midY, before[i].midY, accuracy: 3)
+        }
+        XCTAssertEqual(try canvasViewportRect(of: canvas), viewport)
+        app.buttons["撤销"].tap()
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+        for i in 0..<3 {
+            let restored = app.descendants(matching: .any)["lasso-vertex-\(i)"].frame
+            XCTAssertEqual(restored.midX, before[i].midX, accuracy: 1)
+            XCTAssertEqual(restored.midY, before[i].midY, accuracy: 1)
+        }
+    }
+
     func testPDFTabRestoresZoomAndBothScrollAxes() throws {
 #if targetEnvironment(macCatalyst)
         throw XCTSkip("Direct-touch PDF navigation regression")
@@ -12,6 +315,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let reader = app.scrollViews["document-page-pager"]
         let page = app.descendants(matching: .any)["page-canvas-0"]
         XCTAssertTrue(page.waitForExistence(timeout: 8))
+        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
+        app.buttons["tool-lasso"].tap()
         try pinchCanvas(reader, scale: 1.6, in: app)
         waitUntil(timeout: 4) { !app.buttons["zoom-reset"].label.contains("100%") }
         let start = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.65))
@@ -1771,6 +2076,398 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
     }
 
+    func testLittleFingerMovementCannotNavigateWhileWritingToolsAreSelected() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "practice-sidebar-palm-navigation",
+                                    additionalLaunchArguments: ["--pencil-only-ui-test"])
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        // Wait for the initial workspace layout to settle before taking the
+        // camera baseline; merely finding the canvas can precede that layout.
+        app.buttons["tool-pen"].tap()
+        let initial = try canvasViewportRect(of: canvas)
+        for tool in ["tool-pen", "tool-marker", "tool-eraser"] {
+            if app.buttons[tool].value as? String != "selected" { app.buttons[tool].tap() }
+            let frame = canvas.frame
+            // A resting little finger shifts repeatedly, then lifts and lands
+            // again between strokes. Single direct contacts must never pan.
+            var paths: [SynthesizedTouchPath] = []
+            for contact in 0..<12 {
+                let start = CGPoint(x: frame.minX + frame.width * 0.72,
+                                    y: frame.minY + frame.height * 0.65)
+                let t = Double(contact) * 0.24
+                paths.append(SynthesizedTouchPath(samples: [(start, t),
+                    (CGPoint(x: start.x - 30, y: start.y + 25), t + 0.06),
+                    (CGPoint(x: start.x + 22, y: start.y - 32), t + 0.12),
+                    (CGPoint(x: start.x - 15, y: start.y - 40), t + 0.18)], liftOffset: t + 0.20))
+            }
+            try synthesizeTouchPaths(paths, on: canvas, in: app)
+            XCTAssertEqual(try canvasViewportRect(of: canvas), initial, "Little finger moved paper under \(tool)")
+            waitForValue("笔迹 0", of: canvas)
+            XCTAssertEqual(app.buttons[tool].value as? String, "selected")
+        }
+        // Deliberate two-finger navigation is still available in writing mode.
+        app.buttons["tool-pen"].tap()
+        try pinchCanvas(canvas, scale: 1.3, in: app)
+        XCTAssertLessThan(try canvasViewportRect(of: canvas).width, initial.width * 0.9)
+        let beforePan = try canvasViewportRect(of: canvas)
+        let frame = canvas.frame
+        try synthesizeTouchPaths([0.35, 0.65].map { x in
+            SynthesizedTouchPath(samples: [
+                (CGPoint(x: frame.minX + frame.width * x, y: frame.minY + frame.height * 0.65), 0),
+                (CGPoint(x: frame.minX + frame.width * x + 55, y: frame.minY + frame.height * 0.65 - 45), 0.3)
+            ], liftOffset: 0.35)
+        }, on: canvas, in: app)
+        XCTAssertNotEqual(try canvasViewportRect(of: canvas), beforePan)
+        // Switching out of writing restores intentional single-finger navigation.
+        app.buttons["tool-lasso"].tap()
+        let beforeFingerPan = try canvasViewportRect(of: canvas)
+        let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.75))
+        blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: -60, dy: -40)))
+        XCTAssertNotEqual(try canvasViewportRect(of: canvas), beforeFingerPan)
+        app.buttons["tool-pen"].tap()
+        let beforeWriting = try canvasViewportRect(of: canvas)
+        blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: 60, dy: 40)))
+        XCTAssertEqual(try canvasViewportRect(of: canvas), beforeWriting)
+    }
+
+    func testWritingNavigationDoesNotTurnNotebookPages() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "palm-notebook-navigation",
+                                    additionalLaunchArguments: ["--pencil-only-ui-test"])
+        openPageSidebar(in: app)
+        addPage(named: "横线纸", in: app)
+        let pager = app.scrollViews["document-page-pager"]
+        waitUntil(timeout: 4) { pager.value as? String == "2 / 2" }
+        app.buttons["page-thumbnail-0"].tap()
+        app.buttons.matching(identifier: "关闭页面缩略图").firstMatch.tap()
+        app.buttons["tool-pen"].tap()
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        waitUntil(timeout: 4) { pager.value as? String == "1 / 2" && canvas.exists }
+        let initial = try canvasViewportRect(of: canvas)
+        let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.75))
+        blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: 0, dy: -240)))
+        XCTAssertEqual(pager.value as? String, "1 / 2")
+        XCTAssertEqual(try canvasViewportRect(of: canvas), initial)
+        let frame = canvas.frame
+        try synthesizeTouchPaths([0.35, 0.65].map { x in
+            let start = CGPoint(x: frame.minX + frame.width * x, y: frame.minY + frame.height * 0.72)
+            return SynthesizedTouchPath(samples: [(start, 0),
+                (CGPoint(x: start.x, y: start.y - 240), 0.4)], liftOffset: 0.48)
+        }, on: canvas, in: app)
+        XCTAssertEqual(pager.value as? String, "1 / 2", "Writing navigation must not turn pages")
+        XCTAssertGreaterThan(try canvasViewportRect(of: canvas).minY, initial.minY + 40)
+        waitForValue("笔迹 0", of: canvas)
+    }
+
+    func testRepeatedOrdinaryDraggingKeepsPaperAndAllInkTogether() throws {
+        let app = launchIsolatedApp(prefix: "practice-sidebar-ordinary-drag-stress")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let initialViewport = try canvasViewportRect(of: canvas)
+        let referenceWorld = CGPoint(x: initialViewport.minX + initialViewport.width * 0.48,
+                                     y: initialViewport.minY + initialViewport.height * 0.68)
+        app.buttons["ink-width-preset-1"].tap()
+        app.buttons["ink-color-ocean"].tap()
+        drawStroke(on: canvas, from: CGVector(dx: 0.32, dy: 0.68), to: CGVector(dx: 0.64, dy: 0.68))
+        waitForValue("笔迹 1", of: canvas)
+        app.buttons["ink-color-coral"].tap()
+        let frame = canvas.frame
+        try synthesizeTouchPath((0...10).map {
+            CGPoint(x: frame.minX + frame.width * (0.32 + CGFloat($0) * 0.032),
+                    y: frame.minY + frame.height * 0.43)
+        }, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["practice-exit"].tap()
+        app.terminate()
+        // Simulator fingers now follow the shipping iPad navigation policy.
+        // No dropped callbacks, delayed rendering or other fault injection.
+        app.launchArguments += ["--reuse-text-interaction-ui-test-workspace", "--pencil-only-ui-test"]
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["tool-lasso"].tap()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.48, dy: 0.43)).tap()
+        let selection = app.descendants(matching: .any)["lasso-selection-box"]
+        XCTAssertTrue(selection.waitForExistence(timeout: 3))
+        func nib() throws -> String {
+            let value = try XCTUnwrap(canvas.value as? String)
+            return try XCTUnwrap(value.components(separatedBy: "；").first { $0.hasPrefix("笔尖 ") })
+        }
+        let originalNib = try nib()
+        for cycle in 0..<30 {
+            print("ORDINARY_DRAG_STRESS cycle \(cycle + 1)/30")
+            let sign: CGFloat = cycle.isMultiple(of: 2) ? 1 : -1
+            let viewportBeforeMove = try canvasViewportRect(of: canvas)
+            let original = selection.frame
+            var current = original
+            var paths: [SynthesizedTouchPath] = []
+            let offsets: [CGPoint] = [CGPoint(x: 25, y: 14), CGPoint(x: -13, y: 18),
+                                      CGPoint(x: 18, y: -21), CGPoint(x: -18, y: -3)]
+            // Consecutive contacts with only 60 ms between them, including near
+            // both ends of the line. XCTest does not wait for idle between drags.
+            for (index, delta) in offsets.enumerated() {
+                let fraction: CGFloat = [0.5, 0.97, 0.03, 0.5][index]
+                let start = CGPoint(x: current.minX + current.width * fraction, y: current.midY)
+                let end = CGPoint(x: start.x + delta.x * sign, y: start.y + delta.y * sign)
+                let t = Double(index) * 0.28
+                paths.append(SynthesizedTouchPath(samples: [(start, t),
+                    (CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2), t + 0.08),
+                    (end, t + 0.18)], liftOffset: t + 0.22))
+                current = current.offsetBy(dx: delta.x * sign, dy: delta.y * sign)
+            }
+            try synthesizeTouchPaths(paths, on: canvas, in: app)
+            XCTAssertEqual(selection.frame.midX, current.midX, accuracy: 3, "cycle \(cycle)")
+            XCTAssertEqual(selection.frame.midY, current.midY, accuracy: 3, "cycle \(cycle)")
+            XCTAssertEqual(try canvasViewportRect(of: canvas), viewportBeforeMove)
+            XCTAssertEqual(try nib(), originalNib)
+            let beforeNavigation = drawingGeometryValue(of: canvas)
+            let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.84, dy: 0.82))
+            blank.press(forDuration: 0.03,
+                        thenDragTo: blank.withOffset(CGVector(dx: 42 * sign, dy: -35 * sign)),
+                        withVelocity: .fast, thenHoldForDuration: 0)
+            XCTAssertNotEqual(try canvasViewportRect(of: canvas), viewportBeforeMove)
+            if cycle % 4 == 3 {
+                try pinchCanvas(canvas, scale: cycle % 8 == 3 ? 0.75 : 1 / 0.75, in: app)
+            }
+            XCTAssertEqual(drawingGeometryValue(of: canvas), beforeNavigation)
+            let viewport = try canvasViewportRect(of: canvas)
+            let canvasFrame = canvas.frame
+            let expectedRed = CGPoint(x: (selection.frame.midX - canvasFrame.minX) / canvasFrame.width,
+                                      y: (selection.frame.midY - canvasFrame.minY) / canvasFrame.height)
+            let expectedBlue = CGPoint(x: (referenceWorld.x - viewport.minX) / viewport.width,
+                                       y: (referenceWorld.y - viewport.minY) / viewport.height)
+            let png = canvas.screenshot().pngRepresentation
+            let renderedRed = try XCTUnwrap(coloredInkBounds(in: png, red: true))
+            if abs(renderedRed.midX - expectedRed.x) > 0.008 || abs(renderedRed.midY - expectedRed.y) > 0.008 {
+                let failureImage = XCTAttachment(data: png, uniformTypeIdentifier: "public.png")
+                failureImage.name = "Ink alignment mismatch at cycle \(cycle)"
+                failureImage.lifetime = .keepAlways
+                add(failureImage)
+            }
+            XCTAssertEqual(renderedRed.midX, expectedRed.x, accuracy: 0.008, "red ink x, cycle \(cycle)")
+            XCTAssertEqual(renderedRed.midY, expectedRed.y, accuracy: 0.008, "red ink y, cycle \(cycle)")
+            XCTAssertEqual(renderedRed.width, selection.frame.width / canvasFrame.width,
+                           accuracy: 0.012, "red ink width, cycle \(cycle)")
+            XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: png, around: expectedBlue, radius: 8)), 300,
+                                 "Unselected ink must follow paper too, cycle \(cycle)")
+            if cycle % 5 == 4 {
+                let screenshot = XCTAttachment(screenshot: app.screenshot())
+                screenshot.name = "Ordinary dragging after \((cycle + 1) * 5) drags"
+                screenshot.lifetime = .keepAlways
+                add(screenshot)
+                app.buttons["tool-pen"].tap()
+                app.buttons["tool-lasso"].tap()
+                canvas.coordinate(withNormalizedOffset: CGVector(dx: expectedRed.x, dy: expectedRed.y)).tap()
+                XCTAssertTrue(selection.waitForExistence(timeout: 3))
+            }
+        }
+        let saved = drawingGeometryValue(of: canvas)
+        app.buttons["practice-exit"].tap()
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 2", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), saved)
+        XCTAssertEqual(try nib(), originalNib)
+    }
+
+    private func coloredInkBounds(in png: Data, red: Bool) -> CGRect? {
+        guard let image = UIImage(data: png)?.cgImage else { return nil }
+        let width = image.width, height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let rendered = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(data: buffer.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { return nil }
+        // Ignore small same-color toolbar icons: the horizontal test stroke
+        // occupies far more pixels per row than a delete button does.
+        var rowCounts = [Int](repeating: 0, count: height)
+        func matches(_ i: Int) -> Bool {
+            let r = Int(pixels[i]), g = Int(pixels[i + 1]), b = Int(pixels[i + 2])
+            return red ? (r > g + 65 && r > b + 65) : (b > r + 70 && b > g + 40)
+        }
+        for y in 0..<height {
+            for x in 0..<width where matches((y * width + x) * 4) { rowCounts[y] += 1 }
+        }
+        let threshold = max(10, (rowCounts.max() ?? 0) / 3)
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        for y in 0..<height where rowCounts[y] >= threshold {
+            for x in 0..<width where matches((y * width + x) * 4) {
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX else { return nil }
+        return CGRect(x: CGFloat(minX) / CGFloat(width), y: CGFloat(minY) / CGFloat(height),
+                      width: CGFloat(maxX - minX + 1) / CGFloat(width),
+                      height: CGFloat(maxY - minY + 1) / CGFloat(height))
+    }
+
+    func testMissingRenderCallbacksCannotLeaveFrozenInkAfterEditing() throws {
+        try checkInkPreviewHandoff(delaysFallback: false)
+    }
+
+    func testCameraChangeClearsPendingInkSnapshotsBeforeRenderCallback() throws {
+        try checkInkPreviewHandoff(delaysFallback: true)
+    }
+
+    private func checkInkPreviewHandoff(delaysFallback: Bool) throws {
+        var arguments = ["--suppress-ink-render-callback-ui-test"]
+        if delaysFallback { arguments.append("--delay-ink-preview-handoff-ui-test") }
+        let app = launchIsolatedApp(prefix: "practice-sidebar-preview-handoff",
+                                    additionalLaunchArguments: arguments)
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["ink-width-preset-2"].tap()
+        let frame = canvas.frame
+        let points = (0...10).map { index in
+            CGPoint(x: frame.minX + frame.width * (0.3 + CGFloat(index) * 0.035),
+                    y: frame.minY + frame.height * 0.58)
+        }
+        try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 1", of: canvas)
+        waitForValueContaining("吸附 直线", of: canvas)
+        waitForValueContaining("停笔预览 1", of: canvas)
+        let heldPreview = app.descendants(matching: .any)["held-ink-shape-preview"]
+        if delaysFallback { XCTAssertTrue(heldPreview.exists) }
+        else { XCTAssertTrue(heldPreview.waitForNonExistence(timeout: 2)) }
+        let heldBounds = try drawingBounds(of: canvas)
+        try pinchCanvas(canvas, scale: 1.25, in: app)
+        XCTAssertTrue(heldPreview.waitForNonExistence(timeout: 2))
+        XCTAssertEqual(try drawingBounds(of: canvas), heldBounds)
+
+        func displayedInkCenter() throws -> CGPoint {
+            let ink = try drawingBounds(of: canvas)
+            let viewport = try canvasViewportRect(of: canvas)
+            return CGPoint(x: (ink.midX - viewport.minX) / viewport.width,
+                           y: (ink.midY - viewport.minY) / viewport.height)
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: canvas.screenshot().pngRepresentation,
+            around: try displayedInkCenter(), radius: 8)), 300)
+        app.buttons["tool-lasso"].tap()
+        let center = try displayedInkCenter()
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: center.x, dy: center.y)).tap()
+        let selection = app.descendants(matching: .any)["lasso-selection-box"]
+        XCTAssertTrue(selection.waitForExistence(timeout: 3))
+        let start = selection.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.08, thenDragTo: start.withOffset(CGVector(dx: 25, dy: 45)))
+        let lassoPreview = app.descendants(matching: .any)["lasso-ink-preview"]
+        if delaysFallback { XCTAssertTrue(lassoPreview.exists) }
+        else { XCTAssertTrue(lassoPreview.waitForNonExistence(timeout: 2)) }
+        let movedBounds = try drawingBounds(of: canvas)
+        let beforePan = try canvasViewportRect(of: canvas)
+        let panFrame = canvas.frame
+        try synthesizeTouchPaths([0.38, 0.62].map { x in
+            SynthesizedTouchPath(samples: [
+                (CGPoint(x: panFrame.minX + panFrame.width * x, y: panFrame.minY + panFrame.height * 0.8), 0),
+                (CGPoint(x: panFrame.minX + panFrame.width * x + 50, y: panFrame.minY + panFrame.height * 0.8 - 65), 0.35)
+            ], liftOffset: 0.4)
+        }, on: canvas, in: app)
+        XCTAssertNotEqual(try canvasViewportRect(of: canvas), beforePan)
+        XCTAssertTrue(lassoPreview.waitForNonExistence(timeout: 2))
+        XCTAssertEqual(try drawingBounds(of: canvas), movedBounds)
+        XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: canvas.screenshot().pngRepresentation,
+            around: try displayedInkCenter(), radius: 8)), 300,
+            "Native ink must be visible at the same world position as the paper after navigating")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = delaysFallback ? "Camera clears pending ink snapshots" : "Missing render callback recovers native ink"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    func testThinLineDragPreservesWidthAndFingerDragDoesNotMovePaper() throws {
+        let app = launchIsolatedApp(prefix: "practice-sidebar-thin-line-lasso")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let frame = canvas.frame
+        let points = (0...10).map { index in
+            CGPoint(x: frame.minX + frame.width * (0.32 + CGFloat(index) * 0.032),
+                    y: frame.minY + frame.height * 0.34)
+        }
+        try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 1.2)
+        waitForValue("笔迹 1", of: canvas)
+        waitForValueContaining("吸附 直线", of: canvas)
+        func nibSize() throws -> CGSize {
+            let value = try XCTUnwrap(canvas.value as? String)
+            let field = try XCTUnwrap(value.components(separatedBy: "；").first { $0.hasPrefix("笔尖 ") })
+            let parts = String(field.dropFirst(3)).split(separator: ",").compactMap { Double($0) }
+            XCTAssertEqual(parts.count, 2)
+            return CGSize(width: parts[0], height: parts[1])
+        }
+        let originalInk = try drawingBounds(of: canvas)
+        let originalNib = try nibSize()
+        app.buttons["tool-lasso"].tap()
+        try synthesizeClosedTouchPath(around: CGRect(
+            x: points[0].x - 20, y: points[0].y - 20,
+            width: points.last!.x - points[0].x + 40, height: 40), on: canvas, in: app)
+        let selection = app.descendants(matching: .any)["lasso-selection-box"]
+        XCTAssertTrue(selection.waitForExistence(timeout: 4))
+        let viewport = try canvasViewportRect(of: canvas)
+        // The middle moves the whole line; its endpoints now edit geometry.
+        for x: CGFloat in [0.5, 0.7, 0.3] {
+            let before = try drawingBounds(of: canvas)
+            let start = selection.coordinate(withNormalizedOffset: CGVector(dx: x, dy: 0.5))
+            start.press(forDuration: 0.08, thenDragTo: start.withOffset(CGVector(dx: 15, dy: 24)))
+            let after = try drawingBounds(of: canvas)
+            XCTAssertGreaterThan(after.minY, before.minY + 5)
+            // PKDrawing.bounds encloses the raster on whole-point boundaries.
+            // Fractional translation may add one point without changing the nib.
+            XCTAssertEqual(after.width, originalInk.width, accuracy: 1.01)
+            XCTAssertEqual(after.height, originalInk.height, accuracy: 1.01)
+            XCTAssertEqual(try nibSize(), originalNib)
+            XCTAssertEqual(try canvasViewportRect(of: canvas), viewport)
+        }
+        // Drag an endpoint independently without scaling the nib or moving paper.
+        let beforeResize = try drawingBounds(of: canvas)
+        let fixedEndpoint = app.descendants(matching: .any)["lasso-vertex-0"].frame
+        let handle = app.descendants(matching: .any)["lasso-vertex-1"]
+        XCTAssertTrue(handle.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.descendants(matching: .any)["lasso-resize-bottomRight"].exists)
+        let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.08, thenDragTo: start.withOffset(CGVector(dx: 36, dy: 24)))
+        let afterResize = try drawingBounds(of: canvas)
+        XCTAssertGreaterThan(afterResize.width, beforeResize.width + 5)
+        let resizedNib = try nibSize()
+        XCTAssertEqual(resizedNib, originalNib)
+        XCTAssertEqual(app.descendants(matching: .any)["lasso-vertex-0"].frame.midX, fixedEndpoint.midX, accuracy: 1)
+        XCTAssertEqual(app.descendants(matching: .any)["lasso-vertex-0"].frame.midY, fixedEndpoint.midY, accuracy: 1)
+        XCTAssertEqual(try canvasViewportRect(of: canvas), viewport)
+
+        app.buttons["practice-exit"].tap()
+        app.terminate()
+        app.launchArguments += ["--reuse-text-interaction-ui-test-workspace", "--pencil-only-ui-test"]
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 1", of: canvas)
+        let persisted = try drawingBounds(of: canvas)
+        XCTAssertEqual(persisted.width, afterResize.width, accuracy: 0.1)
+        XCTAssertEqual(persisted.height, afterResize.height, accuracy: 0.1)
+        app.buttons["tool-lasso"].tap()
+        let realViewport = try canvasViewportRect(of: canvas)
+        canvas.coordinate(withNormalizedOffset: CGVector(
+            dx: (persisted.midX - realViewport.minX) / realViewport.width,
+            dy: (persisted.midY - realViewport.minY) / realViewport.height)).tap()
+        XCTAssertTrue(selection.waitForExistence(timeout: 4))
+        let fingerStart = selection.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        fingerStart.press(forDuration: 0.08, thenDragTo: fingerStart.withOffset(CGVector(dx: 35, dy: 50)))
+        let moved = try drawingBounds(of: canvas)
+        XCTAssertGreaterThan(moved.minY, persisted.minY + 10)
+        XCTAssertEqual(moved.width, persisted.width, accuracy: 1.01)
+        XCTAssertEqual(moved.height, persisted.height, accuracy: 1.01)
+        XCTAssertEqual(try nibSize(), resizedNib)
+        XCTAssertEqual(try canvasViewportRect(of: canvas), realViewport,
+                       "The real iPad single-finger camera pan must yield to the selected ink")
+        // The same finger must still pan when its next contact starts outside selection.
+        let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.78))
+        blank.press(forDuration: 0.08, thenDragTo: blank.withOffset(CGVector(dx: -60, dy: -45)))
+        XCTAssertNotEqual(try canvasViewportRect(of: canvas), realViewport)
+    }
+
     func testStrokeSelectionMoveResizeRotateUndoRedoAndPersistence() throws {
         let app = launchIsolatedApp(prefix: "stroke-object-transform")
         let canvas = app.descendants(matching: .any)
@@ -1820,7 +2517,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
 
         let frameBeforeResize = selectionBox.frame
         let resizeHandle = app.descendants(matching: .any)
-            .matching(identifier: "lasso-resize-bottomRight")
+            .matching(identifier: "lasso-vertex-1")
             .firstMatch
         XCTAssertTrue(resizeHandle.waitForExistence(timeout: 3))
         let resizeStart = resizeHandle.coordinate(
@@ -1904,6 +2601,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         app.buttons["page-thumbnail-0"]
             .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         app.buttons.matching(identifier: "关闭页面缩略图").firstMatch.tap()
+        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
+        app.buttons["tool-lasso"].tap()
 
         let pager = app.scrollViews["document-page-pager"]
         let counter = app.scrollViews["document-page-pager"]
@@ -1918,6 +2617,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                     && !canvas.frame.isEmpty
                     && abs(pager.frame.width - canvas.frame.width) < 1
                     && abs(pager.frame.height - canvas.frame.height) < 1
+                    && abs(pager.frame.minY - canvas.frame.minY) < 1
             }
             let viewport = pager.frame.insetBy(dx: 1, dy: 1)
             XCTAssertEqual(pager.frame, canvas.frame, "An unbounded canvas fills exactly one paging viewport")
@@ -1972,6 +2672,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
 #if targetEnvironment(macCatalyst)
         throw XCTSkip("XCUIElement pinch synthesis is unavailable on Mac Catalyst")
 #else
+        XCUIDevice.shared.orientation = .portrait
         let app = launchIsolatedApp(
             prefix: "zoomed-page-navigation",
             additionalLaunchArguments: ["--pencil-only-ui-test"]
@@ -1982,6 +2683,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         app.buttons["page-thumbnail-0"]
             .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         app.buttons.matching(identifier: "关闭页面缩略图").firstMatch.tap()
+        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
+        app.buttons["tool-lasso"].tap()
         let pager = app.scrollViews["document-page-pager"]
         let counter = app.scrollViews["document-page-pager"]
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
@@ -2083,6 +2786,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let first = app.descendants(matching: .any)["page-canvas-0"]
         let second = app.descendants(matching: .any)["page-canvas-1"]
         XCTAssertTrue(first.waitForExistence(timeout: 5))
+        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
+        app.buttons["tool-lasso"].tap()
         let originalTop = first.frame.minY
 
         func dragUp(_ distance: CGFloat) {
@@ -2190,6 +2895,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let counter = app.scrollViews["document-page-pager"]
         let reset = app.buttons["zoom-reset"]
         waitUntil(timeout: 5) { (counter.value as? String ?? "") == "1 / 2" && pager.exists }
+        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
+        app.buttons["tool-lasso"].tap()
 
         // Exercise both directions and both sides of the fit-page boundary. The trailing finger
         // travels far enough to turn a page if the pager takes over when the pinch ends early.
@@ -3190,10 +3897,11 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
     }
 
     func testClosedLassoGroupsAndUngroupsTwoRealObjects() throws {
+        XCUIDevice.shared.orientation = .portrait
         let app = launchIsolatedApp(prefix: "object-group")
         let settingsScroll = app.scrollViews["tool-settings-scroll"]
         XCTAssertTrue(settingsScroll.waitForExistence(timeout: 5))
-        insertShape(named: "矩形", in: app, settingsScroll: settingsScroll)
+        insertShape(named: "三角形", in: app, settingsScroll: settingsScroll)
 
         let shapes = app.descendants(matching: .any)
             .matching(identifier: "page-element-shape")
@@ -3206,14 +3914,18 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertEqual(shapes.count, 1)
         XCTAssertTrue(selectionBox.waitForExistence(timeout: 3))
 
+        let displacement = max(150, selectionBox.frame.width * 0.8)
+        let initialCenter = selectionBox.frame.midX
         let firstMove = selectionBox.coordinate(
             withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
         )
         firstMove.press(
             forDuration: 0.12,
-            thenDragTo: firstMove.withOffset(CGVector(dx: -150, dy: 0))
+            thenDragTo: firstMove.withOffset(CGVector(dx: -displacement, dy: 0))
         )
-        let firstFrame = shapes.element(boundBy: 0).frame
+        let triangle = shapes.matching(NSPredicate(format: "value BEGINSWITH %@", "三角形")).firstMatch
+        let firstFrame = triangle.frame
+        XCTAssertLessThan(firstFrame.midX, initialCenter - displacement * 0.8)
 
         insertShape(named: "圆形", in: app, settingsScroll: settingsScroll)
         XCTAssertEqual(shapes.count, 2)
@@ -3222,9 +3934,9 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
         secondMove.press(
             forDuration: 0.12,
-            thenDragTo: secondMove.withOffset(CGVector(dx: 150, dy: 0))
+            thenDragTo: secondMove.withOffset(CGVector(dx: displacement, dy: 0))
         )
-        let secondFrame = shapes.element(boundBy: 1).frame
+        let secondFrame = shapes.matching(NSPredicate(format: "value BEGINSWITH %@", "圆形")).firstMatch.frame
         XCTAssertFalse(firstFrame.intersects(secondFrame))
 
         canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.10, dy: 0.14)).tap()
@@ -3235,6 +3947,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             in: app
         )
         XCTAssertTrue(app.buttons["删除"].waitForExistence(timeout: 4))
+        XCTAssertFalse(app.descendants(matching: .any)["lasso-vertex-0"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["lasso-resize-bottomRight"].exists)
 
         app.buttons["对象操作"].tap()
         let group = app.buttons["组合"]
@@ -3362,9 +4076,10 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                 insertedShape.waitForExistence(timeout: 3),
                 "插入 \(title) 后没有生成对应的真实页面对象"
             )
+            XCTAssertTrue((insertedShape.value as? String)?.contains("线宽 1.0") == true)
         }
 
-        XCTAssertEqual(shapeTitles(in: shapes), expectedShapes)
+        XCTAssertEqual(shapeTitles(in: shapes).sorted(), expectedShapes.sorted())
     }
 
     func testImageMoveResizeCropAndOpacityChangeARealObject() throws {

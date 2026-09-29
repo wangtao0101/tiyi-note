@@ -66,6 +66,11 @@ private enum LibraryFeatureSmokeHarness {
         defaults.removePersistentDomain(forName: defaultsName)
 
         do {
+            if token.hasPrefix("vertices-only-") {
+                try validateVertexEditing()
+                try validateShapeStyling()
+                return "图形顶点验证通过"
+            }
             try await validateBatchCopy(token: token)
             if token.hasPrefix("copy-only-") {
                 logger.info("TIYI_LIBRARY_SMOKE_PASS token=\(token, privacy: .public)")
@@ -1407,6 +1412,165 @@ private enum LibraryFeatureSmokeHarness {
         guard incomplete.copiedIDs.isEmpty, incomplete.failures.count == 1,
               store.documents(in: folder.id).count == 4 else {
             throw SmokeError.validationFailed("缺失资源生成了不完整副本")
+        }
+    }
+
+    private static func validateShapeStyling() throws {
+        func require(_ condition: Bool, _ message: String) throws {
+            if !condition { throw SmokeError.validationFailed(message) }
+        }
+        func polygon(_ vertices: [CGPoint]) -> [CGPoint] {
+            (0...vertices.count * 12).map { i in
+                let a = vertices[(i / 12) % vertices.count], b = vertices[(i / 12 + 1) % vertices.count]
+                let t = CGFloat(i % 12) / 12
+                return CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+            }
+        }
+        let contours: [(PageShapeKind, [CGPoint])] = [
+            (.line, (0...8).map { CGPoint(x: $0 * 20, y: 30) }),
+            (.triangle, polygon([CGPoint(x: 100, y: 20), CGPoint(x: 200, y: 180), CGPoint(x: 20, y: 180)])),
+            (.rectangle, polygon([.zero, CGPoint(x: 220, y: 0), CGPoint(x: 220, y: 120), CGPoint(x: 0, y: 120)])),
+            (.ellipse, (0...96).map { CGPoint(x: 150 + 120 * cos(Double($0) * .pi / 48), y: 150 + 80 * sin(Double($0) * .pi / 48)) }),
+            (.ellipse, (0...96).map { CGPoint(x: 150 + 100 * cos(Double($0) * .pi / 48), y: 150 + 100 * sin(Double($0) * .pi / 48)) })
+        ]
+        for (kind, points) in contours {
+            let samples = points.enumerated().map { i, point in
+                PKStrokePoint(location: point, timeOffset: Double(i) * 0.01, size: CGSize(width: 2, height: 2),
+                              opacity: 1, force: 1, azimuth: 0, altitude: 1)
+            }
+            let transform = CGAffineTransform(translationX: -600, y: 200).rotated(by: 0.7).scaledBy(x: 0.6, y: 0.6)
+            let stroke = PKStroke(ink: PKInk(.monoline, color: .blue),
+                                  path: PKStrokePath(controlPoints: samples, creationDate: Date()), transform: transform)
+            guard var element = CanvasHitGeometry.editableShape(from: stroke), case .shape(var payload) = element.payload else {
+                throw SmokeError.validationFailed("规则图形缺少样式入口：\(kind)")
+            }
+            try require(payload.kind == kind, "样式转换改变图形类型")
+            let geometry = element.interactionPath(displayScale: 1).boundingBoxOfPath
+            payload.strokeColorHex = "#E9463FFF"; payload.lineWidth = 8; payload.isDashed = true
+            element.payload = .shape(payload)
+            try require(element.interactionPath(displayScale: 1).boundingBoxOfPath == geometry, "样式编辑移动了图形")
+            let restored = try JSONDecoder().decode(CanvasPageElement.self, from: JSONEncoder().encode(element))
+            try require(restored == element, "样式或形状保存失败")
+            let controller = CanvasController()
+            let original = PKDrawing(strokes: [stroke, stroke])
+            _ = controller.prepareUnboundedViewport(CGRect(x: -600, y: 200, width: 1000, height: 700))
+            controller.installInitialDrawing(original)
+            let snapshot = controller.snapshotDrawing()
+            var elements: [CanvasPageElement] = []
+            controller.pageElementsProvider = { elements }
+            controller.onPageElementsUpdated = { updated, _ in elements = updated }
+            try require(controller.replaceInkShape(at: 0, expected: snapshot, with: element), "图形样式未生效")
+            try require(elements == [element] && controller.drawing.strokes.count == 1, "替换影响其他笔迹")
+            let remaining = controller.drawing
+            controller.undo()
+            try require(controller.drawing.strokes.count == 2 && elements.isEmpty, "样式无法单步撤销")
+            controller.redo()
+            try require(controller.drawing.strokes.count == remaining.strokes.count && elements == [element], "样式无法重做")
+            try require(!controller.replaceInkShape(at: 0, expected: snapshot, with: element), "过期样式覆盖新笔迹")
+        }
+    }
+
+    private static func validateVertexEditing() throws {
+        func require(_ condition: Bool, _ message: String) throws {
+            if !condition { throw SmokeError.validationFailed(message) }
+        }
+        func near(_ a: CGPoint, _ b: CGPoint) -> Bool { hypot(a.x - b.x, a.y - b.y) < 0.02 }
+        for angle: CGFloat in [0, 0.7, .pi / 2 - 0.01, .pi / 2 + 0.01, .pi, -.pi / 2] {
+            for length: CGFloat in [12, 180, 900] {
+                let center = CGPoint(x: 120, y: 300)
+                let a = CGPoint(x: center.x - cos(angle) * length / 2, y: center.y - sin(angle) * length / 2)
+                let b = CGPoint(x: center.x + cos(angle) * length / 2, y: center.y + sin(angle) * length / 2)
+                let handle = LineSelectionControls.rotationHandle(from: a, to: b)
+                try require(abs(hypot(handle.x - center.x, handle.y - center.y) - 28) < 0.001,
+                            "旋转按钮距离随线段长度或角度变化")
+                try require(abs((handle.x - center.x) * cos(angle) + (handle.y - center.y) * sin(angle)) < 0.001,
+                            "旋转按钮没有垂直对齐线段中点")
+            }
+        }
+        for kind: PageShapeKind in [.line, .arrow, .triangle, .diamond] {
+            var element = CanvasPageElement(logicalBounds: CGRect(x: -600, y: -400, width: 180, height: 120),
+                rotationRadians: 0.8, payload: .shape(PageShapePayload(kind: kind, lineWidth: 2)))
+            let old = element.shapeVertices(displayScale: 0.5)!
+            var edited = old
+            edited[0].x -= 80
+            edited[0].y += 50
+            element.setShapeVertices(edited)
+            let decoded = try JSONDecoder().decode(CanvasPageElement.self, from: JSONEncoder().encode(element))
+            try require(zip(decoded.shapeVertices(displayScale: 0.5)!, edited).allSatisfy(near), "旋转图形顶点保存后偏移")
+            try require(decoded.interactionPath(displayScale: 0.5).boundingBoxOfPath.contains(edited[0]), "渲染路径没有使用编辑后的顶点")
+        }
+        let legacy = Data(##"{"kind":"triangle","strokeColorHex":"#111111FF","lineWidth":3,"isDashed":false}"##.utf8)
+        try require(try JSONDecoder().decode(PageShapePayload.self, from: legacy).vertices == nil, "旧图形格式无法读取")
+        for kind: PKInk.InkType in [.monoline, .fountainPen, .pencil, .marker] {
+            for angle: CGFloat in [0, .pi / 2, 0.7] {
+                let transform = CGAffineTransform(translationX: -600, y: -400).rotated(by: angle).scaledBy(x: 0.5, y: 0.5)
+                let samples = (0...8).map { i in
+                    PKStrokePoint(location: CGPoint(x: i * 20, y: 0), timeOffset: Double(i) * 0.01,
+                        size: CGSize(width: 2 + Double(i) * 0.1, height: 2), opacity: 0.7, force: 0.8,
+                        azimuth: 0.6, altitude: 1, secondaryScale: 0.9, threshold: 0.1)
+                }
+                let stroke = PKStroke(ink: PKInk(kind, color: .blue),
+                    path: PKStrokePath(controlPoints: samples, creationDate: Date()), transform: transform,
+                    mask: nil, randomSeed: 123)
+                let old = CanvasHitGeometry.editableVertices(in: stroke)!
+                let edited = [old[0], CGPoint(x: old[1].x + 40, y: old[1].y + 75)]
+                let result = CanvasHitGeometry.movingVertices(in: stroke, from: old, to: edited)
+                try require(near(result.path[0].location.applying(transform), old[0])
+                    && near(result.path[8].location.applying(transform), edited[1]), "线段端点没有独立移动")
+                for i in stroke.path.indices {
+                    let a = stroke.path[i], b = result.path[i]
+                    try require(abs(a.size.width - b.size.width) < 0.001 && abs(a.size.height - b.size.height) < 0.004
+                        && a.force == b.force && a.opacity == b.opacity && a.azimuth == b.azimuth
+                        && a.altitude == b.altitude && a.secondaryScale == b.secondaryScale && a.threshold == b.threshold,
+                        "拖动端点改变了原生笔尖或压感")
+                }
+                let controller = CanvasController()
+                let original = PKDrawing(strokes: [stroke])
+                controller.installInitialDrawing(original)
+                controller.beginTransformingStrokes(at: [0])
+                controller.previewStrokeVertices(from: old, to: edited)
+                controller.cancelStrokeTransform()
+                try require(controller.drawing == original, "取消端点编辑没有恢复原图形")
+                controller.beginTransformingStrokes(at: [0])
+                controller.previewStrokeVertices(from: old, to: edited)
+                controller.commitStrokeVertices(from: old, to: edited)
+                let committed = controller.drawing
+                controller.undo()
+                try require(controller.drawing == original, "端点编辑无法单步撤销")
+                controller.redo()
+                try require(controller.drawing == committed, "端点编辑无法重做")
+                controller.installInitialDrawing(original)
+                let center = CGPoint(x: (old[0].x + old[1].x) / 2, y: (old[0].y + old[1].y) / 2)
+                let rotation = CGAffineTransform(translationX: center.x, y: center.y)
+                    .rotated(by: 1.2).translatedBy(x: -center.x, y: -center.y)
+                controller.beginTransformingStrokes(at: [0], usesNativePreview: true)
+                controller.previewStrokeTransform(rotation, usesNativePreview: true)
+                let preview = controller.drawing.strokes[0]
+                try require(near(preview.path[0].location.applying(preview.transform), old[0].applying(rotation)),
+                            "旋转预览没有使用线段的几何中心")
+                controller.commitStrokeTransform(rotation, actionName: "旋转")
+                let final = controller.drawing.strokes[0]
+                for i in preview.path.indices {
+                    try require(near(preview.path[i].location.applying(preview.transform),
+                                     final.path[i].location.applying(final.transform)), "旋转落笔后笔迹发生错位")
+                }
+            }
+        }
+        let vertices = [CGPoint(x: 100, y: 20), CGPoint(x: 200, y: 180), CGPoint(x: 20, y: 180)]
+        let samples = (0...36).map { i -> PKStrokePoint in
+            let edge = (i / 12) % 3, t = CGFloat(i % 12) / 12
+            let a = vertices[edge], b = vertices[(edge + 1) % 3]
+            return PKStrokePoint(location: CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t),
+                timeOffset: Double(i) * 0.01, size: CGSize(width: 2, height: 2), opacity: 1, force: 1,
+                azimuth: 0, altitude: 1)
+        }
+        let triangle = PKStroke(ink: PKInk(.monoline, color: .black), path: PKStrokePath(controlPoints: samples, creationDate: Date()))
+        try require(CanvasHitGeometry.editableVertices(in: triangle)?.count == 3, "识别三角形缺少三个顶点")
+        var edited = vertices
+        edited[0].x += 40
+        let result = CanvasHitGeometry.movingVertices(in: triangle, from: vertices, to: edited)
+        for i in [0, 12, 24, 36] {
+            try require(near(result.path[i].location, edited[(i / 12) % 3]), "移动三角形顶点影响了其他顶点或闭合点")
         }
     }
 

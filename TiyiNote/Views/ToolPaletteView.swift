@@ -665,6 +665,7 @@ struct DockableToolPaletteView: View {
     // Embedded workspaces can supply a smaller command set while sharing the document dock.
     var commands: AnyView? = nil
     var commandCount = 7
+    @ObservedObject var selectionStyle = CanvasSelectionStyle()
 
     @GestureState private var dragTranslation = CGSize.zero
     @State private var measuredPaletteSize = CGSize(width: 48, height: 330)
@@ -714,7 +715,18 @@ struct DockableToolPaletteView: View {
             : AnyLayout(VStackLayout(spacing: 4))
 
         return layout {
-            if let commands {
+            if let payload = selectionStyle.payload {
+                let available = (dockEdge.isHorizontal ? containerSize.width - leadingContentInset : containerSize.height) - 68
+                let length = min(CGFloat(479), max(38, available))
+                ScrollView(dockEdge.isHorizontal ? .horizontal : .vertical, showsIndicators: false) {
+                    layout {
+                        ShapeSelectionPaletteControls(style: selectionStyle, payload: payload,
+                                                      isHorizontal: dockEdge.isHorizontal)
+                    }
+                }
+                .frame(width: dockEdge.isHorizontal ? length : 38,
+                       height: dockEdge.isHorizontal ? 38 : length)
+            } else if let commands {
                 let available = (dockEdge.isHorizontal ? containerSize.width - leadingContentInset : containerSize.height) - 84
                 let length = min(CGFloat(commandCount * 42 - 4), max(38, available))
                 ScrollView(dockEdge.isHorizontal ? .horizontal : .vertical, showsIndicators: false) {
@@ -975,6 +987,71 @@ struct DockableToolPaletteView: View {
     }
 }
 
+/// Immediate shape edits live in the existing dock, with no modal Save step.
+private struct ShapeSelectionPaletteControls: View {
+    let style: CanvasSelectionStyle
+    let payload: PageShapePayload
+    let isHorizontal: Bool
+
+    var body: some View {
+        DockPaletteButton(symbol: "checkmark", title: "完成图形选择", action: style.finishSelection)
+            .accessibilityIdentifier("shape-quick-done")
+        DockPaletteDivider(isHorizontalPalette: isHorizontal)
+        ForEach([InkPaletteColor.graphite, .ocean, .coral]) { color in
+            DockPaletteColorSwatch(color: color,
+                isSelected: payload.strokeColorHex.uppercased() == color.rgbaHex.uppercased(),
+                identifier: "shape-quick-color-\(color.rawValue)") {
+                style.change(.color(color.rgbaHex))
+            }
+        }
+        DockPaletteColorMenu(selection: Binding(get: { InkPaletteColor.nearest(to: payload.strokeColorHex) },
+                                               set: { style.change(.color($0.rgbaHex)) }))
+        DockPaletteDivider(isHorizontalPalette: isHorizontal)
+        ForEach([1.0, 2.0, 4.0], id: \.self) { width in
+            Button { style.change(.width(width)) } label: {
+                DockPaletteIcon(isSelected: abs(payload.lineWidth - width) < 0.05) {
+                    VStack(spacing: 4) {
+                        Capsule().frame(width: 21, height: width)
+                        Text("\(Int(width))").font(.system(size: 9, weight: .semibold)).monospacedDigit()
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("图形线宽 \(Int(width))")
+            .accessibilityIdentifier("shape-quick-width-\(Int(width))")
+            .accessibilityValue(abs(payload.lineWidth - width) < 0.05 ? "selected" : "not-selected")
+        }
+        Menu {
+            ForEach([1.0, 1.5, 2, 3, 4, 5, 8, 12, 20], id: \.self) { width in
+                Button { style.change(.width(width)) } label: {
+                    Label(String(format: "%g pt", width), systemImage: abs(payload.lineWidth - width) < 0.05 ? "checkmark" : "lineweight")
+                }
+            }
+        } label: {
+            DockPaletteIcon {
+                Text(String(format: "%g", payload.lineWidth)).font(.system(size: 12, weight: .semibold)).monospacedDigit()
+            }
+        }
+        .accessibilityLabel("更多图形线宽")
+        .accessibilityValue(String(format: "%g pt", payload.lineWidth))
+        .accessibilityIdentifier("shape-quick-width-more")
+        DockPaletteDivider(isHorizontalPalette: isHorizontal)
+        ForEach([false, true], id: \.self) { dashed in
+            Button { style.change(.dashed(dashed)) } label: {
+                DockPaletteIcon(isSelected: payload.isDashed == dashed) {
+                    Path { path in path.move(to: CGPoint(x: 0, y: 4)); path.addLine(to: CGPoint(x: 24, y: 4)) }
+                        .stroke(style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: dashed ? [4, 4] : []))
+                        .frame(width: 24, height: 8)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(dashed ? "图形虚线" : "图形实线")
+            .accessibilityIdentifier(dashed ? "shape-quick-dashed" : "shape-quick-solid")
+            .accessibilityValue(payload.isDashed == dashed ? "selected" : "not-selected")
+        }
+    }
+}
+
 private struct DockablePaletteSizePreferenceKey: PreferenceKey {
     static var defaultValue = CGSize.zero
 
@@ -1099,6 +1176,7 @@ private struct InkWidthPresetButton: View {
 private struct DockPaletteColorSwatch: View {
     let color: InkPaletteColor
     let isSelected: Bool
+    var identifier: String? = nil
     let action: () -> Void
 
     var body: some View {
@@ -1116,7 +1194,7 @@ private struct DockPaletteColorSwatch: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(color.title)
-        .accessibilityIdentifier("ink-color-\(color.rawValue)")
+        .accessibilityIdentifier(identifier ?? "ink-color-\(color.rawValue)")
         .accessibilityValue(isSelected ? "selected" : "not-selected")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }

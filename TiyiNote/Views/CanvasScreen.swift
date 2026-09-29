@@ -390,7 +390,8 @@ struct CanvasScreen: View {
                                 eraserSize: $eraserSize,
                                 dockEdge: $toolPaletteDockEdge,
                                 dockProgress: $toolPaletteDockProgress,
-                                leadingContentInset: thumbnailVisibility.wrappedValue ? 293 : 0
+                                leadingContentInset: thumbnailVisibility.wrappedValue ? 293 : 0,
+                                selectionStyle: activeController?.selectionStyle ?? CanvasSelectionStyle()
                             )
                             .zIndex(20)
                         }

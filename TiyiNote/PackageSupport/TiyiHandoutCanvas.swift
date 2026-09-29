@@ -41,8 +41,6 @@ enum HandoutAttachmentError: LocalizedError {
     private var mountedPageIDs: Set<String> = []
     private var sessionOrder: [String] = []
     var cachedSessionCount: Int { sessions.count }
-    private let signaturesURL: URL
-    private var signatures: [String: String]
     @Published public var errorMessage: String?
     @Published var requestedPageID: String?
     public var onInteract: ((String) -> Void)?
@@ -53,9 +51,6 @@ enum HandoutAttachmentError: LocalizedError {
         let key = SHA256.hash(data: Data(directory.path.utf8)).map { String(format: "%02x", $0) }.joined()
         defaults = UserDefaults(suiteName: "tiyi.handout.\(key)")!
         store = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: directory, includesBundledSamples: false)
-        signaturesURL = directory.appendingPathComponent("handout-layouts.json")
-        signatures = FileManager.default.fileExists(atPath: signaturesURL.path)
-            ? try JSONDecoder().decode([String: String].self, from: Data(contentsOf: signaturesURL)) : [:]
         if let existing = store.documents.first {
             documentID = existing.id
         } else {
@@ -76,8 +71,6 @@ enum HandoutAttachmentError: LocalizedError {
                 store.flush(drawing, forPage: page.orderIndex, in: documentID)
                 guard store.flushAllPendingSaves() else { throw CocoaError(.fileWriteUnknown) }
                 store.saveCanvasViewport(state.viewport, forPageID: page.id, in: documentID)
-                if !drawing.strokes.isEmpty { signatures[source.id] = state.signature }
-                try JSONEncoder().encode(signatures).write(to: signaturesURL, options: .atomic)
             }
             try store.setHandoutSource(source.id, for: page.id, in: documentID)
         }
@@ -86,7 +79,7 @@ enum HandoutAttachmentError: LocalizedError {
         store.handoutWorkspace = self
     }
     private struct LegacyCheckpoint: Decodable {
-        var version: Int; var signature: String; var drawing: Data; var viewport: CanvasViewport
+        var version: Int; var drawing: Data; var viewport: CanvasViewport
     }
     func sourceID(for pageID: String) -> String? {
         // This is called on every camera update. Never enumerate collaboration files for an
@@ -122,20 +115,9 @@ enum HandoutAttachmentError: LocalizedError {
     }
     func validate(_ session: TiyiHandoutPageSession, pageID: String) throws {
         if session.isReady { return }
-        guard let signature = session.signature, let source = sourceID(for: pageID) else { throw CocoaError(.fileReadCorruptFile) }
-        if let old = signatures[source], old != signature {
-            let archived = store.deletedPages(in: documentID).contains { $0.handoutSourceID == source }
-            let annotated = archived || store.pages(in: documentID).filter { $0.handoutSourceID == source }.contains {
-                !store.loadDrawing(forPage: $0.orderIndex, in: documentID).strokes.isEmpty || !store.loadPageElements(forPage: $0.orderIndex, in: documentID).isEmpty
-            }
-            guard !annotated else { throw HandoutAttachmentError.message("讲义排版与保存笔迹时不同。原有笔迹已保留，请使用原排版版本继续书写。") }
-        }
-        if signatures[source] != signature {
-            var updated = signatures
-            updated[source] = signature
-            try JSONEncoder().encode(updated).write(to: signaturesURL, options: .atomic)
-            signatures = updated
-        }
+        guard session.signature != nil, sourceID(for: pageID) != nil else { throw CocoaError(.fileReadCorruptFile) }
+        // Only wait for this render to finish. Reopen existing ink at its saved coordinates,
+        // regardless of earlier layout measurements; legacy handout-layouts.json is unused.
         session.acceptLayout()
     }
     public func selectChapter(_ sourceID: String) {
@@ -186,7 +168,7 @@ struct HandoutPageHost<Content: View>: View {
     }
 }
 
-/// Do not mount the shared writable editor until fonts/assets and the saved layout are verified.
+/// Wait for fonts/assets to finish loading before mounting the shared writable editor.
 struct HandoutPageGate<Content: View>: View {
     @ObservedObject var session: TiyiHandoutPageSession
     let workspace: TiyiHandoutWorkspace

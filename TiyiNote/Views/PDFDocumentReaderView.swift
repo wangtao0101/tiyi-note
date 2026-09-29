@@ -244,7 +244,7 @@ struct PDFDocumentReaderView: View {
 
     private var pagesScrollView: some View {
         GeometryReader { geometry in
-            Group {
+            ScrollViewReader { scrollProxy in
                 ScrollView(usesContinuousPDFScrolling ? [.horizontal, .vertical] : .vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
                         ForEach(documentStore.pages(in: documentID)) { pageMetadata in
@@ -291,6 +291,12 @@ struct PDFDocumentReaderView: View {
                     else { return }
                     requestPage(pageIndex)
                     externalPageRequest = nil
+                }
+                .onChange(of: geometry.size) { _, _ in
+                    guard !usesContinuousPDFScrolling, let visiblePageID else { return }
+                    // A page's height changes on rotation/window resize. Keep
+                    // its top aligned instead of retaining the old pixel offset.
+                    scrollProxy.scrollTo(visiblePageID, anchor: .top)
                 }
 
             }
@@ -1219,7 +1225,9 @@ private struct PDFPageAnnotationView: View {
             return "；墨迹 \(stroke.ink.inkType.rawValue)," + String(
                 format: "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
                 red, green, blue, alpha, point.size.width, point.size.height, point.opacity
-            )
+            ) + String(format: "；笔尖 %.4f,%.4f",
+                point.size.width * hypot(stroke.transform.a, stroke.transform.b),
+                point.size.height * hypot(stroke.transform.c, stroke.transform.d))
         } ?? "")
     }
 
@@ -1976,7 +1984,9 @@ private struct PDFPageAnnotationView: View {
         payload.fillColorHex = shapeFillEnabledDraft ? shapeFillColorDraft.rgbaHex : nil
         payload.lineWidth = min(max(shapeLineWidthDraft, 1), 20)
         payload.isDashed = shapeDashedDraft
+        let previous = element
         element.payload = .shape(payload)
+        if element != previous { controller.recordElementVertexEdit(previous: [previous]) }
         if let index = pageElements.firstIndex(where: { $0.id == editingShapeElementID }) {
             pageElements[index] = element
         } else {
@@ -2758,7 +2768,7 @@ private struct PageShapeEditorSheet: View {
         NavigationStack {
             Form {
                 Section("线条") {
-                    colorPicker(selection: $strokeColor)
+                    colorPicker(selection: $strokeColor, prefix: "shape-stroke-color")
                     HStack {
                         Text("粗细")
                         Slider(value: $lineWidth, in: 1...20, step: 0.5)
@@ -2773,7 +2783,7 @@ private struct PageShapeEditorSheet: View {
                 Section("填充") {
                     Toggle("启用填充", isOn: $fillEnabled)
                         .accessibilityIdentifier("shape-fill-enabled")
-                    if fillEnabled { colorPicker(selection: $fillColor) }
+                    if fillEnabled { colorPicker(selection: $fillColor, prefix: "shape-fill-color") }
                 }
             }
             .navigationTitle("图形样式")
@@ -2791,7 +2801,7 @@ private struct PageShapeEditorSheet: View {
         .presentationDetents([.medium])
     }
 
-    private func colorPicker(selection: Binding<InkPaletteColor>) -> some View {
+    private func colorPicker(selection: Binding<InkPaletteColor>, prefix: String) -> some View {
         HStack(spacing: 14) {
             ForEach(InkPaletteColor.allCases) { candidate in
                 Button {
@@ -2811,9 +2821,56 @@ private struct PageShapeEditorSheet: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(candidate.title)
+                .accessibilityIdentifier("\(prefix)-\(candidate.rawValue)")
+                .accessibilityValue(selection.wrappedValue == candidate ? "selected" : "not-selected")
             }
         }
     }
+}
+
+private struct SelectionShapeStyleEditor: View {
+    let original: PageShapePayload
+    let onCancel: () -> Void
+    let onSave: (PageShapePayload) -> Void
+    @State private var didChangeStroke = false
+    @State private var didChangeFill = false
+    @State private var stroke: InkPaletteColor
+    @State private var fill: InkPaletteColor
+    @State private var fillEnabled: Bool
+    @State private var width: Double
+    @State private var dashed: Bool
+
+    init(payload: PageShapePayload, onCancel: @escaping () -> Void, onSave: @escaping (PageShapePayload) -> Void) {
+        original = payload
+        self.onCancel = onCancel
+        self.onSave = onSave
+        _stroke = State(initialValue: InkPaletteColor.nearest(to: payload.strokeColorHex))
+        _fill = State(initialValue: InkPaletteColor.nearest(to: payload.fillColorHex ?? InkPaletteColor.ocean.rgbaHex))
+        _fillEnabled = State(initialValue: payload.fillColorHex != nil)
+        _width = State(initialValue: payload.lineWidth)
+        _dashed = State(initialValue: payload.isDashed)
+    }
+
+    var body: some View {
+        PageShapeEditorSheet(strokeColor: Binding(get: { stroke }, set: { stroke = $0; didChangeStroke = true }),
+                             fillEnabled: $fillEnabled,
+                             fillColor: Binding(get: { fill }, set: { fill = $0; didChangeFill = true }),
+                             lineWidth: $width, isDashed: $dashed, onCancel: onCancel) {
+            var updated = original
+            if didChangeStroke { updated.strokeColorHex = stroke.rgbaHex }
+            updated.lineWidth = width
+            updated.isDashed = dashed
+            updated.fillColorHex = fillEnabled ? (didChangeFill ? fill.rgbaHex : original.fillColorHex ?? fill.rgbaHex) : nil
+            onSave(updated)
+        }
+    }
+}
+
+private struct SelectionShapeStyleDraft: Identifiable {
+    var id: UUID { element.id }
+    var element: CanvasPageElement
+    var sourceDrawing: CanvasController.DrawingSnapshot?
+    var strokeIndex: Int?
 }
 
 private struct PageElementView: View {
@@ -2936,6 +2993,7 @@ private extension CanvasPageElement {
         case .shape(let payload):
             [
                 payload.kind.title,
+                "颜色 \(payload.strokeColorHex)",
                 "线宽 \(String(format: "%.1f", payload.lineWidth))",
                 payload.isDashed ? "虚线" : "实线",
                 payload.fillColorHex == nil ? "无填充" : "有填充",
@@ -3010,6 +3068,8 @@ struct CourseInkSelectionOverlay: View {
     let logicalViewport: CGRect
     let background: LibraryPage
     let isActive: Bool
+    @Binding var pageElements: [CanvasPageElement]
+    let onPageElementsChanged: () -> Void
     let onNavigation: (CanvasNavigationChange) -> Void
 
     var body: some View {
@@ -3017,16 +3077,28 @@ struct CourseInkSelectionOverlay: View {
             controller: controller, page: page, logicalPageSize: logicalPageSize,
             logicalViewport: logicalViewport, canvasBackground: background,
             isActive: isActive, allowsLassoCreation: true, isEditingText: false,
-            pageElements: .constant([]), requestedSelection: .constant(nil),
-            onBeginInteraction: {}, onPageElementsChanged: {}, onInsertTextElement: { _ in },
+            pageElements: $pageElements, requestedSelection: .constant(nil),
+            onBeginInteraction: {}, onPageElementsChanged: onPageElementsChanged, onInsertTextElement: { _ in },
             onSelectTextTool: {}, onEditTextElement: { _ in }, onCropImageElement: { _ in },
-            onEditShapeElement: { _ in }, onOpenQuestion: { _ in }, onAskAssistant: { _, _ in },
+            onEditShapeElement: nil, onOpenQuestion: { _ in }, onAskAssistant: { _, _ in },
             allowsAssistant: false, onCanvasNavigation: onNavigation)
+            .background {
+                GeometryReader { geometry in
+                    let projection = PageProjection(pageSize: logicalPageSize, viewport: logicalViewport)
+                    ForEach(pageElements.sorted { $0.zIndex < $1.zIndex }) { element in
+                        let rect = projection.displayRect(element.logicalBounds, displaySize: geometry.size)
+                        PageElementView(element: element, displayScale: geometry.size.width / logicalViewport.width)
+                            .frame(width: rect.width, height: rect.height)
+                            .rotationEffect(.radians(element.rotationRadians))
+                            .position(x: rect.midX, y: rect.midY)
+                    }
+                }.allowsHitTesting(false)
+            }
             .onDisappear { controller.cancelStrokeTransform() }
     }
 }
 
-private struct LassoSelectionContent {
+private struct LassoSelectionContent: Equatable {
     var strokeIndices: Set<Int> = []
     var elementIDs: Set<UUID> = []
 
@@ -3059,7 +3131,7 @@ private struct LassoSelectionOverlay: View {
     let onSelectTextTool: () -> Void
     let onEditTextElement: (UUID) -> Void
     let onCropImageElement: (UUID) -> Void
-    let onEditShapeElement: (UUID) -> Void
+    let onEditShapeElement: ((UUID) -> Void)?
     let onOpenQuestion: (CanvasPageElement) -> Void
     let onAskAssistant: (Data, CGRect) -> Void
     var allowsAssistant = true
@@ -3072,7 +3144,11 @@ private struct LassoSelectionOverlay: View {
     @State private var transformOriginElements: [UUID: CanvasPageElement] = [:]
     @State private var inputDragMode: LassoInputDragMode?
     @State private var inputDragStart: CGPoint?
+    @State private var vertexDragOrigin: [CGPoint]?
+    @State private var liveVertices: [CGPoint]?
     @State private var feedbackText: String?
+    @State private var shapeStyleDraft: SelectionShapeStyleDraft?
+    @State private var styleOwner = UUID()
 
     private var projection: PageProjection {
         PageProjection(pageSize: logicalPageSize, viewport: logicalViewport)
@@ -3108,6 +3184,7 @@ private struct LassoSelectionOverlay: View {
                             // taps deterministic: lasso always selects, text always edits.
                             handleTap(at: point, displaySize: geometry.size)
                         },
+                        onCancelled: cancelInputDrag,
                         onCanvasNavigation: onCanvasNavigation,
                         navigationTouchCount: controller.navigationTouchCount
                     )
@@ -3137,7 +3214,7 @@ private struct LassoSelectionOverlay: View {
                             },
                             canEditText: selectedEditableTextID != nil,
                             canCropImage: selectedCroppableImageID != nil,
-                            canEditShape: selectedEditableShapeID != nil,
+                            canEditShape: selectedEditableShapeID != nil || selectedInkShapeIndex != nil,
                             canModifySelection: !selectionContainsLockedElement,
                             hasSelectedElements: !selection.content.elementIDs.isEmpty,
                             canGroup: canGroupSelection,
@@ -3179,9 +3256,18 @@ private struct LassoSelectionOverlay: View {
                     }
                 }
             }
-            .coordinateSpace(name: LassoCoordinateSpace.page)
         }
         .allowsHitTesting(isActive)
+        .onChange(of: selection, initial: true) { _, _ in publishSelectionStyle() }
+        .onChange(of: pageElements) { _, _ in publishSelectionStyle() }
+        .onDisappear { controller.selectionStyle.clear(owner: styleOwner) }
+        .sheet(item: $shapeStyleDraft) { draft in
+            if case .shape(let payload) = draft.element.payload {
+                SelectionShapeStyleEditor(payload: payload, onCancel: { shapeStyleDraft = nil }) { updated in
+                    commitSelectionShapeStyle(draft, payload: updated)
+                }
+            }
+        }
         .onChange(of: isActive) { _, active in
             if !active {
                 clearSelection()
@@ -3190,6 +3276,19 @@ private struct LassoSelectionOverlay: View {
             }
         }
         .onAppear(perform: consumeRequestedSelectionIfPossible)
+        .onReceive(controller.$selectionHistoryRevision.dropFirst()) { _ in
+            guard transformOriginSelection == nil, let selected = selection else { return }
+            guard selected.content.elementIDs.allSatisfy({ id in pageElements.contains { $0.id == id } }),
+                  selected.content.strokeIndices.allSatisfy({ controller.drawing.strokes.indices.contains($0) }) else {
+                clearSelection()
+                return
+            }
+            let element = selected.content.strokeIndices.isEmpty && selected.content.elementIDs.count == 1
+                ? pageElements.first(where: { selected.content.elementIDs.contains($0.id) }) : nil
+            selection = LassoStrokeSelection(content: selected.content,
+                logicalBounds: logicalBounds(for: selected.content, fallback: selected.logicalBounds),
+                rotationRadians: CGFloat(element?.rotationRadians ?? 0))
+        }
         .onChange(of: requestedSelection?.id) { _, _ in
             consumeRequestedSelectionIfPossible()
         }
@@ -3253,7 +3352,7 @@ private struct LassoSelectionOverlay: View {
         displaySize: CGSize
     ) -> Bool {
         guard allowsLassoCreation else { return false }
-        if selectionContains(displayPoint, displaySize: displaySize) {
+        if selectionDragMode(at: displayPoint, displaySize: displaySize) != nil {
             return true
         }
         // On a physical iPad a finger keeps navigating the page while Apple Pencil
@@ -3318,6 +3417,13 @@ private struct LassoSelectionOverlay: View {
         return elementID
     }
 
+    private var selectedInkShapeIndex: Int? {
+        guard let selection, selection.content.elementIDs.isEmpty, selection.content.strokeIndices.count == 1,
+              let index = selection.content.strokeIndices.first, controller.drawing.strokes.indices.contains(index),
+              CanvasHitGeometry.editableShape(from: controller.drawing.strokes[index]) != nil else { return nil }
+        return index
+    }
+
     private var selectionContainsLockedElement: Bool {
         guard let selection else { return false }
         return pageElements.contains {
@@ -3379,26 +3485,23 @@ private struct LassoSelectionOverlay: View {
         in displaySize: CGSize
     ) -> some View {
         let displayBounds = selectionDisplayBounds(for: selection, in: displaySize)
+        let vertices = selectionContainsLockedElement ? nil : editableSelectionVertices(for: selection, displaySize: displaySize)
         let rotation = Angle.radians(Double(selection.rotationRadians))
         let rotationAnchor = rotationHandlePosition(for: selection, in: displaySize)
-        let boxBottom = rotatedDisplayPoint(
-            CGPoint(x: displayBounds.midX, y: displayBounds.maxY),
-            around: CGPoint(x: displayBounds.midX, y: displayBounds.midY),
-            radians: selection.rotationRadians
-        )
+        let boxBottom = rotationHandleAttachment(for: selection, in: displaySize)
 
         Rectangle()
             .fill(Color.clear)
             .frame(width: displayBounds.width, height: displayBounds.height)
             .overlay {
                 Rectangle()
-                    .stroke(TiyiNoteTheme.lassoBlue, lineWidth: 1.15)
+                    .stroke(TiyiNoteTheme.lassoBlue, lineWidth: vertices == nil ? 1.15 : 0)
                     .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
             .rotationEffect(rotation)
             .position(x: displayBounds.midX, y: displayBounds.midY)
-            .gesture(moveSelectionGesture(displaySize: displaySize))
+            .allowsHitTesting(false)
             .accessibilityIdentifier("lasso-selection-box")
 
         if selectionContainsLockedElement {
@@ -3421,7 +3524,24 @@ private struct LassoSelectionOverlay: View {
         }
 
         if !selectionContainsLockedElement && !selectionContainsQuestionElement {
-            ForEach(LassoResizeHandle.allCases) { handle in
+            if let vertices {
+                Path { path in
+                    path.addLines(vertices.map { displayPoint(for: $0, in: displaySize) })
+                    if vertices.count > 2 { path.closeSubpath() }
+                }
+                .stroke(TiyiNoteTheme.lassoBlue.opacity(0.7), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .allowsHitTesting(false)
+                ForEach(vertices.indices, id: \.self) { index in
+                    Circle().fill(Color.white)
+                        .frame(width: 12, height: 12)
+                        .overlay { Circle().stroke(TiyiNoteTheme.lassoBlue, lineWidth: 1.5) }
+                        .position(displayPoint(for: vertices[index], in: displaySize))
+                        .allowsHitTesting(false)
+                        .accessibilityLabel(vertices.count == 2 ? "移动线段端点" : "移动图形顶点")
+                        .accessibilityIdentifier("lasso-vertex-\(index)")
+                }
+            } else {
+              ForEach(LassoResizeHandle.allCases) { handle in
                 Circle()
                     .fill(Color.white)
                     .frame(width: 9, height: 9)
@@ -3435,9 +3555,10 @@ private struct LassoSelectionOverlay: View {
                             rotationRadians: selection.rotationRadians
                         )
                     )
-                    .gesture(resizeSelectionGesture(handle: handle, displaySize: displaySize))
+                    .allowsHitTesting(false)
                     .accessibilityLabel("调整选中内容大小")
                     .accessibilityIdentifier("lasso-resize-\(handle.rawValue)")
+              }
             }
 
             Circle()
@@ -3453,14 +3574,29 @@ private struct LassoSelectionOverlay: View {
                 }
                 .contentShape(Circle().inset(by: -15))
                 .position(rotationAnchor)
-                .gesture(rotationSelectionGesture(displaySize: displaySize))
+                .allowsHitTesting(false)
                 .accessibilityLabel("旋转选中内容")
                 .accessibilityIdentifier("lasso-rotation-handle")
         }
     }
 
+    private func editableSelectionVertices(for selection: LassoStrokeSelection, displaySize: CGSize) -> [CGPoint]? {
+        if let liveVertices { return liveVertices }
+        if selection.content.strokeIndices.isEmpty, selection.content.elementIDs.count == 1,
+           let element = pageElements.first(where: { selection.content.elementIDs.contains($0.id) }),
+           element.groupID == nil, case .shape(let shape) = element.payload,
+           shape.kind != .rectangle && shape.kind != .ellipse {
+            return element.shapeVertices(displayScale: displayScale(in: displaySize))
+        }
+        if selection.content.elementIDs.isEmpty, selection.content.strokeIndices.count == 1,
+           let index = selection.content.strokeIndices.first, controller.drawing.strokes.indices.contains(index) {
+            return CanvasHitGeometry.editableVertices(in: controller.drawing.strokes[index])
+        }
+        return nil
+    }
+
     private func beginInputDrag(at displayPoint: CGPoint, displaySize: CGSize) {
-        if let selection, selectionContains(displayPoint, displaySize: displaySize) {
+        if let selection, let mode = selectionDragMode(at: displayPoint, displaySize: displaySize) {
             guard !selectionContainsLockedElement else {
                 showTransientFeedback("对象已锁定，请先解锁")
                 return
@@ -3470,8 +3606,10 @@ private struct LassoSelectionOverlay: View {
             transformOriginSelection = nil
             liveLassoPath = []
             feedbackText = nil
-            inputDragMode = .movingSelection
+            inputDragMode = mode
             inputDragStart = logicalPoint(for: displayPoint, in: displaySize)
+            vertexDragOrigin = editableSelectionVertices(for: selection, displaySize: displaySize)
+            liveVertices = vertexDragOrigin
             _ = beginTransformIfNeeded(for: selection)
             return
         }
@@ -3481,69 +3619,158 @@ private struct LassoSelectionOverlay: View {
         beginLasso(at: displayPoint, displaySize: displaySize)
     }
 
+    // All selection gestures use the same UIKit recognizer as lasso creation. The
+    // paper's pan must wait for this recognizer, including contacts on the handles.
+    private func selectionDragMode(at point: CGPoint, displaySize: CGSize) -> LassoInputDragMode? {
+        guard let selection else { return nil }
+        if !selectionContainsLockedElement && !selectionContainsQuestionElement {
+            let bounds = selectionDisplayBounds(for: selection, in: displaySize)
+            if let vertices = editableSelectionVertices(for: selection, displaySize: displaySize) {
+                if let index = vertices.indices.min(by: {
+                    let a = displayPoint(for: vertices[$0], in: displaySize)
+                    let b = displayPoint(for: vertices[$1], in: displaySize)
+                    return hypot(point.x - a.x, point.y - a.y) < hypot(point.x - b.x, point.y - b.y)
+                }) {
+                    let center = displayPoint(for: vertices[index], in: displaySize)
+                    if hypot(point.x - center.x, point.y - center.y) <= 22 { return .movingVertex(index) }
+                }
+            } else {
+              for handle in LassoResizeHandle.allCases {
+                let center = handle.position(in: bounds, rotationRadians: selection.rotationRadians)
+                if hypot(point.x - center.x, point.y - center.y) <= 16.5 {
+                    return .resizingSelection(handle)
+                }
+              }
+            }
+            let rotationCenter = rotationHandlePosition(for: selection, in: displaySize)
+            if hypot(point.x - rotationCenter.x, point.y - rotationCenter.y) <= 22.5 {
+                return .rotatingSelection
+            }
+        }
+        return selectionContains(point, displaySize: displaySize) ? .movingSelection : nil
+    }
+
     private func updateInputDrag(to displayPoint: CGPoint, displaySize: CGSize) {
-        switch inputDragMode {
-        case .movingSelection:
-            updateFreeformSelectionMove(to: displayPoint, displaySize: displaySize)
-        case .drawingLasso:
+        if case .movingVertex = inputDragMode {
+            updateVertexDrag(to: displayPoint, displaySize: displaySize)
+        } else if case .drawingLasso = inputDragMode {
             extendLasso(to: displayPoint, displaySize: displaySize)
-        case nil:
-            break
+        } else if let transform = updateSelectionDrag(to: displayPoint, displaySize: displaySize) {
+            // A geometric stroke is cheap to render natively. Its ink and nodes
+            // should share the exact path throughout rotation, without a bitmap
+            // preview changing appearance/position when the contact lifts.
+            let nativeRotation: Bool
+            if case .rotatingSelection = inputDragMode { nativeRotation = vertexDragOrigin != nil }
+            else { nativeRotation = false }
+            controller.previewStrokeTransform(transform, usesNativePreview: nativeRotation)
+            previewElementTransform(transform)
         }
     }
 
     private func finishInputDrag(at displayPoint: CGPoint, displaySize: CGSize) {
-        switch inputDragMode {
-        case .movingSelection:
-            updateFreeformSelectionMove(to: displayPoint, displaySize: displaySize)
-            if let origin = transformOriginSelection, let moved = selection {
-                let translation = CGSize(
-                    width: moved.logicalBounds.midX - origin.logicalBounds.midX,
-                    height: moved.logicalBounds.midY - origin.logicalBounds.midY
-                )
-                finishTransform(
-                    CGAffineTransform(
-                        translationX: translation.width,
-                        y: translation.height
-                    ),
-                    actionName: "移动选中笔迹"
-                )
+        if case .movingVertex = inputDragMode {
+            updateVertexDrag(to: displayPoint, displaySize: displaySize)
+            if let origin = vertexDragOrigin, let vertices = liveVertices,
+               let selection = transformOriginSelection {
+                if !selection.content.strokeIndices.isEmpty {
+                    controller.commitStrokeVertices(from: origin, to: vertices)
+                } else if origin != vertices {
+                    controller.recordElementVertexEdit(previous: Array(transformOriginElements.values))
+                    onPageElementsChanged()
+                }
             }
-        case .drawingLasso:
+            transformOriginSelection = nil
+            transformOriginElements = [:]
+            vertexDragOrigin = nil
+            liveVertices = nil
+        } else if case .drawingLasso = inputDragMode {
             finishLasso(at: displayPoint, displaySize: displaySize)
-        case nil:
-            break
+        } else if let transform = updateSelectionDrag(to: displayPoint, displaySize: displaySize) {
+            previewElementTransform(transform)
+            let actionName: String
+            switch inputDragMode {
+            case .resizingSelection: actionName = "缩放选中笔迹"
+            case .rotatingSelection: actionName = "旋转选中笔迹"
+            default: actionName = "移动选中笔迹"
+            }
+            finishTransform(transform, actionName: actionName)
         }
         inputDragMode = nil
         inputDragStart = nil
+        vertexDragOrigin = nil
+        liveVertices = nil
     }
 
-    private func updateFreeformSelectionMove(
-        to displayPoint: CGPoint,
-        displaySize: CGSize
-    ) {
-        guard
-            let origin = transformOriginSelection,
-            let inputDragStart
-        else { return }
+    private func cancelInputDrag() {
+        controller.cancelStrokeTransform()
+        if let origin = transformOriginSelection { selection = origin }
+        for (id, origin) in transformOriginElements {
+            if let index = pageElements.firstIndex(where: { $0.id == id }) {
+                pageElements[index] = origin
+            }
+        }
+        transformOriginSelection = nil
+        transformOriginElements = [:]
+        liveLassoPath = []
+        inputDragMode = nil
+        inputDragStart = nil
+        vertexDragOrigin = nil
+        liveVertices = nil
+    }
 
+    private func updateVertexDrag(to displayPoint: CGPoint, displaySize: CGSize) {
+        guard case .movingVertex(let index) = inputDragMode, let origin = vertexDragOrigin,
+              origin.indices.contains(index), let start = inputDragStart,
+              let originalSelection = transformOriginSelection else { return }
         let current = logicalPoint(for: displayPoint, in: displaySize)
-        let translation = CGSize(
-            width: current.x - inputDragStart.x,
-            height: current.y - inputDragStart.y
-        )
-        let transform = CGAffineTransform(
-            translationX: translation.width,
-            y: translation.height
-        )
-        var movedSelection = origin
-        movedSelection.logicalBounds = origin.logicalBounds.offsetBy(
-            dx: translation.width,
-            dy: translation.height
-        )
-        updateSelection(movedSelection)
-        controller.previewStrokeTransform(transform)
-        previewElementTransform(transform)
+        var vertices = origin
+        vertices[index] = CGPoint(x: origin[index].x + current.x - start.x,
+                                  y: origin[index].y + current.y - start.y)
+        liveVertices = vertices
+        if !originalSelection.content.strokeIndices.isEmpty {
+            controller.previewStrokeVertices(from: origin, to: vertices)
+        } else if let id = originalSelection.content.elementIDs.first,
+                  let element = transformOriginElements[id],
+                  let elementIndex = pageElements.firstIndex(where: { $0.id == id }) {
+            var edited = element
+            edited.setShapeVertices(vertices)
+            pageElements[elementIndex] = edited
+        }
+        updateSelection(LassoStrokeSelection(content: originalSelection.content,
+            logicalBounds: logicalBounds(for: originalSelection.content, fallback: originalSelection.logicalBounds),
+            rotationRadians: 0))
+    }
+
+    private func updateSelectionDrag(to displayPoint: CGPoint, displaySize: CGSize) -> CGAffineTransform? {
+        guard let origin = transformOriginSelection, let inputDragStart else { return nil }
+        let current = logicalPoint(for: displayPoint, in: displaySize)
+        let translation = CGSize(width: current.x - inputDragStart.x, height: current.y - inputDragStart.y)
+        var updated = origin
+        let transform: CGAffineTransform
+        switch inputDragMode {
+        case .movingSelection:
+            updated.logicalBounds = origin.logicalBounds.offsetBy(dx: translation.width, dy: translation.height)
+            transform = CGAffineTransform(translationX: translation.width, y: translation.height)
+        case .resizingSelection(let handle):
+            updated = resizedSelection(origin, handle: handle, translation: translation)
+            transform = resizingTransform(from: origin, to: updated)
+        case .rotatingSelection:
+            let center: CGPoint
+            if let vertices = vertexDragOrigin, vertices.count == 2 {
+                center = CGPoint(x: (vertices[0].x + vertices[1].x) / 2,
+                                 y: (vertices[0].y + vertices[1].y) / 2)
+            } else { center = origin.logicalBounds.midPoint }
+            let delta = rotationDelta(from: inputDragStart, to: current, around: center)
+            updated.rotationRadians = normalizedAngle(origin.rotationRadians + delta)
+            transform = rotationTransform(delta, around: center)
+            let updatedCenter = origin.logicalBounds.midPoint.applying(transform)
+            updated.logicalBounds = origin.logicalBounds.offsetBy(
+                dx: updatedCenter.x - origin.logicalBounds.midX, dy: updatedCenter.y - origin.logicalBounds.midY)
+        default: return nil
+        }
+        liveVertices = vertexDragOrigin?.map { $0.applying(transform) }
+        updateSelection(updated)
+        return transform
     }
 
     private func beginLasso(at displayPoint: CGPoint, displaySize: CGSize) {
@@ -3700,9 +3927,80 @@ private struct LassoSelectionOverlay: View {
         onCropImageElement(elementID)
     }
 
+    private func publishSelectionStyle() {
+        guard isActive, !selectionContainsLockedElement else {
+            controller.selectionStyle.clear(owner: styleOwner)
+            return
+        }
+        let payload: PageShapePayload?
+        if let id = selectedEditableShapeID,
+           let element = pageElements.first(where: { $0.id == id }), case .shape(let shape) = element.payload {
+            payload = shape
+        } else if let index = selectedInkShapeIndex,
+                  let element = CanvasHitGeometry.editableShape(from: controller.drawing.strokes[index]),
+                  case .shape(let shape) = element.payload {
+            payload = shape
+        } else { payload = nil }
+        guard let payload else { controller.selectionStyle.clear(owner: styleOwner); return }
+        controller.selectionStyle.present(owner: styleOwner, payload: payload,
+            apply: applyQuickShapeStyle, dismiss: clearSelection)
+    }
+
+    private func applyQuickShapeStyle(_ change: CanvasSelectionStyle.Change) {
+        guard isActive, !selectionContainsLockedElement, transformOriginSelection == nil else { return }
+        let draft: SelectionShapeStyleDraft
+        if let id = selectedEditableShapeID, let element = pageElements.first(where: { $0.id == id }) {
+            draft = SelectionShapeStyleDraft(element: element)
+        } else if let index = selectedInkShapeIndex {
+            let snapshot = controller.snapshotDrawing()
+            guard var element = CanvasHitGeometry.editableShape(from: snapshot.drawing.strokes[index]) else { return }
+            element.zIndex = (pageElements.map(\.zIndex).max() ?? 0) + 1
+            draft = SelectionShapeStyleDraft(element: element, sourceDrawing: snapshot, strokeIndex: index)
+        } else { return }
+        guard case .shape(var payload) = draft.element.payload else { return }
+        switch change {
+        case .color(let hex): payload.strokeColorHex = hex
+        case .width(let width): payload.lineWidth = min(max(width, 1), 20)
+        case .dashed(let dashed): payload.isDashed = dashed
+        }
+        commitSelectionShapeStyle(draft, payload: payload)
+        publishSelectionStyle()
+    }
+
     private func editSelectedShape() {
-        guard let elementID = selectedEditableShapeID else { return }
-        onEditShapeElement(elementID)
+        if let elementID = selectedEditableShapeID {
+            if let onEditShapeElement { onEditShapeElement(elementID) }
+            else if let element = pageElements.first(where: { $0.id == elementID }) {
+                shapeStyleDraft = SelectionShapeStyleDraft(element: element)
+            }
+        } else if let index = selectedInkShapeIndex {
+            let original = controller.snapshotDrawing()
+            guard var element = CanvasHitGeometry.editableShape(from: original.drawing.strokes[index]) else { return }
+            element.zIndex = (pageElements.map(\.zIndex).max() ?? 0) + 1
+            shapeStyleDraft = SelectionShapeStyleDraft(element: element, sourceDrawing: original, strokeIndex: index)
+        }
+    }
+
+    private func commitSelectionShapeStyle(_ draft: SelectionShapeStyleDraft, payload: PageShapePayload) {
+        var element = draft.element
+        element.payload = .shape(payload)
+        if let index = draft.strokeIndex, let original = draft.sourceDrawing {
+            guard element != draft.element else { shapeStyleDraft = nil; return }
+            guard controller.replaceInkShape(at: index, expected: original, with: element) else {
+                shapeStyleDraft = nil
+                showTransientFeedback("图形已变化，请重新选择")
+                return
+            }
+        } else if let index = pageElements.firstIndex(where: { $0.id == element.id }) {
+            if pageElements[index] != element {
+                controller.recordElementVertexEdit(previous: [pageElements[index]])
+                pageElements[index] = element
+                onPageElementsChanged()
+            }
+        } else { shapeStyleDraft = nil; return }
+        updateSelection(LassoStrokeSelection(content: LassoSelectionContent(elementIDs: [element.id]),
+            logicalBounds: element.logicalBounds, rotationRadians: CGFloat(element.rotationRadians)))
+        shapeStyleDraft = nil
     }
 
     private func deleteSelection() {
@@ -3957,6 +4255,7 @@ private struct LassoSelectionOverlay: View {
     }
 
     private func clearSelection() {
+        controller.selectionStyle.clear(owner: styleOwner)
         assistantSelectionBounds = nil
         controller.cancelStrokeTransform()
         liveLassoPath = []
@@ -3965,131 +4264,9 @@ private struct LassoSelectionOverlay: View {
         transformOriginElements = [:]
         inputDragMode = nil
         inputDragStart = nil
+        vertexDragOrigin = nil
+        liveVertices = nil
         feedbackText = nil
-    }
-
-    private func moveSelectionGesture(displaySize: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 1, coordinateSpace: .named(LassoCoordinateSpace.page))
-            .onChanged { value in
-                guard let selection else { return }
-                guard !selectionContainsLockedElement else { return }
-                let origin = beginTransformIfNeeded(for: selection)
-                let translation = logicalTranslation(value.translation, displaySize: displaySize)
-                let transform = CGAffineTransform(
-                    translationX: translation.width,
-                    y: translation.height
-                )
-                var movedSelection = origin
-                movedSelection.logicalBounds = origin.logicalBounds.offsetBy(
-                    dx: translation.width,
-                    dy: translation.height
-                )
-                updateSelection(movedSelection)
-                controller.previewStrokeTransform(transform)
-                previewElementTransform(transform)
-            }
-            .onEnded { value in
-                guard let selection else { return }
-                guard !selectionContainsLockedElement else { return }
-                let origin = transformOriginSelection ?? selection
-                let translation = logicalTranslation(value.translation, displaySize: displaySize)
-                let transform = CGAffineTransform(
-                    translationX: translation.width,
-                    y: translation.height
-                )
-                var movedSelection = origin
-                movedSelection.logicalBounds = origin.logicalBounds.offsetBy(
-                    dx: translation.width,
-                    dy: translation.height
-                )
-                updateSelection(movedSelection)
-                previewElementTransform(transform)
-                finishTransform(transform, actionName: "移动选中笔迹")
-            }
-    }
-
-    private func resizeSelectionGesture(
-        handle: LassoResizeHandle,
-        displaySize: CGSize
-    ) -> some Gesture {
-        DragGesture(minimumDistance: 1, coordinateSpace: .named(LassoCoordinateSpace.page))
-            .onChanged { value in
-                guard let selection else { return }
-                guard !selectionContainsLockedElement else { return }
-                let origin = beginTransformIfNeeded(for: selection)
-                let translation = logicalTranslation(value.translation, displaySize: displaySize)
-                let resizedSelection = resizedSelection(
-                    origin,
-                    handle: handle,
-                    translation: translation
-                )
-                let transform = resizingTransform(from: origin, to: resizedSelection)
-                updateSelection(resizedSelection)
-                controller.previewStrokeTransform(transform)
-                previewElementTransform(transform)
-            }
-            .onEnded { value in
-                guard let selection else { return }
-                guard !selectionContainsLockedElement else { return }
-                let origin = transformOriginSelection ?? selection
-                let translation = logicalTranslation(value.translation, displaySize: displaySize)
-                let resizedSelection = resizedSelection(
-                    origin,
-                    handle: handle,
-                    translation: translation
-                )
-                let transform = resizingTransform(from: origin, to: resizedSelection)
-                updateSelection(resizedSelection)
-                previewElementTransform(transform)
-                finishTransform(transform, actionName: "缩放选中笔迹")
-            }
-    }
-
-    private func rotationSelectionGesture(displaySize: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 1, coordinateSpace: .named(LassoCoordinateSpace.page))
-            .onChanged { value in
-                guard let selection else { return }
-                guard !selectionContainsLockedElement else { return }
-                let origin = beginTransformIfNeeded(for: selection)
-                let delta = rotationDelta(
-                    from: value.startLocation,
-                    to: value.location,
-                    around: displayPoint(for: origin.logicalBounds.midPoint, in: displaySize)
-                )
-                var rotatedSelection = origin
-                rotatedSelection.rotationRadians = normalizedAngle(
-                    origin.rotationRadians + delta
-                )
-                updateSelection(rotatedSelection)
-                controller.previewStrokeTransform(
-                    rotationTransform(delta, around: origin.logicalBounds.midPoint)
-                )
-                previewElementTransform(
-                    rotationTransform(delta, around: origin.logicalBounds.midPoint)
-                )
-            }
-            .onEnded { value in
-                guard let selection else { return }
-                guard !selectionContainsLockedElement else { return }
-                let origin = transformOriginSelection ?? selection
-                let delta = rotationDelta(
-                    from: value.startLocation,
-                    to: value.location,
-                    around: displayPoint(for: origin.logicalBounds.midPoint, in: displaySize)
-                )
-                var rotatedSelection = origin
-                rotatedSelection.rotationRadians = normalizedAngle(
-                    origin.rotationRadians + delta
-                )
-                updateSelection(rotatedSelection)
-                previewElementTransform(
-                    rotationTransform(delta, around: origin.logicalBounds.midPoint)
-                )
-                finishTransform(
-                    rotationTransform(delta, around: origin.logicalBounds.midPoint),
-                    actionName: "旋转选中笔迹"
-                )
-            }
     }
 
     private func beginTransformIfNeeded(
@@ -4100,7 +4277,10 @@ private struct LassoSelectionOverlay: View {
         }
         transformOriginSelection = selection
         if !selection.content.strokeIndices.isEmpty {
-            controller.beginTransformingStrokes(at: selection.content.strokeIndices)
+            let nativeRotation: Bool
+            if case .rotatingSelection = inputDragMode { nativeRotation = vertexDragOrigin != nil }
+            else { nativeRotation = false }
+            controller.beginTransformingStrokes(at: selection.content.strokeIndices, usesNativePreview: nativeRotation)
         }
         transformOriginElements = Dictionary(uniqueKeysWithValues: pageElements.compactMap {
             selection.content.elementIDs.contains($0.id) ? ($0.id, $0) : nil
@@ -4177,14 +4357,28 @@ private struct LassoSelectionOverlay: View {
             width: cosine * translation.width + sine * translation.height,
             height: -sine * translation.width + cosine * translation.height
         )
-        let width = max(
-            minimumSize,
+        var width = max(
+            min(minimumSize, selection.logicalBounds.width),
             selection.logicalBounds.width + handle.horizontalSign * localTranslation.width
         )
-        let height = max(
-            minimumSize,
+        var height = max(
+            min(minimumSize, selection.logicalBounds.height),
             selection.logicalBounds.height + handle.verticalSign * localTranslation.height
         )
+        if !selection.content.strokeIndices.isEmpty && selection.content.elementIDs.isEmpty {
+            // Project the drag onto the original diagonal. Dividing a vertical
+            // drag by a hairline's height would multiply its thickness many times.
+            let original = selection.logicalBounds.size
+            let diagonalSquared = original.width * original.width + original.height * original.height
+            if diagonalSquared > 0 {
+                let delta = handle.horizontalSign * localTranslation.width * original.width
+                    + handle.verticalSign * localTranslation.height * original.height
+                let minimumScale = min(1, minimumSize / max(original.width, original.height))
+                let scale = max(minimumScale, 1 + delta / diagonalSquared)
+                width = original.width * scale
+                height = original.height * scale
+            }
+        }
         let localCenterShift = CGPoint(
             x: handle.horizontalSign * (width - selection.logicalBounds.width) / 2,
             y: handle.verticalSign * (height - selection.logicalBounds.height) / 2
@@ -4311,12 +4505,27 @@ private struct LassoSelectionOverlay: View {
         for selection: LassoStrokeSelection,
         in displaySize: CGSize
     ) -> CGPoint {
+        if let vertices = editableSelectionVertices(for: selection, displaySize: displaySize), vertices.count == 2 {
+            return LineSelectionControls.rotationHandle(
+                from: displayPoint(for: vertices[0], in: displaySize),
+                to: displayPoint(for: vertices[1], in: displaySize))
+        }
         let bounds = selectionDisplayBounds(for: selection, in: displaySize)
         return rotatedDisplayPoint(
             CGPoint(x: bounds.midX, y: bounds.maxY + 26),
             around: bounds.midPoint,
             radians: selection.rotationRadians
         )
+    }
+
+    private func rotationHandleAttachment(for selection: LassoStrokeSelection, in displaySize: CGSize) -> CGPoint {
+        if let vertices = editableSelectionVertices(for: selection, displaySize: displaySize), vertices.count == 2 {
+            return displayPoint(for: CGPoint(x: (vertices[0].x + vertices[1].x) / 2,
+                                             y: (vertices[0].y + vertices[1].y) / 2), in: displaySize)
+        }
+        let bounds = selectionDisplayBounds(for: selection, in: displaySize)
+        return rotatedDisplayPoint(CGPoint(x: bounds.midX, y: bounds.maxY),
+                                   around: bounds.midPoint, radians: selection.rotationRadians)
     }
 
     private func rotatedDisplayPoint(
@@ -4342,7 +4551,7 @@ private struct LassoSelectionOverlay: View {
             bounds: displayRect(for: selection.axisAlignedBounds, in: displaySize),
             displaySize: displaySize,
             halfWidth: selectionContainsQuestionElement ? (selectedQuestionElement != nil ? 39 : 21)
-                : (selectedEditableTextID != nil || selectedCroppableImageID != nil || selectedEditableShapeID != nil ? 150 : 128)
+                : (selectedEditableTextID != nil || selectedCroppableImageID != nil || selectedEditableShapeID != nil || selectedInkShapeIndex != nil ? 150 : 128)
         )
     }
 
@@ -4379,12 +4588,9 @@ private struct LassoSelectionOverlay: View {
         projection.displayRect(logicalRect, displaySize: displaySize)
     }
 
-    private func logicalTranslation(_ translation: CGSize, displaySize: CGSize) -> CGSize {
-        projection.logicalTranslation(translation, displaySize: displaySize)
-    }
 }
 
-private struct LassoStrokeSelection {
+private struct LassoStrokeSelection: Equatable {
     let content: LassoSelectionContent
     var logicalBounds: CGRect
     var rotationRadians: CGFloat
@@ -4418,10 +4624,9 @@ private struct LassoStrokeSelection {
 private enum LassoInputDragMode {
     case drawingLasso
     case movingSelection
-}
-
-private enum LassoCoordinateSpace {
-    static let page = "tiyi.lasso.page"
+    case movingVertex(Int)
+    case resizingSelection(LassoResizeHandle)
+    case rotatingSelection
 }
 
 private enum LassoResizeHandle: String, CaseIterable, Identifiable {
@@ -4674,6 +4879,7 @@ struct LassoInputView: UIViewRepresentable {
     let onEnded: (CGPoint) -> Void
     let onTap: (CGPoint) -> Void
     let onDoubleTap: (CGPoint) -> Void
+    var onCancelled: (() -> Void)? = nil
     var onCanvasNavigation: ((CanvasNavigationChange) -> Void)? = nil
     var navigationTouchCount = 2
 
@@ -4788,11 +4994,16 @@ struct LassoInputView: UIViewRepresentable {
             let location = gesture.location(in: gesture.view)
             switch gesture.state {
             case .began:
-                parent.onBegan(location)
+                let start = (gesture as? LassoPanGestureRecognizer)?.initialLocation ?? location
+                parent.onBegan(start)
+                parent.onMoved(location)
             case .changed:
                 parent.onMoved(location)
-            case .ended, .cancelled, .failed:
+            case .ended:
                 parent.onEnded(location)
+            case .cancelled, .failed:
+                if let onCancelled = parent.onCancelled { onCancelled() }
+                else { parent.onEnded(location) }
             default:
                 break
             }
@@ -4812,7 +5023,9 @@ struct LassoInputView: UIViewRepresentable {
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
         ) -> Bool {
-            otherGestureRecognizer is UIPinchGestureRecognizer
+            !(gestureRecognizer is LassoPanGestureRecognizer)
+                && !(otherGestureRecognizer is LassoPanGestureRecognizer)
+                && otherGestureRecognizer is UIPinchGestureRecognizer
         }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -4820,7 +5033,7 @@ struct LassoInputView: UIViewRepresentable {
                 return true
             }
             return parent.shouldBeginDrag(
-                panGesture.location(in: panGesture.view),
+                panGesture.initialLocation,
                 panGesture.initialTouchType
             )
         }
@@ -4857,12 +5070,14 @@ private final class LassoInputContainerView: UIView {
     }
 }
 
-private final class LassoPanGestureRecognizer: UIPanGestureRecognizer {
+final class LassoPanGestureRecognizer: UIPanGestureRecognizer {
     private(set) var initialTouchType: UITouch.TouchType = .direct
+    private(set) var initialLocation: CGPoint = .zero
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        if let firstTouch = touches.first {
+        if numberOfTouches == 0, let firstTouch = touches.first {
             initialTouchType = firstTouch.type
+            initialLocation = firstTouch.location(in: view)
         }
         super.touchesBegan(touches, with: event)
     }
@@ -5052,38 +5267,9 @@ enum LassoSnapshotRenderer {
             context.setFillColor(UIColor.clear.cgColor)
         }
 
-        switch payload.kind {
-        case .line, .arrow:
-            context.move(to: CGPoint(x: rect.minX, y: rect.midY))
-            context.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
-            if payload.kind == .arrow {
-                let head = min(rect.height * 0.35, rect.width * 0.18, 18)
-                context.move(to: CGPoint(x: rect.maxX, y: rect.midY))
-                context.addLine(to: CGPoint(x: rect.maxX - head, y: rect.midY - head * 0.72))
-                context.move(to: CGPoint(x: rect.maxX, y: rect.midY))
-                context.addLine(to: CGPoint(x: rect.maxX - head, y: rect.midY + head * 0.72))
-            }
-            context.strokePath()
-        case .rectangle:
-            context.addRect(rect.insetBy(dx: payload.lineWidth / 2, dy: payload.lineWidth / 2))
-            context.drawPath(using: payload.fillColorHex == nil ? .stroke : .fillStroke)
-        case .ellipse:
-            context.addEllipse(in: rect.insetBy(dx: payload.lineWidth / 2, dy: payload.lineWidth / 2))
-            context.drawPath(using: payload.fillColorHex == nil ? .stroke : .fillStroke)
-        case .triangle:
-            context.move(to: CGPoint(x: rect.midX, y: rect.minY))
-            context.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-            context.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-            context.closePath()
-            context.drawPath(using: payload.fillColorHex == nil ? .stroke : .fillStroke)
-        case .diamond:
-            context.move(to: CGPoint(x: rect.midX, y: rect.minY))
-            context.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
-            context.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
-            context.addLine(to: CGPoint(x: rect.minX, y: rect.midY))
-            context.closePath()
-            context.drawPath(using: payload.fillColorHex == nil ? .stroke : .fillStroke)
-        }
+        context.addPath(payload.path(in: rect, displayScale: 1))
+        let filled = payload.fillColorHex != nil && payload.kind != .line && payload.kind != .arrow
+        context.drawPath(using: filled ? .fillStroke : .stroke)
     }
 }
 

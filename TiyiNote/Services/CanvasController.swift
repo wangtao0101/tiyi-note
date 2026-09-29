@@ -1,6 +1,34 @@
 import PencilKit
 import SwiftUI
 
+/// Only the floating palette observes selection styles; drawing contacts do not invalidate the workspace.
+final class CanvasSelectionStyle: ObservableObject {
+    enum Change { case color(String), width(Double), dashed(Bool) }
+    @Published private(set) var payload: PageShapePayload?
+    private var owner: UUID?
+    private var apply: ((Change) -> Void)?
+    private var dismiss: (() -> Void)?
+
+    func present(owner: UUID, payload: PageShapePayload, apply: @escaping (Change) -> Void,
+                 dismiss: @escaping () -> Void) {
+        self.owner = owner
+        self.apply = apply
+        self.dismiss = dismiss
+        if self.payload != payload { self.payload = payload }
+    }
+
+    func clear(owner: UUID) {
+        guard self.owner == owner else { return }
+        self.owner = nil
+        apply = nil
+        dismiss = nil
+        payload = nil
+    }
+
+    func change(_ change: Change) { apply?(change) }
+    func finishSelection() { dismiss?() }
+}
+
 final class CanvasController: NSObject, ObservableObject {
     /// Simulator touch synthesis normally stands in for Pencil input. Navigation regressions can
     /// opt into the real iPad policy, where fingers navigate and only Pencil creates ink or lassos.
@@ -17,6 +45,7 @@ final class CanvasController: NSObject, ObservableObject {
     /// the complete page. Full drawings are kept only for inherently whole-page edits such as an
     /// eraser pass, lasso transform, or Clear.
     private static let maximumUndoDepth = 80
+    let selectionStyle = CanvasSelectionStyle()
     let canvasView: PKCanvasView
 
     @Published private(set) var canUndo = false
@@ -45,6 +74,7 @@ final class CanvasController: NSObject, ObservableObject {
     private var strokeTransformSession: StrokeTransformSession?
     private var strokeTransformPreview: StrokeTransformPreview?
     private var didInstallStrokeTransformPreview = false
+    private var inkPreviewHandoffWorkItem: DispatchWorkItem?
     private var toolInteractionOriginDrawing: PKDrawing?
     private var toolInteractionDidChangeDrawing = false
     private var toolInteractionEndWorkItem: DispatchWorkItem?
@@ -63,6 +93,8 @@ final class CanvasController: NSObject, ObservableObject {
     private let heldInkRecognizer = HeldInkGestureRecognizer()
     private let shapeEraserRecognizer = ShapeEraserGestureRecognizer()
     private let fingerSelectionRecognizer = FingerContentTapGestureRecognizer()
+    let palmRejectionRecognizer = CanvasPalmRejectionGestureRecognizer()
+    @Published private(set) var selectionHistoryRevision = 0
     private var fingerSelectionTarget: (strokes: Set<Int>, elements: Set<UUID>)?
     private var erasedElements: [CanvasPageElement] = []
     private var eraserRadius: CGFloat = 9
@@ -80,7 +112,11 @@ final class CanvasController: NSObject, ObservableObject {
         UIDevice.current.userInterfaceIdiom == .phone || Self.allowsFingerDrawing
 #endif
     }
-    var navigationTouchCount: Int { isAnnotationInputEditable && allowsDirectDrawing ? 2 : 1 }
+    var navigationTouchCount: Int {
+        // A single resting little finger must never move paper between strokes.
+        isAnnotationInputEditable
+            && (allowsDirectDrawing || selectedToolKind.usesInkSettings || selectedToolKind == .eraser) ? 2 : 1
+    }
 
     override init() {
         let canvasView = TiyiPencilCanvasView(frame: .zero)
@@ -88,9 +124,13 @@ final class CanvasController: NSObject, ObservableObject {
         super.init()
 
         canvasView.delegate = self
+        palmRejectionRecognizer.onNavigationRestored = { [weak self] in
+            (self?.canvasView.superview as? PageCanvasContainerView)?.configureAncestorNavigation()
+        }
         canvasView.addGestureRecognizer(fingerSelectionRecognizer)
         fingerSelectionRecognizer.canSelect = { [weak self] point in
-            guard let self, self.isAnnotationInputEditable, self.selectedToolKind.usesInkSettings else { return false }
+            guard let self, self.isAnnotationInputEditable, self.selectedToolKind.usesInkSettings,
+                  !self.palmRejectionRecognizer.blocksFingerActions else { return false }
             let scale = max(self.canvasView.zoomScale, 0.0001)
             let worldPoint = CGPoint(x: point.x / scale + self.canvasWorldOrigin.x,
                                      y: point.y / scale + self.canvasWorldOrigin.y)
@@ -112,7 +152,8 @@ final class CanvasController: NSObject, ObservableObject {
             return self.fingerSelectionTarget != nil
         }
         fingerSelectionRecognizer.onSelect = { [weak self] in
-            guard let self, let target = self.fingerSelectionTarget else { return }
+            guard let self, !self.palmRejectionRecognizer.blocksFingerActions,
+                  let target = self.fingerSelectionTarget else { return }
             self.onRequestContentSelection?(target.strokes, target.elements)
             self.fingerSelectionTarget = nil
         }
@@ -326,6 +367,9 @@ final class CanvasController: NSObject, ObservableObject {
         canvasView.drawingGestureRecognizer.isEnabled = isAnnotationInputEditable
             && kind != .lasso && kind != .question && kind != .text && kind != .explain
         (canvasView as? TiyiPencilCanvasView)?.disableSystemEditingInteractions()
+        // Tool changes can arrive after the representable's update pass. Apply
+        // the new finger policy immediately, including existing camera gestures.
+        (canvasView.superview as? PageCanvasContainerView)?.configureAncestorNavigation()
     }
 
     func configureAnnotationInput(isEditable: Bool = true) {
@@ -359,6 +403,7 @@ final class CanvasController: NSObject, ObservableObject {
         guard let action = undoActions.popLast(),
               let inverse = applyHistoryAction(action) else { return }
         redoActions.append(inverse)
+        selectionHistoryRevision &+= 1
         onDrawingChanged?(false)
         refreshHistoryState()
     }
@@ -368,6 +413,7 @@ final class CanvasController: NSObject, ObservableObject {
         guard let action = redoActions.popLast(),
               let inverse = applyHistoryAction(action) else { return }
         undoActions.append(inverse)
+        selectionHistoryRevision &+= 1
         trimUndoHistoryIfNeeded()
         onDrawingChanged?(false)
         refreshHistoryState()
@@ -507,7 +553,7 @@ final class CanvasController: NSObject, ObservableObject {
         return appendStrokes(pastedStrokes, actionName: "粘贴笔迹")
     }
 
-    func beginTransformingStrokes(at indices: Set<Int>) {
+    func beginTransformingStrokes(at indices: Set<Int>, usesNativePreview: Bool = false) {
         cancelStrokeTransform()
         let original = self.drawing
         let validIndices = indices.filter { original.strokes.indices.contains($0) }
@@ -517,24 +563,90 @@ final class CanvasController: NSObject, ObservableObject {
             originalDrawing: original,
             strokeIndices: validIndices.sorted()
         )
-        strokeTransformPreview = StrokeTransformPreview(
-            canvas: canvasView, drawing: original,
-            selectedIndices: validIndices, worldOrigin: canvasWorldOrigin
-        )
+        if !usesNativePreview {
+            strokeTransformPreview = StrokeTransformPreview(
+                canvas: canvasView, drawing: original,
+                selectedIndices: validIndices, worldOrigin: canvasWorldOrigin
+            )
+        }
         didInstallStrokeTransformPreview = false
     }
 
-    func previewStrokeTransform(_ transform: CGAffineTransform) {
+    func previewStrokeTransform(_ transform: CGAffineTransform, usesNativePreview: Bool = false) {
         guard let session = strokeTransformSession else { return }
+        if usesNativePreview { dismissStrokeTransformPreview() }
         if let strokeTransformPreview {
             strokeTransformPreview.update(transform)
             return
         }
-        // Detached canvases (including model tests) have no presentation host.
+        // Native geometry previews and detached canvases use the actual drawing.
         didInstallStrokeTransformPreview = true
         installCanvasDrawing(
             drawingByTransformingStrokes(in: session, using: transform)
         )
+    }
+
+    func previewStrokeVertices(from originalVertices: [CGPoint], to vertices: [CGPoint]) {
+        guard let drawing = drawingByEditingVertices(from: originalVertices, to: vertices) else { return }
+        dismissStrokeTransformPreview()
+        didInstallStrokeTransformPreview = true
+        installCanvasDrawing(drawing)
+    }
+
+    func commitStrokeVertices(from originalVertices: [CGPoint], to vertices: [CGPoint]) {
+        guard originalVertices != vertices,
+              let drawing = drawingByEditingVertices(from: originalVertices, to: vertices),
+              let session = strokeTransformSession else {
+            cancelStrokeTransform()
+            return
+        }
+        dismissStrokeTransformPreview()
+        strokeTransformSession = nil
+        replaceDrawing(drawing, actionName: "调整图形顶点", previousDrawing: session.originalDrawing)
+        didInstallStrokeTransformPreview = false
+        setToolInteractionActive(false)
+    }
+
+    func recordElementVertexEdit(previous elements: [CanvasPageElement]) {
+        guard !elements.isEmpty else { return }
+        recordUndoAction(.restorePageContent(drawing: nil, elements: elements,
+                                            replacingIDs: Set(elements.map(\.id))))
+        refreshHistoryState()
+    }
+
+    struct DrawingSnapshot {
+        let drawing: PKDrawing
+        fileprivate let localDrawing: PKDrawing
+        fileprivate let origin: CGPoint
+    }
+
+    func snapshotDrawing() -> DrawingSnapshot {
+        DrawingSnapshot(drawing: drawing, localDrawing: canvasView.drawing, origin: canvasWorldOrigin)
+    }
+
+    @discardableResult
+    func replaceInkShape(at index: Int, expected: DrawingSnapshot, with element: CanvasPageElement) -> Bool {
+        // World-coordinate reads create new transformed PencilKit values. Compare
+        // the captured native drawing instead so an unchanged infinite canvas is valid.
+        guard canvasWorldOrigin == expected.origin, canvasView.drawing == expected.localDrawing,
+              expected.drawing.strokes.indices.contains(index), let onPageElementsUpdated else { return false }
+        let original = expected.drawing
+        cancelStrokeTransform()
+        let elements = pageElementsProvider?() ?? []
+        recordUndoAction(.restorePageContent(drawing: original, elements: [], replacingIDs: [element.id]))
+        installCanvasDrawing(PKDrawing(strokes: original.strokes.enumerated().compactMap { $0.offset == index ? nil : $0.element }))
+        onPageElementsUpdated(elements + [element], true)
+        onDrawingChanged?(false)
+        refreshHistoryState()
+        return true
+    }
+
+    private func drawingByEditingVertices(from originalVertices: [CGPoint], to vertices: [CGPoint]) -> PKDrawing? {
+        guard let session = strokeTransformSession, session.strokeIndices.count == 1,
+              let index = session.strokeIndices.first else { return nil }
+        var strokes = session.originalDrawing.strokes
+        strokes[index] = CanvasHitGeometry.movingVertices(in: strokes[index], from: originalVertices, to: vertices)
+        return PKDrawing(strokes: strokes)
     }
 
     func commitStrokeTransform(_ transform: CGAffineTransform, actionName: String) {
@@ -570,6 +682,39 @@ final class CanvasController: NSObject, ObservableObject {
     private func dismissStrokeTransformPreview() {
         strokeTransformPreview?.dismiss()
         strokeTransformPreview = nil
+    }
+
+    /// These bitmaps use the viewport captured at edit time. Once the edit is
+    /// committed, reveal native ink before moving the camera, even if PencilKit
+    /// has not delivered its render callback. Never discard an in-progress edit.
+    func prepareForViewportChange() {
+        if strokeTransformSession == nil { dismissStrokeTransformPreview() }
+        if heldShape == nil, !heldInkRecognizer.isTrackingContact { discardShapePreview() }
+    }
+
+    private func scheduleInkPreviewHandoff() {
+        inkPreviewHandoffWorkItem?.cancel()
+        inkPreviewHandoffWorkItem = nil
+        guard strokeTransformPreview != nil || shapePreview != nil else { return }
+        let work = DispatchWorkItem { [weak self, weak strokePreview = strokeTransformPreview,
+                                       weak heldPreview = shapePreview] in
+            guard let self else { return }
+            // A delayed handoff must never remove a later contact's preview/mask.
+            if let strokePreview, self.strokeTransformPreview === strokePreview,
+               self.strokeTransformSession == nil { self.dismissStrokeTransformPreview() }
+            if let heldPreview, self.shapePreview === heldPreview,
+               self.heldShape == nil, !self.heldInkRecognizer.isTrackingContact {
+                self.discardShapePreview()
+            }
+        }
+        inkPreviewHandoffWorkItem = work
+        var delay: TimeInterval = 0.35
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--text-interaction-ui-test"),
+           arguments.contains("--delay-ink-preview-handoff-ui-test") { delay = 30 }
+#endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func replaceDrawing(
@@ -814,6 +959,9 @@ final class CanvasController: NSObject, ObservableObject {
         toolInteractionEndWorkItem = nil
         guard !isUsingTool else { return }
 
+        inkPreviewHandoffWorkItem?.cancel()
+        inkPreviewHandoffWorkItem = nil
+        dismissStrokeTransformPreview()
         discardShapePreview()
 
         // A snapped drawing remains authoritative after lift only to reject a late cancellation
@@ -977,6 +1125,7 @@ final class CanvasController: NSObject, ObservableObject {
     private func setToolInteractionActive(_ isActive: Bool) {
         guard isUsingTool != isActive else { return }
         isUsingTool = isActive
+        if !isActive { scheduleInkPreviewHandoff() }
         onToolInteractionChanged?(isActive)
     }
 
@@ -1307,6 +1456,8 @@ private final class StrokeTransformPreview: UIView {
         backgroundColor = .clear
         overrideUserInterfaceStyle = .light
         accessibilityIdentifier = "lasso-ink-preview"
+        isAccessibilityElement = true
+        accessibilityLabel = "笔迹变换预览"
         let background = UIImageView(image: raster(remainder, in: viewport))
         background.frame = bounds
         addSubview(background)
@@ -1359,6 +1510,11 @@ private extension CGRect {
 
 extension CanvasController: PKCanvasViewDelegate {
     func canvasViewDidFinishRendering(_ canvasView: PKCanvasView) {
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--text-interaction-ui-test"),
+           arguments.contains("--suppress-ink-render-callback-ui-test") { return }
+#endif
         if canvasView === self.canvasView, strokeTransformPreview?.isWaitingForRender == true {
             dismissStrokeTransformPreview()
         }

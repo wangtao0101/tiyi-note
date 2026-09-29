@@ -22,6 +22,7 @@
 		100000000000000000000131 /* CanvasHitGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000234 /* CanvasHitGeometry.swift */; };
 		100000000000000000000130 /* TiyiPracticeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000233 /* TiyiPracticeView.swift */; };
 		100000000000000000000128 /* HeldInkShapeRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000231 /* HeldInkShapeRecognizer.swift */; };
+		E51000000000000000000001 /* CanvasPalmRejection.swift in Sources */ = {isa = PBXBuildFile; fileRef = E51000000000000000000002 /* CanvasPalmRejection.swift */; };
 		100000000000000000000129 /* HeldInkGestureRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000232 /* HeldInkGestureRecognizer.swift */; };
 		100000000000000000000127 /* CanvasViewport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000230 /* CanvasViewport.swift */; };
 		100000000000000000000101 /* TiyiNoteApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000201 /* TiyiNoteApp.swift */; };
@@ -80,6 +81,7 @@
 		100000000000000000000234 /* CanvasHitGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasHitGeometry.swift; sourceTree = "<group>"; };
 		100000000000000000000233 /* TiyiPracticeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiPracticeView.swift; path = PackageSupport/TiyiPracticeView.swift; sourceTree = "<group>"; };
 		100000000000000000000231 /* HeldInkShapeRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeldInkShapeRecognizer.swift; sourceTree = "<group>"; };
+		E51000000000000000000002 /* CanvasPalmRejection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasPalmRejection.swift; sourceTree = "<group>"; };
 		100000000000000000000232 /* HeldInkGestureRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeldInkGestureRecognizer.swift; sourceTree = "<group>"; };
 		100000000000000000000230 /* CanvasViewport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasViewport.swift; sourceTree = "<group>"; };
 		100000000000000000000201 /* TiyiNoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TiyiNoteApp.swift; sourceTree = "<group>"; };
@@ -214,6 +216,7 @@
 				100000000000000000000234 /* CanvasHitGeometry.swift */,
 				100000000000000000000206 /* PencilCanvasView.swift */,
 				100000000000000000000232 /* HeldInkGestureRecognizer.swift */,
+				E51000000000000000000002 /* CanvasPalmRejection.swift */,
 				100000000000000000000207 /* ToolPaletteView.swift */,
 				100000000000000000000211 /* PDFPageView.swift */,
 				100000000000000000000213 /* PDFWorkspaceChrome.swift */,
@@ -369,6 +372,7 @@
 				100000000000000000000128 /* HeldInkShapeRecognizer.swift in Sources */,
 				100000000000000000000132 /* ScribbleEraseRecognizer.swift in Sources */,
 				100000000000000000000129 /* HeldInkGestureRecognizer.swift in Sources */,
+				E51000000000000000000001 /* CanvasPalmRejection.swift in Sources */,
 				B7C7939F3A4D4928B1C43803 /* SparseLibraryDatabase.swift in Sources */,
 				B7C7939F3A4D4928B1C43805 /* SparseCloudLibrarySync.swift in Sources */,
 				100000000000000000000104 /* DrawingDocumentStore.swift in Sources */,

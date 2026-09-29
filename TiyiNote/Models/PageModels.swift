@@ -334,12 +334,14 @@ struct PageShapePayload: Codable, Hashable, Sendable {
     var fillColorHex: String?
     var lineWidth: Double
     var isDashed: Bool
+    // Optional so documents saved before vertex editing keep their default shape.
+    var vertices: [PageShapeVertex]? = nil
 
     init(
         kind: PageShapeKind,
         strokeColorHex: String = "#111111FF",
         fillColorHex: String? = nil,
-        lineWidth: Double = 3,
+        lineWidth: Double = 1,
         isDashed: Bool = false
     ) {
         self.kind = kind
@@ -348,6 +350,11 @@ struct PageShapePayload: Codable, Hashable, Sendable {
         self.lineWidth = lineWidth
         self.isDashed = isDashed
     }
+}
+
+struct PageShapeVertex: Codable, Hashable, Sendable {
+    var x: Double
+    var y: Double
 }
 
 enum PageElementPayload: Codable, Hashable, Sendable {

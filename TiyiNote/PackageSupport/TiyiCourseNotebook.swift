@@ -11,6 +11,8 @@ import CryptoKit
     static let pageSize = CGSize(width: 1000, height: 700)
     @Published var controller = CanvasController()
     @Published var viewport = CanvasViewport(referenceSize: pageSize)
+    @Published var pageElements: [CanvasPageElement] = []
+    private var submittedElements: [CanvasPageElement] = []
     @Published private(set) var pageIndex = 0
     @Published private(set) var pageCount = 1
     @Published public private(set) var error: String?
@@ -47,9 +49,19 @@ import CryptoKit
     private func loadPage(_ index: Int) {
         controller.onDrawingChanged = nil
         controller.onToolInteractionChanged = nil
+        controller.onPageElementsUpdated = nil
+        controller.pageElementsProvider = nil
         controller = CanvasController()
         pageIndex = index
         controller.installInitialDrawing(store.loadDrawing(forPage: index, in: documentID))
+        pageElements = store.loadPageElements(forPage: index, in: documentID)
+        submittedElements = pageElements
+        controller.pageElementsProvider = { [weak self] in self?.pageElements ?? [] }
+        controller.onPageElementsUpdated = { [weak self] elements, shouldPersist in
+            guard let self else { return }
+            self.pageElements = elements
+            if shouldPersist { self.elementsChanged() }
+        }
         if let id = store.pageID(at: index, in: documentID) {
             viewport = store.canvasViewport(forPageID: id, in: documentID, referenceSize: Self.pageSize)
             defaults.set(id, forKey: "activePage")
@@ -81,6 +93,12 @@ import CryptoKit
             }
             self.checkpoint()
         }
+    }
+
+    func elementsChanged() {
+        store.scheduleSave(pageElements, replacing: submittedElements, forPage: pageIndex, in: documentID)
+        submittedElements = pageElements
+        drawingChanged()
     }
 
     @discardableResult public func checkpoint() -> Bool {
@@ -175,6 +193,8 @@ public struct TiyiCourseNotebookEditor: View {
                             logicalViewport: notebook.viewport.logicalBounds(in: geometry.size, referenceSize: TiyiCourseNotebook.pageSize),
                             background: notebook.backgroundPage,
                             isActive: notebook.tool == .lasso && !notebook.isMoving,
+                            pageElements: $notebook.pageElements,
+                            onPageElementsChanged: notebook.elementsChanged,
                             onNavigation: { notebook.navigate($0, size: geometry.size) })
                         .id("selection-\(notebook.pageIndex)-\(notebook.tool.rawValue)")
                     }
@@ -214,7 +234,8 @@ private struct CourseNotebookPalette: View {
         DockableToolPaletteView(selectedTool: $notebook.tool, selectedPenVariant: notebook.penVariant,
                                 selectedColor: $notebook.color, penWidth: $notebook.width,
                                 markerWidth: $notebook.markerWidth, eraserSize: $notebook.eraserSize,
-                                dockEdge: $edge, dockProgress: $progress, commands: AnyView(commands), commandCount: 6)
+                                dockEdge: $edge, dockProgress: $progress, commands: AnyView(commands), commandCount: 6,
+                                selectionStyle: notebook.controller.selectionStyle)
     }
 
     @ViewBuilder private var commands: some View {

@@ -7942,35 +7942,7 @@ final class DrawingDocumentStore: ObservableObject {
         context: CGContext
     ) {
         let lineWidth = max(0.5, payload.lineWidth)
-        let drawingRect = rect.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
-        let path = CGMutablePath()
-        switch payload.kind {
-        case .line, .arrow:
-            path.move(to: CGPoint(x: drawingRect.minX, y: drawingRect.midY))
-            path.addLine(to: CGPoint(x: drawingRect.maxX, y: drawingRect.midY))
-            if payload.kind == .arrow {
-                let head = min(drawingRect.height * 0.35, drawingRect.width * 0.18, 18)
-                path.move(to: CGPoint(x: drawingRect.maxX, y: drawingRect.midY))
-                path.addLine(to: CGPoint(x: drawingRect.maxX - head, y: drawingRect.midY - head * 0.72))
-                path.move(to: CGPoint(x: drawingRect.maxX, y: drawingRect.midY))
-                path.addLine(to: CGPoint(x: drawingRect.maxX - head, y: drawingRect.midY + head * 0.72))
-            }
-        case .rectangle:
-            path.addRect(drawingRect)
-        case .ellipse:
-            path.addEllipse(in: drawingRect)
-        case .triangle:
-            path.move(to: CGPoint(x: drawingRect.midX, y: drawingRect.minY))
-            path.addLine(to: CGPoint(x: drawingRect.maxX, y: drawingRect.maxY))
-            path.addLine(to: CGPoint(x: drawingRect.minX, y: drawingRect.maxY))
-            path.closeSubpath()
-        case .diamond:
-            path.move(to: CGPoint(x: drawingRect.midX, y: drawingRect.minY))
-            path.addLine(to: CGPoint(x: drawingRect.maxX, y: drawingRect.midY))
-            path.addLine(to: CGPoint(x: drawingRect.midX, y: drawingRect.maxY))
-            path.addLine(to: CGPoint(x: drawingRect.minX, y: drawingRect.midY))
-            path.closeSubpath()
-        }
+        let path = payload.path(in: rect, displayScale: 1)
         if let fill = payload.fillColorHex,
            ![.line, .arrow].contains(payload.kind) {
             context.addPath(path)
