@@ -1,8 +1,13 @@
 import CoreGraphics
 import Foundation
 import UniformTypeIdentifiers
+import ImageIO
+import PDFKit
+import UIKit
 
 extension UTType {
+    static let tiyiWordDoc = UTType(importedAs: "com.microsoft.word.doc")
+    static let tiyiWordDocx = UTType(importedAs: "org.openxmlformats.wordprocessingml.document")
     static let tiyiNoteDocument = UTType(
         exportedAs: "com.tiyi.note.editable-document",
         conformingTo: .data
@@ -484,6 +489,7 @@ struct EditableDocumentPackage: Codable, Hashable, Sendable {
     let pages: [LibraryPage]
     /// Recycle-bin pages retain their own backgrounds, ink and delete/restore history.
     let deletedPages: [LibraryPage]
+    /// Historical wire key: stores the immutable image bytes when document.kind is image.
     let sourcePDFData: Data
     let pageAssets: [EditableDocumentPageAssets]
     /// Document-wide operations currently include the collaborative title register. Schema-v1
@@ -531,5 +537,68 @@ struct EditableDocumentPackage: Codable, Hashable, Sendable {
             [CollaborationOperation].self,
             forKey: .documentOperations
         ) ?? []
+    }
+}
+
+/// The imported bytes stay immutable. ImageIO normalizes EXIF orientation only for display.
+/// PDFKit's in-memory page adapter lets images use the existing zoom, ink and export pipeline.
+enum ImageDocumentSource {
+    struct Info: Sendable {
+        let fileExtension: String
+        let width: Double
+        let height: Double
+    }
+    static func accepts(_ url: URL) -> Bool {
+        UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
+    }
+    static func info(at url: URL) throws -> Info {
+        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard size > 0, size <= 100 * 1024 * 1024,
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { throw invalidImage() }
+        return try info(source)
+    }
+    static func info(data: Data) throws -> Info {
+        guard !data.isEmpty, data.count <= 100 * 1024 * 1024,
+              let source = CGImageSourceCreateWithData(data as CFData, nil) else { throw invalidImage() }
+        return try info(source)
+    }
+    private static func info(_ source: CGImageSource) throws -> Info {
+        guard CGImageSourceGetCount(source) > 0,
+              let identifier = CGImageSourceGetType(source),
+              let type = UTType(identifier as String), type.conforms(to: .image),
+              let ext = type.preferredFilenameExtension,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let h = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              w.doubleValue > 0, h.doubleValue > 0,
+              w.doubleValue <= 100_000, h.doubleValue <= 100_000 else { throw invalidImage() }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let swapped = (5...8).contains(orientation)
+        let width = swapped ? h.doubleValue : w.doubleValue
+        let height = swapped ? w.doubleValue : h.doubleValue
+        let scale = min(1, 4096 / max(width, height))
+        guard thumbnail(source, maxPixelSize: 64) != nil else { throw invalidImage() }
+        return Info(fileExtension: ext, width: width * scale, height: height * scale)
+    }
+    static func displayDocument(at url: URL) -> PDFDocument? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let info = try? info(source),
+              let image = thumbnail(source, maxPixelSize: 4096),
+              let page = PDFPage(image: UIImage(cgImage: image)) else { return nil }
+        page.setBounds(CGRect(x: 0, y: 0, width: info.width, height: info.height), for: .mediaBox)
+        let document = PDFDocument()
+        document.insert(page, at: 0)
+        return document
+    }
+    private static func thumbnail(_ source: CGImageSource, maxPixelSize: Int) -> CGImage? {
+        CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary)
+    }
+    private static func invalidImage() -> NSError {
+        NSError(domain: "TiyiImageImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法读取图片，请选择 100 MB 以内的有效 PNG、JPEG、HEIC 等图片。"])
     }
 }

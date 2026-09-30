@@ -8,7 +8,7 @@ import VisionKit
 
 /// Own the provider's file before its callback returns; async import keeps this copy alive.
 final class StagedDocumentDrop: @unchecked Sendable {
-    let url: URL
+    private(set) var url: URL
     private let directory: URL
 
     init(copying source: URL, suggestedName: String? = nil) throws {
@@ -30,6 +30,11 @@ final class StagedDocumentDrop: @unchecked Sendable {
             }
             if let coordinationError { throw coordinationError }
             if let copyError { throw copyError }
+            if url.pathExtension.isEmpty, let info = try? ImageDocumentSource.info(at: url) {
+                let namedURL = url.appendingPathExtension(info.fileExtension)
+                try FileManager.default.moveItem(at: url, to: namedURL)
+                url = namedURL
+            }
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
@@ -64,6 +69,7 @@ struct LibraryBrowserView: View {
     let onOpenDocument: (String) -> Void
     let canEditDocument: (String) -> Bool
     var libraryPicker: AnyView? = nil
+    var imports: TiyiPDFImportController? = nil
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -94,7 +100,7 @@ struct LibraryBrowserView: View {
         .accessibilityLabel("文稿")
         .fileImporter(
             isPresented: $showsPDFImporter,
-            allowedContentTypes: [.pdf, .tiyiNoteDocument],
+            allowedContentTypes: [.pdf, .image, .tiyiNoteDocument] + (imports?.supportsWordImport == true ? [.tiyiWordDoc, .tiyiWordDocx] : []),
             allowsMultipleSelection: true,
             onCompletion: handlePDFImport
         )
@@ -560,25 +566,34 @@ struct LibraryBrowserView: View {
         let fileExtension = staged.url.pathExtension
         let isPDF = fileExtension.caseInsensitiveCompare("pdf") == .orderedSame
         let isEditableDocument = fileExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
-        guard isPDF || isEditableDocument else { return false }
+        guard isPDF || isEditableDocument || ImageDocumentSource.accepts(staged.url) || (imports?.supportsWordImport == true && ["doc", "docx"].contains(fileExtension.lowercased())) else { return false }
         importDocuments([staged.url], into: folderID, stagedDrop: staged)
         return true
     }
 
     private func importDocuments(_ urls: [URL], into folderID: String?, stagedDrop: StagedDocumentDrop? = nil) {
         let accessedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
+        let importLibraryID = imports?.libraries.selectedID
         Task {
             defer {
                 for url in accessedURLs { url.stopAccessingSecurityScopedResource() }
                 withExtendedLifetime(stagedDrop) {}
             }
             do {
+                for url in urls where ["doc", "docx"].contains(url.pathExtension.lowercased()) || (imports != nil && ImageDocumentSource.accepts(url)) {
+                    guard let imports else { throw CocoaError(.fileReadUnsupportedScheme) }
+                    await imports.receive(url, libraryID: importLibraryID, folderID: folderID)
+                }
+                if imports == nil {
+                    let images = urls.filter(ImageDocumentSource.accepts)
+                    _ = try await documentStore.importImagesInBackground(from: images, into: folderID)
+                }
                 let pdfURLs = urls.filter { $0.pathExtension.lowercased() == "pdf" }
                 if !pdfURLs.isEmpty {
-                    _ = try await documentStore.importPDFsInBackground(from: pdfURLs, into: folderID)
+                    _ = try await documentStore.importPDFsInBackground(from: pdfURLs, into: folderID, openAfterImport: false)
                 }
                 for url in urls where url.pathExtension.lowercased() == "tiyinote" {
-                    _ = try documentStore.importEditableDocumentPackage(from: url, into: folderID)
+                    _ = try documentStore.importEditableDocumentPackage(from: url, into: folderID, openAfterImport: false)
                 }
             } catch { present(error) }
         }
@@ -793,7 +808,10 @@ private struct LibraryContentPage: View {
             of: [
                 UTType.fileURL.identifier,
                 UTType.pdf.identifier,
-                UTType.tiyiNoteDocument.identifier
+                UTType.tiyiNoteDocument.identifier,
+                UTType.tiyiWordDoc.identifier,
+                UTType.tiyiWordDocx.identifier,
+                UTType.image.identifier
             ],
             isTargeted: $isDropTargeted,
             perform: receiveDroppedFiles
@@ -807,13 +825,17 @@ private struct LibraryContentPage: View {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
                 || $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier)
                 || $0.hasItemConformingToTypeIdentifier(UTType.tiyiNoteDocument.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.tiyiWordDoc.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.tiyiWordDocx.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
         }
         guard !fileProviders.isEmpty else { return false }
 
         let dropHandler = onDropPDFs
         for provider in fileProviders {
-            let type: UTType? = provider.hasItemConformingToTypeIdentifier(UTType.tiyiNoteDocument.identifier)
-                ? .tiyiNoteDocument : (provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) ? .pdf : nil)
+            let type = [UTType.tiyiNoteDocument, .pdf, .tiyiWordDocx, .tiyiWordDoc, .png, .jpeg, .heic, .tiff, .image].first {
+                provider.hasItemConformingToTypeIdentifier($0.identifier)
+            }
             if let type {
                 provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
                     let result = Result {
@@ -962,7 +984,7 @@ private struct LibraryContentPage: View {
                 }
                 if PlatformCapabilities.current.canImportPDF {
                     Button(action: onImportPDF) {
-                        Label("导入 PDF", systemImage: "square.and.arrow.down")
+                        Label("导入文稿", systemImage: "square.and.arrow.down")
                     }
                 }
                 if PlatformCapabilities.current.canScanDocuments {
@@ -978,6 +1000,10 @@ private struct LibraryContentPage: View {
             }
             .buttonStyle(LibraryCompactControlStyle(isProminent: true))
             .tint(.black)
+        } else if PlatformCapabilities.current.canImportPDF, scope == .documents {
+            Button(action: onImportPDF) { Label("导入文稿", systemImage: "square.and.arrow.down") }
+                .font(.system(size: 14, weight: .semibold))
+                .buttonStyle(LibraryCompactControlStyle(isProminent: true))
         } else if PlatformCapabilities.current.canManageLibrary,
                   scope == .trash,
                   !folders.isEmpty || !documents.isEmpty {
@@ -1181,7 +1207,7 @@ private struct LibraryContentPage: View {
 
     private var emptyDescription: String {
         switch scope {
-        case .documents: "新建画板、文件夹，或导入 PDF。"
+        case .documents: "新建画板、文件夹，或导入文稿。"
         case .favorites: "收藏的文件夹和文稿会显示在这里。"
         case .trash: "删除的项目会保留在这里，直到永久删除。"
         }
@@ -1243,6 +1269,7 @@ private struct LibraryContentPage: View {
             case .all: true
             case .pdf: document.kind == .pdf
             case .canvas: document.kind == .canvas
+            case .image: document.kind == .image
             }
         }
         return sortDocuments(kindFiltered.filter { document in
@@ -1519,7 +1546,7 @@ private struct LibraryDocumentListRow: View {
         if let trashedAt = document.trashedAt {
             return "已删除 · \(trashedAt.formatted(date: .numeric, time: .omitted))"
         }
-        let kind = document.kind == .canvas ? "画板" : "PDF"
+        let kind = document.kind.title
         return "\(kind) · \(document.modifiedAt.formatted(date: .numeric, time: .omitted))"
     }
 
@@ -1663,7 +1690,7 @@ private struct LibraryDocumentGridCard: View {
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(TiyiNoteTheme.textPrimary)
                         .lineLimit(2)
-                    Text(document.kind == .canvas ? "画板" : "PDF")
+                    Text(document.kind.title)
                         .font(.caption)
                         .foregroundStyle(TiyiNoteTheme.textSecondary)
                 }
@@ -1771,9 +1798,7 @@ private struct DocumentListArtwork: View {
                     .resizable()
                     .scaledToFill()
             } else {
-                Image(systemName: document.kind == .canvas
-                    ? "rectangle.and.pencil.and.ellipsis"
-                    : "doc.richtext.fill")
+                Image(systemName: document.kind.symbol)
                     .font(.system(size: 24, weight: .medium))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
             }
@@ -1816,7 +1841,7 @@ private struct DocumentArtwork: View {
                     .resizable()
                     .scaledToFit()
             } else {
-                Image(systemName: document.kind == .canvas ? "rectangle.and.pencil.and.ellipsis" : "doc.richtext.fill")
+                Image(systemName: document.kind.symbol)
                     .font(.system(size: 30))
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
             }
@@ -2862,6 +2887,7 @@ enum LibraryKindFilter: String, CaseIterable, Identifiable {
     case all
     case pdf
     case canvas
+    case image
 
     var id: String { rawValue }
     var title: String {
@@ -2869,6 +2895,7 @@ enum LibraryKindFilter: String, CaseIterable, Identifiable {
         case .all: "全部"
         case .pdf: "PDF"
         case .canvas: "画板"
+        case .image: "图片"
         }
     }
     var symbol: String {
@@ -2876,6 +2903,7 @@ enum LibraryKindFilter: String, CaseIterable, Identifiable {
         case .all: "square.stack.3d.up"
         case .pdf: "doc.richtext"
         case .canvas: "rectangle.and.pencil.and.ellipsis"
+        case .image: "photo"
         }
     }
 }

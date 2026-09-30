@@ -22,7 +22,7 @@ struct PlatformCapabilities {
         let isPad = UIDevice.current.userInterfaceIdiom == .pad
         return PlatformCapabilities(
             canManageLibrary: isPad,
-            canImportPDF: isPad,
+            canImportPDF: true,
             canScanDocuments: isPad,
             canEditAnnotations: true,
             supportsDocumentTabs: true

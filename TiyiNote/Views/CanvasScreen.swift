@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 import AVFoundation
 
 struct CanvasScreen: View {
+    var imports: TiyiPDFImportController? = nil
     @Environment(\.tiyiAssistant) private var assistantIntegration
     @State private var showsAssistant = false
     @State private var assistantPageID: String?
@@ -73,6 +74,7 @@ struct CanvasScreen: View {
     }
 
     init(
+        imports: TiyiPDFImportController? = nil,
         documentStore: DrawingDocumentStore,
         activeDocumentID: Binding<String>? = nil,
         canEditActiveDocument: Bool = true,
@@ -82,6 +84,7 @@ struct CanvasScreen: View {
         handout: TiyiHandoutWorkspace? = nil,
         navigation: TiyiWorkspaceNavigation? = nil
     ) {
+        self.imports = imports
         self.documentStore = documentStore
         self.documentSelection = activeDocumentID
         self.canEditActiveDocument = canEditActiveDocument
@@ -464,7 +467,7 @@ struct CanvasScreen: View {
         }
         .fileImporter(
             isPresented: $showsPDFImporter,
-            allowedContentTypes: [.pdf, .tiyiNoteDocument],
+            allowedContentTypes: [.pdf, .image, .tiyiNoteDocument] + (imports?.supportsWordImport == true ? [.tiyiWordDoc, .tiyiWordDocx] : []),
             allowsMultipleSelection: true,
             onCompletion: handlePDFImport
         )
@@ -531,7 +534,7 @@ struct CanvasScreen: View {
                 )
             case .importFailed(let message):
                 Alert(
-                    title: Text("PDF 导入失败"),
+                    title: Text("文稿导入失败"),
                     message: Text(message),
                     dismissButton: .default(Text("好"))
                 )
@@ -665,19 +668,33 @@ struct CanvasScreen: View {
         switch result {
         case .success(let urls):
             do {
+                let wordURLs = urls.filter { ["doc", "docx"].contains($0.pathExtension.lowercased()) || ImageDocumentSource.accepts($0) }
+                if let imports, !wordURLs.isEmpty {
+                    let libraryID = imports.libraries.selectedID
+                    Task { for url in wordURLs { await imports.receive(url, libraryID: libraryID) } }
+                }
+                if imports == nil {
+                    let images = urls.filter(ImageDocumentSource.accepts)
+                    if !images.isEmpty {
+                        Task {
+                            do {
+                                _ = try await documentStore.importImagesInBackground(from: images, into: nil)
+                                onShowLibrary()
+                            } catch { workspaceAlert = .importFailed(error.localizedDescription) }
+                        }
+                    }
+                }
                 let pdfURLs = urls.filter {
                     $0.pathExtension.caseInsensitiveCompare("pdf") == .orderedSame
                 }
                 let editableURLs = urls.filter {
                     $0.pathExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
                 }
-                var importedDocuments = try documentStore.importPDFs(from: pdfURLs)
-                importedDocuments.append(contentsOf: try editableURLs.map {
-                    try documentStore.importEditableDocumentPackage(from: $0)
-                })
-                if let lastImportedDocument = importedDocuments.last {
-                    selectDocument(lastImportedDocument.id)
+                _ = try documentStore.importPDFs(from: pdfURLs, into: nil, openAfterImport: false)
+                for url in editableURLs {
+                    _ = try documentStore.importEditableDocumentPackage(from: url, openAfterImport: false)
                 }
+                if !pdfURLs.isEmpty || !editableURLs.isEmpty { onShowLibrary() }
             } catch {
                 workspaceAlert = .importFailed(error.localizedDescription)
             }
@@ -948,12 +965,12 @@ private struct EmptyPDFWorkspaceView: View {
         } description: {
             Text(
                 canImportPDF
-                    ? "从文件中导入一个 PDF 开始批注。"
+                    ? "从文件中导入文稿开始批注。"
                     : "其他设备同步的 PDF 会显示在这里。"
             )
         } actions: {
             if canImportPDF {
-                Button("导入 PDF", action: onImportPDF)
+                Button("导入文稿", action: onImportPDF)
                     .buttonStyle(.borderedProminent)
             }
         }

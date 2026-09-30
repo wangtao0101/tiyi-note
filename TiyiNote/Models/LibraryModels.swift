@@ -70,8 +70,15 @@ enum LibraryFolderIcon: String, CaseIterable, Codable, Identifiable, Sendable {
 enum LibraryDocumentKind: String, CaseIterable, Codable, Identifiable, Sendable {
     case pdf
     case canvas
+    case image
 
     var id: String { rawValue }
+    var title: String {
+        switch self { case .pdf: "PDF"; case .canvas: "画板"; case .image: "图片" }
+    }
+    var symbol: String {
+        switch self { case .pdf: "doc.richtext.fill"; case .canvas: "rectangle.and.pencil.and.ellipsis"; case .image: "photo" }
+    }
 }
 
 enum CanvasBackgroundStyle: String, CaseIterable, Codable, Identifiable, Sendable {

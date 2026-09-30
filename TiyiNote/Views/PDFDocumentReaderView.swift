@@ -159,7 +159,8 @@ struct PDFDocumentReaderView: View {
             } else {
                 VStack(spacing: 12) {
                     ProgressView()
-                    Text("正在从 iCloud 下载 PDF…")
+                    Text(documentStore.document(withID: documentID)?.kind == .image
+                        ? "正在从 iCloud 下载图片…" : "正在从 iCloud 下载 PDF…")
                         .font(.callout)
                         .foregroundStyle(TiyiNoteTheme.textSecondary)
                 }

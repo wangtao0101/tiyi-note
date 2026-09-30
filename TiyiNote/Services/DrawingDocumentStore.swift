@@ -1916,8 +1916,68 @@ final class DrawingDocumentStore: ObservableObject {
         persistOpenDocuments()
     }
 
+    /// Preserve original image bytes; the page background and editable ink are separate assets.
+    func importImagesInBackground(from urls: [URL], into parentID: String?, openAfterImport: Bool = false) async throws -> [PDFWorkspaceDocument] {
+        try validateParentFolder(parentID)
+        let titles = try urls.map { try normalizedTitle($0.lastPathComponent) }
+        for title in titles { try validateUniqueTitle(title, in: parentID) }
+        guard Set(titles.map(normalizedComparisonKey)).count == titles.count else {
+            throw LibraryStoreError.nameConflict(titles.first ?? "图片")
+        }
+        let staging = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: staging) }
+        let prepared = try await Task.detached(priority: .userInitiated) {
+            var documents: [LibraryDocumentMetadata] = []
+            var pages: [LibraryPage] = []
+            for (source, title) in zip(urls, titles) {
+                try Task.checkCancellation()
+                let access = source.startAccessingSecurityScopedResource()
+                defer { if access { source.stopAccessingSecurityScopedResource() } }
+                let id = UUID().uuidString.lowercased()
+                let temporary = staging.appendingPathComponent(id)
+                try FileManager.default.copyItem(at: source, to: temporary)
+                let info = try ImageDocumentSource.info(at: temporary)
+                let name = "\(id).\(info.fileExtension)"
+                try FileManager.default.moveItem(at: temporary, to: staging.appendingPathComponent(name))
+                let now = Date()
+                documents.append(LibraryDocumentMetadata(id: id, title: title, parentID: parentID,
+                    fileName: name, isBundled: false, createdAt: now, modifiedAt: now, kind: .image))
+                pages.append(LibraryPage(documentID: id, orderIndex: 0, createdAt: now, modifiedAt: now,
+                    width: info.width, height: info.height, sourceKind: .image))
+            }
+            return (documents, pages)
+        }.value
+        try Task.checkCancellation()
+        try validateParentFolder(parentID)
+        for title in titles { try validateUniqueTitle(title, in: parentID) }
+        let targets = prepared.0.map { importsDirectory.appendingPathComponent($0.fileName) }
+        let transaction = try beginWorkspaceTransaction(kind: "import-source-images", affectedURLs: [registryURL] + targets)
+        do {
+            for (metadata, target) in zip(prepared.0, targets) {
+                try fileManager.moveItem(at: staging.appendingPathComponent(metadata.fileName), to: target)
+            }
+            let documents = documentMetadata + prepared.0
+            let updatedPages = pages + prepared.1
+            try persistRegistry(folders: folders, documents: documents, pages: updatedPages)
+            documentMetadata = documents
+            pages = updatedPages
+            try commitWorkspaceTransaction(transaction)
+            rebuildWorkspaceDocuments()
+            if openAfterImport {
+                openDocumentIDs.append(contentsOf: prepared.0.map(\.id))
+                persistOpenDocuments()
+            }
+            signalLocalCloudChange()
+            return prepared.0.compactMap { document(withID: $0.id) }
+        } catch {
+            rollbackWorkspaceTransaction(transaction)
+            throw error
+        }
+    }
+
     /// Read/copy PDFs on a worker; publish the finished page manifest in one main-actor commit.
-    func importPDFsInBackground(from urls: [URL], into parentID: String?) async throws -> [PDFWorkspaceDocument] {
+    func importPDFsInBackground(from urls: [URL], into parentID: String?, openAfterImport: Bool = true) async throws -> [PDFWorkspaceDocument] {
         try validateParentFolder(parentID)
         let titles = try urls.map { try normalizedTitle($0.lastPathComponent) }
         for title in titles { try validateUniqueTitle(title, in: parentID) }
@@ -1966,8 +2026,10 @@ final class DrawingDocumentStore: ObservableObject {
             pages = updatedPages
             try commitWorkspaceTransaction(transaction)
             rebuildWorkspaceDocuments()
-            openDocumentIDs.append(contentsOf: prepared.0.map(\.id))
-            persistOpenDocuments()
+            if openAfterImport {
+                openDocumentIDs.append(contentsOf: prepared.0.map(\.id))
+                persistOpenDocuments()
+            }
             signalLocalCloudChange()
             return prepared.0.compactMap { document(withID: $0.id) }
         } catch {
@@ -1984,7 +2046,8 @@ final class DrawingDocumentStore: ObservableObject {
     @discardableResult
     func importPDFs(
         from urls: [URL],
-        into parentID: String?
+        into parentID: String?,
+        openAfterImport: Bool = true
     ) throws -> [PDFWorkspaceDocument] {
         try validateParentFolder(parentID)
         var reservedTitles = Set<String>()
@@ -2052,7 +2115,7 @@ final class DrawingDocumentStore: ObservableObject {
             documentMetadata = updatedMetadata
             pages = updatedPages
             pdfCache.merge(loadedPDFs) { _, new in new }
-            openDocumentIDs.append(contentsOf: newMetadata.map(\.id))
+            if openAfterImport { openDocumentIDs.append(contentsOf: newMetadata.map(\.id)) }
             rebuildWorkspaceDocuments()
             persistOpenDocuments()
             signalLocalCloudChange()
@@ -2082,7 +2145,9 @@ final class DrawingDocumentStore: ObservableObject {
             requestSparsePDF(documentID)
             return nil
         }
-        let pdfDocument = PDFDocument(url: workspaceDocument.fileURL)
+        let pdfDocument = workspaceDocument.kind == .image
+            ? ImageDocumentSource.displayDocument(at: workspaceDocument.fileURL)
+            : PDFDocument(url: workspaceDocument.fileURL)
         pdfCache[documentID] = pdfDocument
         return pdfDocument
     }
@@ -2112,6 +2177,11 @@ final class DrawingDocumentStore: ObservableObject {
                   let copy = source.copy() as? PDFPage else { return nil }
             holder = PDFDocument()
             holder.insert(copy, at: 0)
+        } else if metadata.sourceKind == .image {
+            guard let source = pdfDocument(for: metadata.documentID)?.page(at: 0),
+                  let copy = source.copy() as? PDFPage else { return nil }
+            holder = PDFDocument()
+            holder.insert(copy, at: 0)
         } else if metadata.sourceKind == .template {
             guard let data = try? templatePagePDFData(
                 size: CGSize(width: metadata.width, height: metadata.height),
@@ -2135,7 +2205,7 @@ final class DrawingDocumentStore: ObservableObject {
     /// Stable across process launches and page reordering; ink is composited separately.
     func pdfRasterIdentity(at index: Int, in documentID: String) -> String? {
         guard let page = pageMetadata(at: index, in: documentID) else { return nil }
-        let source = page.sourcePDFPageIndex != nil ? document(withID: documentID)?.fileURL
+        let source = (page.sourcePDFPageIndex != nil || page.sourceKind == .image) ? document(withID: documentID)?.fileURL
             : pageBackgroundURL(forPageID: page.id, in: documentID)
         let attributes = source.flatMap { try? fileManager.attributesOfItem(atPath: $0.path) }
         let resourceID = documentMetadata.first { $0.id == documentID }?.sourceResourceID ?? documentID
@@ -2221,7 +2291,7 @@ final class DrawingDocumentStore: ObservableObject {
         return try documentPages.indices.map { pageIndex in
             let bounds = exportBounds(forPage: pageIndex, in: documentID)
             let format = UIGraphicsImageRendererFormat()
-            format.scale = document.kind == .canvas ? min(2, 4096 / max(bounds.width, bounds.height)) : 2
+            format.scale = document.kind != .pdf ? min(2, 4096 / max(bounds.width, bounds.height)) : 2
             format.opaque = true
             let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
             let image = renderer.image { rendererContext in
@@ -2430,8 +2500,9 @@ final class DrawingDocumentStore: ObservableObject {
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: staging) }
         let reusesSource = source.sourceResourceID != nil
+        let copiedSourceName = "\(newID).\(source.kind == .image ? URL(fileURLWithPath: source.fileName).pathExtension : "pdf")"
         var copies: [(URL, URL)] = reusesSource ? [] : [(sourcePDF, staging.appendingPathComponent("source.pdf"))]
-        var installs: [(URL, URL)] = reusesSource ? [] : [(staging.appendingPathComponent("source.pdf"), importsDirectory.appendingPathComponent("\(newID).pdf"))]
+        var installs: [(URL, URL)] = reusesSource ? [] : [(staging.appendingPathComponent("source.pdf"), importsDirectory.appendingPathComponent(copiedSourceName))]
         for page in allPages {
             let id = pageMap[page.id]!
             let pairs = [
@@ -2462,7 +2533,7 @@ final class DrawingDocumentStore: ObservableObject {
             && normalizedComparisonKey($0.title) == normalizedComparisonKey(source.title) }
             || documentMetadata.contains { $0.parentID == parentID && $0.trashedAt == nil
                 && normalizedComparisonKey($0.title) == normalizedComparisonKey(source.title) }
-        let copyTitle = source.kind == .pdf && name.pathExtension.lowercased() == "pdf"
+        let copyTitle = (source.kind == .image || source.kind == .pdf) && !name.pathExtension.isEmpty
             ? "\(name.deletingPathExtension)_副本.\(name.pathExtension)" : "\(source.title)_副本"
         let proposed = alwaysAddsCopySuffix || occupied ? copyTitle : source.title
         let title = uniqueRestoredTitle(proposed, parentID: parentID, excludingID: newID,
@@ -2477,7 +2548,7 @@ final class DrawingDocumentStore: ObservableObject {
             for operation in operations { collaborationClock.observe(operation.stamp) }
             let stamp = collaborationClock.nextStamp()
             let metadata = LibraryDocumentMetadata(id: newID, title: title, parentID: parentID,
-                fileName: reusesSource ? source.fileName : "\(newID).pdf", isBundled: false, sourcePageCount: source.sourcePageCount,
+                fileName: reusesSource ? source.fileName : copiedSourceName, isBundled: false, sourcePageCount: source.sourcePageCount,
                 sourceResourceID: source.sourceResourceID, createdAt: stamp.createdAt,
                 modifiedAt: stamp.createdAt, contentModifiedAt: stamp.createdAt, kind: source.kind,
                 canvasBackgroundStyle: source.canvasBackgroundStyle, canvasBackgroundColor: source.canvasBackgroundColor,
@@ -2504,7 +2575,8 @@ final class DrawingDocumentStore: ObservableObject {
     @discardableResult
     func importEditableDocumentPackage(
         from sourceURL: URL,
-        into parentID: String? = nil
+        into parentID: String? = nil,
+        openAfterImport: Bool = true
     ) throws -> PDFWorkspaceDocument {
         try validateParentFolder(parentID)
         let hasSecurityAccess = sourceURL.startAccessingSecurityScopedResource()
@@ -2520,12 +2592,13 @@ final class DrawingDocumentStore: ObservableObject {
         } catch {
             throw PDFWorkspaceError.cannotAccess(sourceURL.lastPathComponent)
         }
-        return try importEditableDocumentPackage(data: packageData, into: parentID)
+        return try importEditableDocumentPackage(data: packageData, into: parentID, openAfterImport: openAfterImport)
     }
 
     private func importEditableDocumentPackage(
         data packageData: Data,
         into parentID: String?,
+        openAfterImport: Bool = true,
         preferredTitle: String? = nil
     ) throws -> PDFWorkspaceDocument {
         try validateParentFolder(parentID)
@@ -2617,7 +2690,9 @@ final class DrawingDocumentStore: ObservableObject {
         let assetsByOldPageID = Dictionary(
             uniqueKeysWithValues: package.pageAssets.map { ($0.pageID, $0) }
         )
-        let targetFileName = "\(newDocumentID).pdf"
+        let sourceExtension = package.document.kind == .image
+            ? try ImageDocumentSource.info(data: package.sourcePDFData).fileExtension : "pdf"
+        let targetFileName = "\(newDocumentID).\(sourceExtension)"
         let targetPDFURL = importsDirectory.appendingPathComponent(targetFileName)
         var affectedURLs = [registryURL, collaborationClockURL, targetPDFURL]
         for page in allPackagePages {
@@ -2733,8 +2808,10 @@ final class DrawingDocumentStore: ObservableObject {
             try persistCollaborationClock()
             try commitWorkspaceTransaction(transaction)
             rebuildWorkspaceDocuments()
-            openDocumentIDs.append(newDocumentID)
-            persistOpenDocuments()
+            if openAfterImport {
+                openDocumentIDs.append(newDocumentID)
+                persistOpenDocuments()
+            }
             signalLocalCloudChange()
             guard let result = document(withID: newDocumentID) else {
                 throw LibraryStoreError.documentNotFound(newDocumentID)
@@ -2756,10 +2833,14 @@ final class DrawingDocumentStore: ObservableObject {
         guard isSafePathComponent(package.document.id),
               isSafePathComponent(package.document.fileName),
               !package.pages.isEmpty,
-              package.pages.count + package.deletedPages.count <= 10_000,
-              let sourcePDF = PDFDocument(data: package.sourcePDFData),
-              sourcePDF.pageCount > 0 else {
+              package.pages.count + package.deletedPages.count <= 10_000 else {
             throw LibraryStoreError.invalidSnapshot("文稿身份、PDF 或页数无效")
+        }
+        let sourcePDF = package.document.kind == .image ? nil : PDFDocument(data: package.sourcePDFData)
+        if package.document.kind == .image {
+            _ = try ImageDocumentSource.info(data: package.sourcePDFData)
+        } else if sourcePDF == nil || sourcePDF!.pageCount == 0 {
+            throw LibraryStoreError.invalidSnapshot("原始 PDF 无效")
         }
         _ = try normalizedTitle(package.document.title)
 
@@ -2793,8 +2874,12 @@ final class DrawingDocumentStore: ObservableObject {
         for assets in package.pageAssets {
             let page = allPackagePages.first { $0.id == assets.pageID }!
             if let index = page.sourcePDFPageIndex {
-                guard index >= 0, index < sourcePDF.pageCount else {
+                guard let sourcePDF, index >= 0, index < sourcePDF.pageCount else {
                     throw LibraryStoreError.invalidSnapshot("原始 PDF 页面引用无效")
+                }
+            } else if page.sourceKind == .image {
+                guard package.document.kind == .image else {
+                    throw LibraryStoreError.invalidSnapshot("图片背景引用无效")
                 }
             } else if page.sourceKind != .template {
                 guard let data = assets.backgroundPDFData,
@@ -3300,7 +3385,7 @@ final class DrawingDocumentStore: ObservableObject {
         }
         guard pendingThumbnailIDs[cacheKey] == nil else { return previous }
         let token = UUID(); pendingThumbnailIDs[cacheKey] = token
-        let sourceURL = metadata.sourcePDFPageIndex != nil ? document(withID: documentID)?.fileURL
+        let sourceURL = (metadata.sourcePDFPageIndex != nil || metadata.sourceKind == .image) ? document(withID: documentID)?.fileURL
             : pageBackgroundURL(forPageID: metadata.id, in: documentID)
         let operations = loadCollaborationOperations(forPageID: metadata.id, in: documentID)
         Task { [weak self] in
@@ -5497,8 +5582,8 @@ final class DrawingDocumentStore: ObservableObject {
                 width: Double(max(bounds.width, 1)),
                 height: Double(max(bounds.height, 1)),
                 rotation: pdfPage.rotation,
-                sourcePDFPageIndex: metadata.kind == .canvas ? nil : pageIndex,
-                sourceKind: metadata.kind == .canvas ? .template : .pdf,
+                sourcePDFPageIndex: metadata.kind == .pdf ? pageIndex : nil,
+                sourceKind: metadata.kind == .image ? .image : (metadata.kind == .canvas ? .template : .pdf),
                 backgroundStyle: metadata.kind == .canvas
                     ? metadata.canvasBackgroundStyle
                     : nil,
@@ -5595,8 +5680,10 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func fileURL(for metadata: LibraryDocumentMetadata) -> URL? {
-        if let resourceID = metadata.sourceResourceID,
-           let entry = try? sparseDatabase().entry(kind: "asset", id: resourceID),
+        // Every immutable source uses this asset channel, including images and legacy documents
+        // without an explicit sourceResourceID. Remote sources live in Resources, not PDFs.
+        let resourceID = metadata.sourceResourceID ?? metadata.id
+        if let entry = try? sparseDatabase().entry(kind: "asset", id: resourceID),
            let path = entry.filePath, fileManager.fileExists(atPath: path) { return URL(fileURLWithPath: path) }
         if metadata.isBundled {
             let fileURL = URL(fileURLWithPath: metadata.fileName)
@@ -7776,7 +7863,7 @@ final class DrawingDocumentStore: ObservableObject {
     }
 
     private func ensureRecoveryBackground(for page: LibraryPage) throws {
-        guard page.sourcePDFPageIndex == nil, page.sourceKind != .template else { return }
+        guard page.sourcePDFPageIndex == nil, page.sourceKind == .pdf else { return }
         let url = pageBackgroundURL(forPageID: page.id, in: page.documentID)
         guard !fileManager.fileExists(atPath: url.path) else { return }
         let size = CGSize(width: max(page.width, 1), height: max(page.height, 1))
@@ -8390,7 +8477,7 @@ extension DrawingDocumentStore {
             for key in thumbnailCache.keys where key.hasPrefix("\(documentID)#\(page.id)#") { dirtyThumbnailKeys.remove(key) }
             return
         }
-        let sourceURL = page.sourcePDFPageIndex != nil ? document(withID: documentID)?.fileURL
+        let sourceURL = (page.sourcePDFPageIndex != nil || page.sourceKind == .image) ? document(withID: documentID)?.fileURL
             : pageBackgroundURL(forPageID: page.id, in: documentID)
         let directory = workspaceDirectory.appendingPathComponent("Covers")
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -8425,7 +8512,8 @@ extension DrawingDocumentStore {
     nonisolated private static func renderSparsePreview(page: LibraryPage, sourceURL: URL?,
         operations: [CollaborationOperation], size: CGSize) -> UIImage? {
         autoreleasepool {
-            let pdf = sourceURL.flatMap(PDFDocument.init(url:))
+            let pdf = sourceURL.flatMap { page.sourceKind == .image
+                ? ImageDocumentSource.displayDocument(at: $0) : PDFDocument(url: $0) }
             let sourcePage = pdf?.page(at: page.sourcePDFPageIndex ?? 0)
             if page.sourceKind != .template && sourcePage == nil { return nil }
             sourcePage?.rotation = page.rotation
@@ -8609,7 +8697,12 @@ extension DrawingDocumentStore {
         let directory = workspaceDirectory.appendingPathComponent(entry.kind == "cover" ? "Covers" : "Resources")
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         let hash = SHA256.hash(data: entry.payload).map { String(format: "%02x", $0) }.joined()
-        let destination = directory.appendingPathComponent(hash + (entry.kind == "cover" ? ".jpg" : ".pdf"))
+        let sourceImage = entry.kind == "asset" ? documentMetadata.first {
+            $0.kind == .image && ($0.sourceResourceID ?? $0.id) == entry.id
+        } : nil
+        let fileExtension = entry.kind == "cover" ? "jpg"
+            : sourceImage.map { URL(fileURLWithPath: $0.fileName).pathExtension } ?? "pdf"
+        let destination = directory.appendingPathComponent(hash + "." + fileExtension)
         if !fileManager.fileExists(atPath: destination.path) {
             try fileManager.copyItem(at: source, to: destination)
         }
@@ -8673,8 +8766,10 @@ extension DrawingDocumentStore {
         Set(((try? sparsePendingEntries(limit: 10000)) ?? []).map(\.documentID))
     }
     func isOriginalPDFDownloaded(_ documentID: String) -> Bool {
-        guard let metadata = documentMetadata.first(where: { $0.id == documentID }),
-              (metadata.sourcePageCount ?? 0) > 0 else { return true }
+        guard let metadata = documentMetadata.first(where: { $0.id == documentID }) else { return true }
+        // Images have an explicit page manifest instead of sourcePageCount, but still need their
+        // immutable background asset before the reader can mount a visible page.
+        guard metadata.kind == .image || (metadata.sourcePageCount ?? 0) > 0 else { return true }
         return fileURL(for: metadata).map { fileManager.fileExists(atPath: $0.path) } ?? false
     }
 }

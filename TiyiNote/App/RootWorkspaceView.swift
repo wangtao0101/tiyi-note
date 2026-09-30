@@ -72,6 +72,7 @@ struct RootWorkspaceView: View {
                     .transition(.opacity)
             case .workspace:
                 CanvasScreen(
+                    imports: imports,
                     documentStore: documentStore,
                     activeDocumentID: $activeDocumentID,
                     canEditActiveDocument: canEditDocument(activeDocumentID),
@@ -84,6 +85,11 @@ struct RootWorkspaceView: View {
             guard let id, imports?.documentToOpenLibraryID == libraryID else { return }
             openDocument(id)
             imports?.documentToOpen = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .documentImportCompleted)) { notification in
+            guard let imports, notification.object as? TiyiPDFImportController === imports,
+                  imports.libraries.selectedID == libraryID else { return }
+            showLibrary()
         }
         .animation(.easeInOut(duration: 0.16), value: destination)
         .tint(TiyiNoteTheme.selectionBlue)
@@ -240,7 +246,8 @@ struct RootWorkspaceView: View {
             },
             onOpenDocument: openDocument,
             canEditDocument: canEditDocument,
-            libraryPicker: libraryManager.map { AnyView(DocumentLibraryPicker(manager: $0)) }
+            libraryPicker: libraryManager.map { AnyView(DocumentLibraryPicker(manager: $0)) },
+            imports: imports
         )
     }
 
