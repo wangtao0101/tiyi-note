@@ -21,11 +21,44 @@ struct ScribbleEraseRecognizerChecks {
                 let result = ScribbleEraseRecognizer.recognize(world(scribble), displayScale: zoom)
                 check(result != nil, "recognize rotated scratch at \(zoom)")
                 check(result?.covers([world(letter)]) == true, "erase covered handwriting at \(zoom)")
+                check(result?.coversHandwriting([world(letter)]) == true, "handwriting coverage at \(zoom)")
+                check(result?.coversHandwriting([world(axis)]) == false, "handwriting policy protects crossed axis")
+                check(result?.coversHandwriting([world([CGPoint(x: 5, y: -20)])]) == false,
+                      "handwriting policy protects single-pass entry fringe")
                 check(result?.covers([world(axis)]) == false, "protect long crossed axis at \(zoom)")
                 check(result?.covers([world([CGPoint(x: 70, y: 0)])]) == true, "erase covered dot")
                 check(result?.covers([world([CGPoint(x: 5, y: -20)])]) == false, "a bounding box is not an erase area")
                 let partial = [CGPoint(x: 20, y: 2), CGPoint(x: 90, y: 2), CGPoint(x: 90, y: 150)]
                 check(result?.covers([world(partial)], minimumCoverage: 0.70) == false, "protect mostly uncovered shape")
+            }
+        }
+        // Wider vertical travel used to erase the middle of a multi-stroke glyph but
+        // leave its first/last horizontal strokes and small dots behind.
+        let broadScratch = (0...8).map { CGPoint(x: $0.isMultiple(of: 2) ? 0 : 140, y: CGFloat($0) * 10) }
+        let glyph: [[CGPoint]] = [
+            [CGPoint(x: 35, y: 0), CGPoint(x: 105, y: 0)],
+            [CGPoint(x: 70, y: 0), CGPoint(x: 70, y: 80)],
+            [CGPoint(x: 35, y: 40), CGPoint(x: 105, y: 40)],
+            [CGPoint(x: 35, y: 80), CGPoint(x: 105, y: 80)],
+            [CGPoint(x: 70, y: 78)]
+        ]
+        for zoom: CGFloat in [0.1, 0.25, 1, 3, 8] {
+            for angle: CGFloat in [0, .pi / 6, .pi / 2, .pi * 0.83] {
+                func world(_ points: [CGPoint]) -> [CGPoint] {
+                    points.map { CGPoint(x: ($0.x * cos(angle) - $0.y * sin(angle)) / zoom - 12000,
+                                         y: ($0.x * sin(angle) + $0.y * cos(angle)) / zoom - 8000) }
+                }
+                let gesture = ScribbleEraseRecognizer.recognize(world(broadScratch), displayScale: zoom)!
+                for stroke in glyph {
+                    check(gesture.coversHandwriting([world(stroke)]), "erase every glyph component at \(zoom), angle \(angle)")
+                }
+                check(!gesture.covers([world(glyph[0])]), "geometry keeps its stricter coverage policy")
+                check(!gesture.coversHandwriting([world([CGPoint(x: 35, y: -20), CGPoint(x: 105, y: -20)])]),
+                      "protect neighbouring handwriting")
+                check(!gesture.coversHandwriting([world(axis)]), "protect long stroke through broad scribble")
+                check(!gesture.coversHandwriting([world([CGPoint(x: -30, y: 40), CGPoint(x: -20, y: 40)]),
+                                                  world([CGPoint(x: 170, y: 40), CGPoint(x: 180, y: 40)])]),
+                      "a masked gap still contributes no coverage")
             }
         }
         let line = (0...40).map { CGPoint(x: CGFloat($0) * 4, y: sin(CGFloat($0)) * 1.2) }
@@ -55,6 +88,9 @@ struct ScribbleEraseRecognizerChecks {
         let loop = ScribbleEraseRecognizer.recognize(repeatedCircle, displayScale: 1)
         check(loop != nil, "repeated circular scribbling is an erase gesture")
         check(loop?.covers([circle]) == true, "erase ink repeatedly covered by circular scribbling")
+        check(loop?.coversHandwriting([circle]) == true, "handwriting policy erases repeated ring contact")
+        check(loop?.coversHandwriting([[CGPoint(x: -10, y: 0), CGPoint(x: 10, y: 0)]]) == false,
+              "handwriting policy never fills an untouched loop interior")
         check(loop?.covers([[CGPoint(x: -10, y: 0), CGPoint(x: 10, y: 0)]]) == false,
               "circling around untouched ink must not erase the interior")
         let rounded = (0...96).map { i in

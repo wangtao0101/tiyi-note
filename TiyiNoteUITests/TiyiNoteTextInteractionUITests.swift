@@ -468,6 +468,49 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         }
     }
 
+    func testBroadScribbleErasesEveryGlyphStrokeButKeepsNearbyInk() throws {
+        for prefix in ["scribble-multi-stroke-glyph", "practice-sidebar-scribble-multi-stroke-glyph"] {
+            let app = launchIsolatedApp(prefix: prefix)
+            let canvas = app.descendants(matching: .any)["page-canvas-0"]
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            app.buttons["tool-pen"].tap()
+            let center = CGPoint(x: canvas.frame.midX, y: canvas.frame.minY + canvas.frame.height * 0.3)
+            func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+                CGPoint(x: center.x + x - 70, y: center.y + y - 40)
+            }
+            let protected = [point(35, -30), point(105, -30)]
+            try synthesizeTouchPath(protected, on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 1", of: canvas)
+            let protectedGeometry = drawingGeometryValue(of: canvas)
+            let glyph = [[point(35, 0), point(105, 0)], [point(70, 0), point(70, 80)],
+                         [point(35, 40), point(105, 40)], [point(35, 80), point(105, 80)],
+                         [point(83, 72), point(87, 76), point(91, 78)]]
+            for (index, stroke) in glyph.enumerated() {
+                try synthesizeTouchPath(stroke, on: canvas, in: app, holdBeforeLift: 0.04)
+                waitForValue("笔迹 \(index + 2)", of: canvas)
+            }
+            let originalGeometry = drawingGeometryValue(of: canvas)
+            let scratch = (0...8).map { point($0.isMultiple(of: 2) ? 0 : 140, CGFloat($0) * 10) }
+            try synthesizeTouchPath(scratch, on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 1", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), protectedGeometry,
+                           "All five glyph strokes must disappear while the neighbouring stroke stays unchanged")
+            app.buttons["撤销"].tap()
+            waitForValue("笔迹 6", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+            app.buttons["重做"].tap()
+            waitForValue("笔迹 1", of: canvas)
+            app.buttons[prefix.hasPrefix("practice") ? "practice-exit" : "home-button"].tap()
+            app.terminate()
+            app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+            app.launch()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            waitForValue("笔迹 1", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), protectedGeometry)
+            app.terminate()
+        }
+    }
+
     func testScribbleEraseIsOneUndoAndPersistsInNoteAndPractice() throws {
         for prefix in ["scribble-ink", "practice-sidebar-scribble-ink"] {
             let app = launchIsolatedApp(prefix: prefix)

@@ -9,17 +9,24 @@ struct ScribbleEraseGesture {
     private let origin: CGPoint
     private let displayScale: CGFloat
     private let sweepAreas: [CGPath]
+    private let nearbySweepAreas: [CGPath]
+    private let footprint: CGPath
+    private let footprintEdge: CGPath
 
     fileprivate init(points: [CGPoint], passes: [ClosedRange<Int>], origin: CGPoint, displayScale: CGFloat) {
         self.origin = origin
         self.displayScale = displayScale
         let extent = ScribbleEraseRecognizer.bounds(passes.flatMap { Array(points[$0]) })
         let radius = max(6, min(14, hypot(extent.width, extent.height) * 0.065))
-        sweepAreas = passes.map { range in
+        let paths = passes.map { range -> CGPath in
             let path = CGMutablePath()
             path.addLines(between: Array(points[range]))
-            return path.copy(strokingWithWidth: radius * 2, lineCap: .round, lineJoin: .round, miterLimit: 10)
+            return path
         }
+        sweepAreas = paths.map { $0.copy(strokingWithWidth: radius * 2, lineCap: .round, lineJoin: .round, miterLimit: 10) }
+        nearbySweepAreas = paths.map { $0.copy(strokingWithWidth: radius * 4, lineCap: .round, lineJoin: .round, miterLimit: 10) }
+        footprint = ScribbleEraseRecognizer.footprint(passes.flatMap { Array(points[$0]) })
+        footprintEdge = footprint.copy(strokingWithWidth: radius * 1.3, lineCap: .round, lineJoin: .round, miterLimit: 10)
         let padded = extent.insetBy(dx: -radius, dy: -radius)
         bounds = CGRect(x: origin.x + padded.minX / displayScale,
                         y: origin.y + padded.minY / displayScale,
@@ -29,6 +36,22 @@ struct ScribbleEraseGesture {
     /// Length-weighted coverage of visible contours, never their bounding rectangle or interior.
     /// Requiring two different passes protects content merely crossed on the way to the scribble.
     func covers(_ contours: [[CGPoint]], minimumCoverage: CGFloat = 0.58) -> Bool {
+        covers(contours, minimumCoverage: minimumCoverage, accepts: repeatedlyCovers)
+    }
+
+    /// A recognized scribble can sweep a glyph's top/bottom strokes only once.
+    /// Count those sweeps when they belong to the local repeated motion, retaining the
+    /// length threshold so crossing one small part of a long stroke never deletes it all.
+    func coversHandwriting(_ contours: [[CGPoint]]) -> Bool {
+        covers(contours, minimumCoverage: 0.58) { point in
+            if repeatedlyCovers(point) { return true }
+            guard footprint.contains(point) || footprintEdge.contains(point),
+                  sweepAreas.contains(where: { $0.contains(point) }) else { return false }
+            return nearbySweepAreas.lazy.filter { $0.contains(point) }.prefix(2).count == 2
+        }
+    }
+
+    private func covers(_ contours: [[CGPoint]], minimumCoverage: CGFloat, accepts: (CGPoint) -> Bool) -> Bool {
         var covered: CGFloat = 0
         var total: CGFloat = 0
         for contour in contours where !contour.isEmpty {
@@ -37,7 +60,7 @@ struct ScribbleEraseGesture {
                                                y: ($0.y - origin.y) * displayScale) }
             if points.count == 1 {
                 total += 1
-                if repeatedlyCovers(points[0]) { covered += 1 }
+                if accepts(points[0]) { covered += 1 }
             }
             for (start, end) in zip(points, points.dropFirst()) {
                 let length = hypot(end.x - start.x, end.y - start.y)
@@ -48,14 +71,14 @@ struct ScribbleEraseGesture {
                     let t = (CGFloat(index) + 0.5) / CGFloat(count)
                     let point = CGPoint(x: start.x + (end.x - start.x) * t,
                                         y: start.y + (end.y - start.y) * t)
-                    if repeatedlyCovers(point) { covered += weight }
+                    if accepts(point) { covered += weight }
                 }
                 total += length
             }
             // PencilKit dots can have multiple samples at the very same position.
             if points.count > 1, points.dropFirst().allSatisfy({ $0 == points[0] }) {
                 total += 1
-                if repeatedlyCovers(points[0]) { covered += 1 }
+                if accepts(points[0]) { covered += 1 }
             }
         }
         return total > 0 && covered / total >= minimumCoverage
@@ -185,6 +208,32 @@ enum ScribbleEraseRecognizer {
         }
         if start < points.count - 1 { passes.append(start...(points.count - 1)) }
         return passes.count >= 3 ? passes : nil
+    }
+
+    /// Convex envelope only limits edge tolerance; it never fills an untouched interior.
+    /// Actual sweep contact and a second nearby pass are still required for every sample.
+    fileprivate static func footprint(_ input: [CGPoint]) -> CGPath {
+        let sorted = input.sorted { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
+        var points: [CGPoint] = []
+        for point in sorted where points.last != point { points.append(point) }
+        func half(_ points: [CGPoint]) -> [CGPoint] {
+            var hull: [CGPoint] = []
+            for point in points {
+                while hull.count >= 2 {
+                    let a = hull[hull.count - 2], b = hull[hull.count - 1]
+                    let cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x)
+                    if cross > 0 { break }
+                    hull.removeLast()
+                }
+                hull.append(point)
+            }
+            return hull
+        }
+        let vertices = Array(half(points).dropLast()) + half(points.reversed()).dropLast()
+        let path = CGMutablePath()
+        path.addLines(between: vertices)
+        path.closeSubpath()
+        return path
     }
 
     fileprivate static func bounds(_ points: [CGPoint]) -> CGRect {

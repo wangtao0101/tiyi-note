@@ -915,7 +915,7 @@ final class CanvasController: NSObject, ObservableObject {
                                              hypot(stroke.transform.c, stroke.transform.d), 0.001)
                     let contours = CanvasHitGeometry.visiblePoints(in: stroke, spacing: 3 / (scale * transformScale))
                         .map { $0.map { $0.location.applying(stroke.transform) } }
-                    return gesture.covers(contours)
+                    return gesture.coversHandwriting(contours)
                 })
                 removedElements = elements.filter { element in
                     guard !element.isLocked, case .shape = element.payload else { return false }
