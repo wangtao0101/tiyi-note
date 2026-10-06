@@ -23,7 +23,7 @@ struct PlatformCapabilities {
         return PlatformCapabilities(
             canManageLibrary: isPad,
             canImportPDF: true,
-            canScanDocuments: isPad,
+            canScanDocuments: true,
             canEditAnnotations: true,
             supportsDocumentTabs: true
         )

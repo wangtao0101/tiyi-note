@@ -53,6 +53,9 @@
 		100000000000000000000126 /* TiyiNoteTextInteractionUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000228 /* TiyiNoteTextInteractionUITests.swift */; };
 		F65000000000000000000021 /* TiyiHandoutCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = F65000000000000000000022 /* TiyiHandoutCanvas.swift */; };
 		F65000000000000000000023 /* TiyiWorkspaceNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */; };
+		DCC000000000000000000001 /* DocumentScanStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000002 /* DocumentScanStore.swift */; };
+		DCC000000000000000000003 /* DocumentScanCamera.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000004 /* DocumentScanCamera.swift */; };
+		DCC000000000000000000005 /* DocumentScanView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000006 /* DocumentScanView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -115,6 +118,9 @@
 		100000000000000000000229 /* TiyiNoteUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TiyiNoteUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F65000000000000000000022 /* TiyiHandoutCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiHandoutCanvas.swift; path = PackageSupport/TiyiHandoutCanvas.swift; sourceTree = "<group>"; };
 		F65000000000000000000024 /* TiyiWorkspaceNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TiyiWorkspaceNavigation.swift; path = PackageSupport/TiyiWorkspaceNavigation.swift; sourceTree = "<group>"; };
+		DCC000000000000000000002 /* DocumentScanStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentScanStore.swift; sourceTree = "<group>"; };
+		DCC000000000000000000004 /* DocumentScanCamera.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentScanCamera.swift; sourceTree = "<group>"; };
+		DCC000000000000000000006 /* DocumentScanView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentScanView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -192,6 +198,8 @@
 		100000000000000000000405 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				DCC000000000000000000004 /* DocumentScanCamera.swift */,
+				DCC000000000000000000002 /* DocumentScanStore.swift */,
 				100000000000000000000203 /* CanvasController.swift */,
 				100000000000000000000231 /* HeldInkShapeRecognizer.swift */,
 				100000000000000000000235 /* ScribbleEraseRecognizer.swift */,
@@ -210,6 +218,7 @@
 		100000000000000000000406 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				DCC000000000000000000006 /* DocumentScanView.swift */,
 				100000000000000000000220 /* LibraryBrowserView.swift */,
 				100000000000000000000205 /* CanvasScreen.swift */,
 				100000000000000000000230 /* CanvasViewport.swift */,
@@ -390,6 +399,9 @@
 				100000000000000000000116 /* LibraryModels.swift in Sources */,
 				100000000000000000000117 /* RootWorkspaceView.swift in Sources */,
 				100000000000000000000118 /* LibraryBrowserView.swift in Sources */,
+				DCC000000000000000000005 /* DocumentScanView.swift in Sources */,
+				DCC000000000000000000003 /* DocumentScanCamera.swift in Sources */,
+				DCC000000000000000000001 /* DocumentScanStore.swift in Sources */,
 				100000000000000000000119 /* CloudSyncModels.swift in Sources */,
 				100000000000000000000120 /* CloudLibrarySyncCoordinator.swift in Sources */,
 				100000000000000000000121 /* CloudKitSmokeHarness.swift in Sources */,

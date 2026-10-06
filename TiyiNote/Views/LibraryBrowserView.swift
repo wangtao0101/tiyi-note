@@ -1,10 +1,6 @@
 import SwiftUI
 import Observation
 import UniformTypeIdentifiers
-#if !targetEnvironment(macCatalyst)
-import AVFoundation
-import VisionKit
-#endif
 
 /// Own the provider's file before its callback returns; async import keeps this copy alive.
 final class StagedDocumentDrop: @unchecked Sendable {
@@ -105,16 +101,13 @@ struct LibraryBrowserView: View {
             onCompletion: handlePDFImport
         )
 #if !targetEnvironment(macCatalyst)
-        .sheet(isPresented: $showsDocumentScanner) {
-            DocumentScannerView(
-                onScan: handleScannedPDF,
-                onCancel: { showsDocumentScanner = false },
-                onFailure: { error in
-                    showsDocumentScanner = false
-                    present(error)
-                }
+        .fullScreenCover(isPresented: $showsDocumentScanner) {
+            DocumentScanView(
+                libraryID: imports?.libraries.selectedID ?? DocumentLibrary.personalID,
+                folderID: scanDestinationFolderID,
+                destinationName: documentStore.folder(withID: scanDestinationFolderID ?? "")?.title ?? "全部文稿",
+                onSave: saveScannedPDF
             )
-            .ignoresSafeArea()
         }
 #endif
         .sheet(item: $folderEditorRequest) { request in
@@ -607,30 +600,32 @@ struct LibraryBrowserView: View {
 #if targetEnvironment(macCatalyst)
         errorMessage = "Mac 暂不支持相机扫描。"
 #else
-        guard VNDocumentCameraViewController.isSupported else {
-            errorMessage = "当前设备不支持文档扫描。请在带相机的 iPad 上使用。"
-            return
-        }
         scanDestinationFolderID = folderID
         showsDocumentScanner = true
 #endif
     }
 
-    private func handleScannedPDF(_ data: Data) {
-        showsDocumentScanner = false
-        let fileName = "扫描-\(UUID().uuidString.prefix(8)).pdf"
-        let temporaryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(fileName)
-        do {
-            try data.write(to: temporaryURL, options: .atomic)
-            defer { try? FileManager.default.removeItem(at: temporaryURL) }
-            _ = try documentStore.importPDFs(
-                from: [temporaryURL],
-                into: scanDestinationFolderID
-            )
-        } catch {
-            present(error)
+    private func saveScannedPDF(_ url: URL, draft: DocumentScanDraft) async throws {
+        try imports?.checkpoint(prepare: {})
+        if let imports {
+            guard try imports.libraries.requireImportLibrary(draft.libraryID) === documentStore else {
+                throw CocoaError(.fileWriteNoPermission)
+            }
         }
+        let name: String
+        if let imports {
+            name = try imports.suggestedName(draft.title, folderID: draft.folderID, libraryID: draft.libraryID)
+        } else {
+            name = draft.title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        }
+        let staging = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        let namedURL = staging.appendingPathComponent(name).appendingPathExtension("pdf")
+        try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.copyItem(at: url, to: namedURL)
+        }.value
+        _ = try await documentStore.importPDFsInBackground(from: [namedURL], into: draft.folderID, openAfterImport: false)
     }
 
     private func finishSelecting() {
@@ -1001,7 +996,12 @@ private struct LibraryContentPage: View {
             .buttonStyle(LibraryCompactControlStyle(isProminent: true))
             .tint(.black)
         } else if PlatformCapabilities.current.canImportPDF, scope == .documents {
-            Button(action: onImportPDF) { Label("导入文稿", systemImage: "square.and.arrow.down") }
+            Menu {
+                Button(action: onImportPDF) { Label("导入文稿", systemImage: "square.and.arrow.down") }
+                if PlatformCapabilities.current.canScanDocuments {
+                    Button(action: onScanDocument) { Label("扫描文稿", systemImage: "doc.viewfinder") }
+                }
+            } label: { Label("添加", systemImage: "plus") }
                 .font(.system(size: 14, weight: .semibold))
                 .buttonStyle(LibraryCompactControlStyle(isProminent: true))
         } else if PlatformCapabilities.current.canManageLibrary,
@@ -3173,87 +3173,3 @@ enum DocumentScanPDFRenderer {
         )
     }
 }
-
-#if !targetEnvironment(macCatalyst)
-private struct DocumentScannerView: UIViewControllerRepresentable {
-    let onScan: (Data) -> Void
-    let onCancel: () -> Void
-    let onFailure: (Error) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onScan: onScan, onCancel: onCancel, onFailure: onFailure)
-    }
-
-    func makeUIViewController(context: Context) -> VNDocumentCameraViewController {
-        let controller = VNDocumentCameraViewController()
-        controller.delegate = context.coordinator
-        return controller
-    }
-
-    func updateUIViewController(
-        _ uiViewController: VNDocumentCameraViewController,
-        context: Context
-    ) {}
-
-    final class Coordinator: NSObject, VNDocumentCameraViewControllerDelegate {
-        let onScan: (Data) -> Void
-        let onCancel: () -> Void
-        let onFailure: (Error) -> Void
-
-        init(
-            onScan: @escaping (Data) -> Void,
-            onCancel: @escaping () -> Void,
-            onFailure: @escaping (Error) -> Void
-        ) {
-            self.onScan = onScan
-            self.onCancel = onCancel
-            self.onFailure = onFailure
-        }
-
-        func documentCameraViewControllerDidCancel(
-            _ controller: VNDocumentCameraViewController
-        ) {
-            onCancel()
-        }
-
-        func documentCameraViewController(
-            _ controller: VNDocumentCameraViewController,
-            didFailWithError error: Error
-        ) {
-#if targetEnvironment(simulator)
-            let scannerError = error as NSError
-            if scannerError.domain == AVFoundationErrorDomain,
-               scannerError.code == AVError.unknown.rawValue {
-                // VisionKit already presents its own camera-unavailable alert in
-                // Simulator. Reporting the same AVFoundation failure again after the
-                // scanner closes leaves a second, misleading app alert over the
-                // library and makes the cancellation path look stuck.
-                onCancel()
-                return
-            }
-#endif
-            onFailure(error)
-        }
-
-        func documentCameraViewController(
-            _ controller: VNDocumentCameraViewController,
-            didFinishWith scan: VNDocumentCameraScan
-        ) {
-            guard scan.pageCount > 0 else {
-                onFailure(
-                    NSError(
-                        domain: "TiyiNote.DocumentScanner",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "扫描结果没有页面。"]
-                    )
-                )
-                return
-            }
-            let data = DocumentScanPDFRenderer.makePDFData(
-                images: (0..<scan.pageCount).map(scan.imageOfPage(at:))
-            )
-            onScan(data)
-        }
-    }
-}
-#endif
