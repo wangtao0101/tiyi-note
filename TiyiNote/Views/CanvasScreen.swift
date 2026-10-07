@@ -51,6 +51,8 @@ struct CanvasScreen: View {
     @State private var activePageIndex = 0
     @State private var showsPDFImporter = false
     @State private var showsImageImporter = false
+    @State private var imageImportSession: CanvasImageImportSession?
+    @State private var fileImageTarget: CanvasImageImportSession?
     @State private var showsPDFSearch = false
     @State private var showsConflictVersions = false
     @State private var requestedReaderPageIndex: Int?
@@ -301,7 +303,10 @@ struct CanvasScreen: View {
                 isScribbleEraseEnabled: $isScribbleEraseEnabled,
                 showsThumbnails: thumbnailVisibility,
                 onSearch: practice == nil && handout == nil ? { showsPDFSearch = true } : nil,
-                onInsertImage: { showsImageImporter = true },
+                onInsertImage: {
+                    fileImageTarget = makeImageSession(source: .photos)
+                    showsImageImporter = fileImageTarget != nil
+                },
                 onInsertShape: insertShape,
                 hasActiveDocument: !activeDocumentID.isEmpty,
                 canClearPage: activeController != nil,
@@ -314,7 +319,10 @@ struct CanvasScreen: View {
                 isPreparingPracticeVersion: practice?.isPreparingCloseReading == true,
                 onTogglePracticeVersion: onTogglePracticeVersion,
                 allowsExplanation: onExplanation != nil,
-                onToggleEditing: canToggleEditing ? toggleEditing : nil
+                onToggleEditing: canToggleEditing ? toggleEditing : nil,
+                onTakePhoto: PlatformCapabilities.current.canScanDocuments && UIDevice.current.userInterfaceIdiom == .pad
+                    ? { imageImportSession = makeImageSession(source: .camera) } : nil,
+                onSelectPhoto: { imageImportSession = makeImageSession(source: .photos) }
             )
         } else {
             ReadOnlyToolPaletteView(
@@ -477,6 +485,11 @@ struct CanvasScreen: View {
             allowsMultipleSelection: false,
             onCompletion: handleImageImport
         )
+        .fullScreenCover(item: $imageImportSession) { session in
+            CanvasImageImportView(source: session.source) { data in
+                try insertImportedImage(data, into: session)
+            }
+        }
         .sheet(isPresented: $showsPDFSearch) {
             if let document = documentStore.document(withID: activeDocumentID) {
                 PDFTextSearchSheet(
@@ -639,28 +652,43 @@ struct CanvasScreen: View {
     }
 
     private func handleImageImport(_ result: Result<[URL], Error>) {
-        guard annotationEditingEnabled else { return }
+        guard let target = fileImageTarget else { return }
+        fileImageTarget = nil
         switch result {
         case .success(let urls):
             guard let url = urls.first else { return }
-            let hasAccess = url.startAccessingSecurityScopedResource()
-            defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
-            do {
-                let data = try Data(contentsOf: url)
-                guard let image = UIImage(data: data), let pngData = image.pngData() else {
-                    throw PDFWorkspaceError.invalidPDF(url.lastPathComponent)
-                }
-                pageElementInsertionRequest = PageElementInsertionRequest(
-                    pageIndex: activePageIndex,
-                    payload: .image(PageImagePayload(pngData: pngData))
-                )
-                selectedTool = .lasso
-            } catch {
-                workspaceAlert = .objectImportFailed(error.localizedDescription)
+            Task {
+                do {
+                    let data = try await Task.detached(priority: .userInitiated) {
+                        let hasAccess = url.startAccessingSecurityScopedResource()
+                        defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+                        return try Data(contentsOf: url)
+                    }.value
+                    imageImportSession = CanvasImageImportSession(documentID: target.documentID, pageID: target.pageID, source: .file(data))
+                } catch { workspaceAlert = .objectImportFailed(error.localizedDescription) }
             }
         case .failure(let error):
             workspaceAlert = .objectImportFailed(error.localizedDescription)
         }
+    }
+
+    private func makeImageSession(source: CanvasImageSource) -> CanvasImageImportSession? {
+        guard annotationEditingEnabled,
+              let pageID = documentStore.pageID(at: activePageIndex, in: activeDocumentID) else { return nil }
+        return CanvasImageImportSession(documentID: activeDocumentID, pageID: pageID, source: source)
+    }
+
+    private func insertImportedImage(_ data: Data, into session: CanvasImageImportSession) throws {
+        guard annotationEditingEnabled, activeDocumentID == session.documentID,
+              let pageIndex = documentStore.pageIndex(for: session.pageID, in: session.documentID),
+              documentStore.document(withID: session.documentID) != nil else {
+            throw CanvasImageImportError.destinationChanged
+        }
+        requestedReaderPageIndex = pageIndex
+        pageElementInsertionRequest = PageElementInsertionRequest(
+            pageIndex: pageIndex, payload: .image(PageImagePayload(pngData: data)),
+            documentID: session.documentID, pageID: session.pageID, fitsVisibleViewport: true)
+        selectedTool = .lasso
     }
 
     private func handlePDFImport(_ result: Result<[URL], Error>) {

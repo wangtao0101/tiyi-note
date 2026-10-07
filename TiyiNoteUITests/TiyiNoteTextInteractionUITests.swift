@@ -3,6 +3,106 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+    func testCanvasImageSourcePickersCancelWithoutInsertion() throws {
+        let app = launchIsolatedApp(prefix: "canvas-photo-source-picker")
+        XCTAssertTrue(app.buttons["插入图片"].waitForExistence(timeout: 5))
+        app.buttons["插入图片"].tap(); app.buttons["从相册选择"].tap()
+        let cancel = app.buttons.matching(NSPredicate(format: "label == %@ AND identifier != %@", "取消", "canvas-image-cancel")).firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5))
+        cancel.tap()
+        XCTAssertTrue(app.staticTexts["选择图片后，框选需要放到画板的部分"].waitForExistence(timeout: 5))
+        app.buttons["canvas-image-cancel"].tap()
+        XCTAssertTrue(app.buttons["插入图片"].waitForExistence(timeout: 3))
+        app.buttons["插入图片"].tap(); app.buttons["从文件选择"].tap()
+        let fileCancel = app.buttons.matching(NSPredicate(format: "label IN %@", ["取消", "Cancel"])).firstMatch
+        XCTAssertTrue(fileCancel.waitForExistence(timeout: 5), app.debugDescription); fileCancel.tap()
+        XCTAssertTrue(app.buttons["插入图片"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.descendants(matching: .any).matching(identifier: "page-element-image").count, 0)
+    }
+
+    func testCanvasPhotoResizeMoveResetAndCancel() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "canvas-photo-handles", additionalLaunchArguments: ["--canvas-photo-ui-test"])
+        XCTAssertTrue(app.buttons["插入图片"].waitForExistence(timeout: 5))
+        app.buttons["插入图片"].tap(); app.buttons["拍照"].tap()
+        XCTAssertTrue(app.buttons["canvas-image-shutter"].waitForExistence(timeout: 3))
+        app.buttons["canvas-image-shutter"].tap()
+        let surface = app.descendants(matching: .any)["canvas-image-crop-surface"]
+        let selection = app.descendants(matching: .any)["canvas-image-crop-workspace"]
+        let bottomRight = app.descendants(matching: .any)["canvas-image-crop-handle-4"]
+        XCTAssertTrue(bottomRight.waitForExistence(timeout: 3))
+        bottomRight.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.1,
+            thenDragTo: surface.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.65)))
+        XCTAssertTrue((selection.value as? String)?.contains("70,65") == true, "\(selection.value ?? "nil")")
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.3)).press(forDuration: 0.1,
+            thenDragTo: surface.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.4)))
+        XCTAssertTrue((selection.value as? String)?.contains("10,10,70,65") == true, "\(selection.value ?? "nil")")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Photo crop handles and move dark"; screenshot.lifetime = .keepAlways; add(screenshot)
+        app.buttons["canvas-image-reset"].tap()
+        XCTAssertTrue((selection.value as? String)?.contains("0,0,100,100") == true)
+        app.buttons["canvas-image-cancel"].tap()
+        XCTAssertTrue(surface.waitForNonExistence(timeout: 3))
+        XCTAssertEqual(app.descendants(matching: .any).matching(identifier: "page-element-image").count, 0)
+    }
+
+    func testCanvasPhotoOrientationCropAndUndoChecks() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--library-smoke", "photo-only-\(UUID().uuidString)"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["拍照裁剪验证通过"].waitForExistence(timeout: 20), app.debugDescription)
+    }
+
+    func testCanvasPhotoCropInsertUndoRedoAndReload() throws {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchIsolatedApp(prefix: "canvas-photo", additionalLaunchArguments: ["--canvas-photo-ui-test"])
+        XCTAssertTrue(app.descendants(matching: .any)["page-canvas-0"].waitForExistence(timeout: 5))
+        app.buttons["插入图片"].tap()
+        XCTAssertTrue(app.buttons["从相册选择"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["从文件选择"].exists)
+        app.buttons["拍照"].tap()
+        let shutter = app.buttons["canvas-image-shutter"]
+        XCTAssertTrue(shutter.waitForExistence(timeout: 5))
+        shutter.tap()
+        let surface = app.descendants(matching: .any)["canvas-image-crop-surface"]
+        XCTAssertTrue(surface.waitForExistence(timeout: 5))
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.25))
+            .press(forDuration: 0.1, thenDragTo: surface.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.75)))
+        let selection = app.descendants(matching: .any)["canvas-image-crop-workspace"]
+        XCTAssertTrue((selection.value as? String)?.contains("60,50") == true, app.debugDescription)
+        let cropScreenshot = XCTAttachment(screenshot: app.screenshot())
+        cropScreenshot.name = "Photo crop portrait"; cropScreenshot.lifetime = .keepAlways; add(cropScreenshot)
+        app.buttons["canvas-image-rotate"].tap()
+        XCTAssertTrue(app.buttons["canvas-image-insert"].waitForExistence(timeout: 3))
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(app.buttons["canvas-image-insert"].isHittable)
+        let rotatedScreenshot = XCTAttachment(screenshot: app.screenshot())
+        rotatedScreenshot.name = "Photo crop landscape rotated"; rotatedScreenshot.lifetime = .keepAlways; add(rotatedScreenshot)
+        app.buttons["canvas-image-insert"].tap()
+        let image = app.descendants(matching: .any).matching(identifier: "page-element-image").firstMatch
+        XCTAssertTrue(image.waitForExistence(timeout: 5))
+        XCTAssertEqual(image.frame.width / image.frame.height, 0.625, accuracy: 0.06)
+        XCTAssertTrue(app.buttons["撤销"].isEnabled)
+        app.buttons["撤销"].tap()
+        XCTAssertTrue(image.waitForNonExistence(timeout: 3))
+        app.buttons["重做"].tap()
+        XCTAssertTrue(image.waitForExistence(timeout: 3))
+        let insertedScreenshot = XCTAttachment(screenshot: app.screenshot())
+        insertedScreenshot.name = "Photo inserted on canvas"; insertedScreenshot.lifetime = .keepAlways; add(insertedScreenshot)
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(image.waitForExistence(timeout: 5), "图片重启后应保留")
+        app.buttons["插入图片"].tap(); app.buttons["拍照"].tap()
+        XCTAssertTrue(shutter.waitForExistence(timeout: 3)); shutter.tap()
+        XCTAssertTrue(app.buttons["canvas-image-retake"].waitForExistence(timeout: 3))
+        app.buttons["canvas-image-retake"].tap()
+        XCTAssertTrue(shutter.waitForExistence(timeout: 3)); shutter.tap()
+        XCTAssertTrue(app.buttons["canvas-image-insert"].waitForExistence(timeout: 3))
+        app.buttons["canvas-image-cancel"].tap()
+        XCTAssertEqual(app.descendants(matching: .any).matching(identifier: "page-element-image").count, 1)
+    }
+
     func testLineRotationControlFollowsTheActualLineAtEveryAngleAndZoom() throws {
         XCUIDevice.shared.orientation = .portrait
         let app = launchIsolatedApp(prefix: "practice-sidebar-line-rotation-alignment")

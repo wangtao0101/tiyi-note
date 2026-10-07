@@ -4,6 +4,8 @@ import PDFKit
 import PencilKit
 import SwiftUI
 import UIKit
+import ImageIO
+import UniformTypeIdentifiers
 
 struct LibraryFeatureSmokeConfiguration: Hashable {
     static let argument = "--library-smoke"
@@ -66,6 +68,11 @@ private enum LibraryFeatureSmokeHarness {
         defaults.removePersistentDomain(forName: defaultsName)
 
         do {
+            try await validateCanvasPhotoImport()
+            if token.hasPrefix("photo-only-") {
+                logger.info("TIYI_LIBRARY_SMOKE_PASS token=\(token, privacy: .public)")
+                return "拍照裁剪验证通过"
+            }
             if token.hasPrefix("vertices-only-") {
                 try validateVertexEditing()
                 try validateShapeStyling()
@@ -1642,6 +1649,77 @@ private enum LibraryFeatureSmokeHarness {
                 }
             }
         }
+    }
+
+    private static func validateCanvasPhotoImport() async throws {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1; format.opaque = true
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 100), format: format).image { context in
+            UIColor.red.setFill(); context.fill(CGRect(x: 0, y: 0, width: 100, height: 50))
+            UIColor.green.setFill(); context.fill(CGRect(x: 100, y: 0, width: 100, height: 50))
+            UIColor.blue.setFill(); context.fill(CGRect(x: 0, y: 50, width: 100, height: 50))
+            UIColor.yellow.setFill(); context.fill(CGRect(x: 100, y: 50, width: 100, height: 50))
+        }
+        let processor = CanvasImageProcessor()
+        let oriented = NSMutableData()
+        guard let cg = image.cgImage,
+              let destination = CGImageDestinationCreateWithData(oriented, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw SmokeError.validationFailed("无法创建带方向的拍照样本")
+        }
+        CGImageDestinationAddImage(destination, cg, [kCGImagePropertyOrientation: 6] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw SmokeError.validationFailed("照片样本无法编码") }
+        let preview = UIImage(data: try await processor.load(oriented as Data))
+        guard preview?.size == CGSize(width: 100, height: 200) else {
+            throw SmokeError.validationFailed("拍照 EXIF 方向未归一化")
+        }
+        let crop = UIImage(data: try await processor.crop(CGRect(x: 0, y: 0, width: 0.5, height: 0.5)))
+        func isBlue(_ image: UIImage?) -> Bool {
+            guard let cg = image?.cgImage,
+                  let pixel = cg.cropping(to: CGRect(x: cg.width / 2, y: cg.height / 2, width: 1, height: 1)) else { return false }
+            var rgba = [UInt8](repeating: 0, count: 4)
+            let valid = rgba.withUnsafeMutableBytes { bytes -> Bool in
+                guard let context = CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8,
+                    bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+                context.draw(pixel, in: CGRect(x: 0, y: 0, width: 1, height: 1)); return true
+            }
+            return valid && rgba[2] > 220 && rgba[0] < 30 && rgba[1] < 30
+        }
+        guard crop?.size == CGSize(width: 50, height: 100), isBlue(crop) else {
+            throw SmokeError.validationFailed("框选裁错方向或使用了预览坐标")
+        }
+        _ = try await processor.rotate()
+        _ = try await processor.rotate()
+        _ = try await processor.rotate()
+        let restored = UIImage(data: try await processor.crop(CGRect(x: 0, y: 0.5, width: 0.5, height: 0.5)))
+        guard restored?.size == CGSize(width: 100, height: 50), isBlue(restored) else {
+            throw SmokeError.validationFailed("连续旋转后图片内容错位")
+        }
+        do {
+            _ = try await processor.crop(CGRect(x: 2, y: 2, width: 1, height: 1))
+            throw SmokeError.validationFailed("越界框选未拒绝")
+        } catch CanvasImageImportError.invalidCrop {}
+
+        let fitted = CanvasImageCropGeometry.aspectFit(CGSize(width: 200, height: 100), in: CGSize(width: 300, height: 300))
+        let corner = CanvasImageCropGeometry.selection(from: CGPoint(x: 0.999, y: 0.999), to: CGPoint(x: 1, y: 1))
+        guard CanvasImageCropGeometry.point(CGPoint(x: 150, y: 150), in: fitted) == CGPoint(x: 0.5, y: 0.5),
+              corner.width >= 0.02, corner.maxX <= 1, corner.maxY <= 1,
+              CanvasImageCropGeometry.selection(from: CGPoint(x: 0.8, y: 0.9), to: CGPoint(x: 0.2, y: 0.3)).width > 0.59,
+              CanvasImageCropGeometry.moved(CGRect(x: 0.2, y: 0.2, width: 0.4, height: 0.4), by: CGSize(width: 2, height: -2)).origin == CGPoint(x: 0.6, y: 0) else {
+            throw SmokeError.validationFailed("框选适配留白、反向框选或边界约束错误")
+        }
+        let controller = CanvasController()
+        let inserted = CanvasPageElement(logicalBounds: CGRect(x: 1, y: 2, width: 50, height: 100), zIndex: 0,
+                                         payload: .image(PageImagePayload(pngData: crop!.pngData()!)))
+        let unrelated = CanvasPageElement(logicalBounds: CGRect(x: 20, y: 30, width: 10, height: 10), zIndex: 1,
+                                          payload: .text(PageTextPayload(text: "保留其他对象")))
+        var elements = [inserted, unrelated]
+        controller.pageElementsProvider = { elements }
+        controller.onPageElementsUpdated = { updated, _ in elements = updated }
+        controller.recordElementInsertion(inserted.id)
+        controller.undo()
+        guard elements == [unrelated], controller.canRedo else { throw SmokeError.validationFailed("图片撤销影响其他对象") }
+        controller.redo()
+        guard Set(elements.map(\.id)) == [inserted.id, unrelated.id] else { throw SmokeError.validationFailed("图片无法重做") }
     }
 
     private static func validateScanPDFRenderer() throws {

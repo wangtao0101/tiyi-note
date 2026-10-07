@@ -45,6 +45,7 @@ final class DocumentScanCamera: NSObject, ObservableObject, AVCapturePhotoCaptur
     @Published private(set) var isBoundaryStable = false
     @Published var errorMessage: String?
     let session = AVCaptureSession()
+    private let detectsDocumentEdges: Bool
     private let queue = DispatchQueue(label: "tiyi.document-scan.camera")
     private let output = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -62,7 +63,8 @@ final class DocumentScanCamera: NSObject, ObservableObject, AVCapturePhotoCaptur
     private var interruptionObserver: NSObjectProtocol?
     private var interruptionBeganObserver: NSObjectProtocol?
 
-    override init() {
+    init(detectsDocumentEdges: Bool = true) {
+        self.detectsDocumentEdges = detectsDocumentEdges
         super.init()
         interruptionObserver = NotificationCenter.default.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { [weak self] _ in
             self?.queue.async { [weak self] in
@@ -146,15 +148,18 @@ final class DocumentScanCamera: NSObject, ObservableObject, AVCapturePhotoCaptur
                 if session.canSetSessionPreset(.photo) { session.sessionPreset = .photo }
                 guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { throw CameraError.unavailable }
                 let input = try AVCaptureDeviceInput(device: device)
-                guard session.canAddInput(input), session.canAddOutput(output), session.canAddOutput(videoOutput) else { throw CameraError.unavailable }
+                guard session.canAddInput(input), session.canAddOutput(output),
+                      !detectsDocumentEdges || session.canAddOutput(videoOutput) else { throw CameraError.unavailable }
                 session.addInput(input)
                 session.addOutput(output)
-                videoOutput.alwaysDiscardsLateVideoFrames = true
-                videoOutput.automaticallyConfiguresOutputBufferDimensions = false
-                videoOutput.deliversPreviewSizedOutputBuffers = true
-                videoOutput.setSampleBufferDelegate(self, queue: analysisQueue)
-                session.addOutput(videoOutput)
-                configureVideoConnection()
+                if detectsDocumentEdges {
+                    videoOutput.alwaysDiscardsLateVideoFrames = true
+                    videoOutput.automaticallyConfiguresOutputBufferDimensions = false
+                    videoOutput.deliversPreviewSizedOutputBuffers = true
+                    videoOutput.setSampleBufferDelegate(self, queue: analysisQueue)
+                    session.addOutput(videoOutput)
+                    configureVideoConnection()
+                }
                 configured = true
             }
             if !session.isRunning { session.startRunning() }

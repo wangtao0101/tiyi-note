@@ -614,6 +614,11 @@ final class CanvasController: NSObject, ObservableObject {
         refreshHistoryState()
     }
 
+    func recordElementInsertion(_ id: UUID) {
+        recordUndoAction(.restorePageContent(drawing: nil, elements: [], replacingIDs: [id]))
+        refreshHistoryState()
+    }
+
     struct DrawingSnapshot {
         let drawing: PKDrawing
         fileprivate let localDrawing: PKDrawing

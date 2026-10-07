@@ -438,6 +438,9 @@ struct PageElementInsertionRequest: Identifiable {
     let id = UUID()
     let pageIndex: Int
     let payload: PageElementInsertionPayload
+    var documentID: String? = nil
+    var pageID: String? = nil
+    var fitsVisibleViewport = false
 }
 
 struct PDFTextSearchResult: Identifiable, Hashable {

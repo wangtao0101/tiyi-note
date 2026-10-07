@@ -1605,7 +1605,8 @@ private struct PDFPageAnnotationView: View {
 
     private func consumePageElementInsertionRequest() {
         guard let request = pageElementInsertionRequest,
-              request.pageIndex == pageIndex,
+              request.documentID == nil || request.documentID == documentID,
+              request.pageID.map({ $0 == pageID }) ?? (request.pageIndex == pageIndex),
               isAnnotationEditingEnabled else { return }
 
         if case .text = request.payload, selectedTool != .text {
@@ -1630,8 +1631,8 @@ private struct PDFPageAnnotationView: View {
         case .image(let payload):
             let imageSize = UIImage(data: payload.pngData)?.size ?? CGSize(width: 4, height: 3)
             let maximumSize = CGSize(
-                width: logicalPageSize.width * 0.46,
-                height: logicalPageSize.height * 0.36
+                width: (request.fitsVisibleViewport ? projection.logicalBounds.width : logicalPageSize.width) * 0.46,
+                height: (request.fitsVisibleViewport ? projection.logicalBounds.height : logicalPageSize.height) * 0.36
             )
             let scale = min(
                 maximumSize.width / max(imageSize.width, 1),
@@ -1663,6 +1664,9 @@ private struct PDFPageAnnotationView: View {
             payload: payload
         )
         pageElements.append(element)
+        if case .image = element.payload {
+            controller.recordElementInsertion(element.id)
+        }
         markPageElementsChanged()
         pageElementInsertionRequest = nil
 

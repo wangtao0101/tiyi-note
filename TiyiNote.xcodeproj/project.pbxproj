@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		CA7200000000000000000001 /* CanvasImageImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7200000000000000000002 /* CanvasImageImportView.swift */; };
+		CA7100000000000000000001 /* CanvasImageImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7100000000000000000002 /* CanvasImageImport.swift */; };
 		DCA000000000000000000001 /* PDFRasterDiskCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA000000000000000000002 /* PDFRasterDiskCache.swift */; };
 		63BF45BCDDA244E184C9083A /* DocumentLibraryPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A07C34D47F549509ED9B6F3 /* DocumentLibraryPicker.swift */; };
 		E34DED9BF4BC44D3BBEBDCC1 /* DocumentLibraryManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ABA3512F2FA4C47BF66DCC4 /* DocumentLibraryManager.swift */; };
@@ -69,6 +71,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		CA7200000000000000000002 /* CanvasImageImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasImageImportView.swift; sourceTree = "<group>"; };
+		CA7100000000000000000002 /* CanvasImageImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasImageImport.swift; sourceTree = "<group>"; };
 		DCA000000000000000000002 /* PDFRasterDiskCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFRasterDiskCache.swift; sourceTree = "<group>"; };
 		6A07C34D47F549509ED9B6F3 /* DocumentLibraryPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DocumentLibraryPicker.swift; path = Views/DocumentLibraryPicker.swift; sourceTree = "<group>"; };
 		4ABA3512F2FA4C47BF66DCC4 /* DocumentLibraryManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = DocumentLibraryManager.swift; path = Services/DocumentLibraryManager.swift; sourceTree = "<group>"; };
@@ -198,6 +202,7 @@
 		100000000000000000000405 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				CA7100000000000000000002 /* CanvasImageImport.swift */,
 				DCC000000000000000000004 /* DocumentScanCamera.swift */,
 				DCC000000000000000000002 /* DocumentScanStore.swift */,
 				100000000000000000000203 /* CanvasController.swift */,
@@ -218,6 +223,7 @@
 		100000000000000000000406 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				CA7200000000000000000002 /* CanvasImageImportView.swift */,
 				DCC000000000000000000006 /* DocumentScanView.swift */,
 				100000000000000000000220 /* LibraryBrowserView.swift */,
 				100000000000000000000205 /* CanvasScreen.swift */,
@@ -366,6 +372,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CA7200000000000000000001 /* CanvasImageImportView.swift in Sources */,
+				CA7100000000000000000001 /* CanvasImageImport.swift in Sources */,
 				100000000000000000000130 /* TiyiPracticeView.swift in Sources */,
 				F65000000000000000000021 /* TiyiHandoutCanvas.swift in Sources */,
 				F65000000000000000000023 /* TiyiWorkspaceNavigation.swift in Sources */,

@@ -46,7 +46,7 @@
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>用于扫描纸质文档并生成 PDF 笔记。</string>
+	<string>用于扫描纸质文档，以及拍照、裁剪并将图片添加到画板。</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIBackgroundModes</key>

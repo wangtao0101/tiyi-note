@@ -54,6 +54,8 @@ struct ToolPaletteView: View {
     var onTogglePracticeVersion: (() -> Void)? = nil
     var allowsExplanation = false
     var onToggleEditing: (() -> Void)? = nil
+    var onTakePhoto: (() -> Void)? = nil
+    var onSelectPhoto: (() -> Void)? = nil
 
     var body: some View {
         ZStack {
@@ -182,11 +184,26 @@ struct ToolPaletteView: View {
                                 selectFirstLevelTool(.text)
                             }
 
-                            DocumentToolbarButton(
-                                symbol: "photo",
-                                title: "插入图片",
-                                action: onInsertImage
-                            )
+                            if onTakePhoto != nil || onSelectPhoto != nil {
+                                Menu {
+                                    if let onTakePhoto {
+                                        Button("拍照", systemImage: "camera", action: onTakePhoto)
+                                    }
+                                    if let onSelectPhoto {
+                                        Button("从相册选择", systemImage: "photo", action: onSelectPhoto)
+                                    }
+                                    Button("从文件选择", systemImage: "folder", action: onInsertImage)
+                                } label: {
+                                    DocumentToolbarIcon(symbol: "photo")
+                                }
+                                .accessibilityLabel("插入图片")
+                            } else {
+                                DocumentToolbarButton(
+                                    symbol: "photo",
+                                    title: "插入图片",
+                                    action: onInsertImage
+                                )
+                            }
 
                             Menu {
                                 ForEach(PageShapeKind.allCases) { shape in
