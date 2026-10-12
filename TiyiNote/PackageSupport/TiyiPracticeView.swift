@@ -8,12 +8,14 @@ public struct TiyiPracticeSection: Codable, Hashable, Identifiable, Sendable {
     public var pageIDs: [String]
     public var deletedPageIDs: [String]
     public var closeReadingPageID: String?
-    public init(id: String, label: String, pageIDs: [String] = [], deletedPageIDs: [String] = [], closeReadingPageID: String? = nil) {
+    public var isReferencePage: Bool
+    public init(id: String, label: String, pageIDs: [String] = [], deletedPageIDs: [String] = [], closeReadingPageID: String? = nil, isReferencePage: Bool = false) {
         self.id = id; self.label = label; self.pageIDs = pageIDs; self.deletedPageIDs = deletedPageIDs
         self.closeReadingPageID = closeReadingPageID
+        self.isReferencePage = isReferencePage
     }
 
-    private enum CodingKeys: String, CodingKey { case id, label, pageIDs, deletedPageIDs, closeReadingPageID }
+    private enum CodingKeys: String, CodingKey { case id, label, pageIDs, deletedPageIDs, closeReadingPageID, isReferencePage }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
@@ -21,6 +23,7 @@ public struct TiyiPracticeSection: Codable, Hashable, Identifiable, Sendable {
         pageIDs = try values.decode([String].self, forKey: .pageIDs)
         deletedPageIDs = try values.decodeIfPresent([String].self, forKey: .deletedPageIDs) ?? []
         closeReadingPageID = try values.decodeIfPresent(String.self, forKey: .closeReadingPageID)
+        isReferencePage = try values.decodeIfPresent(Bool.self, forKey: .isReferencePage) ?? false
     }
 }
 
@@ -416,7 +419,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
             (section.pageIDs + section.deletedPageIDs).map { ($0, index) }
         }, uniquingKeysWith: { first, _ in first })
         var owner = 0
-        var restored = sections.map { TiyiPracticeSection(id: $0.id, label: $0.label, closeReadingPageID: $0.closeReadingPageID) }
+        var restored = sections.map { TiyiPracticeSection(id: $0.id, label: $0.label, closeReadingPageID: $0.closeReadingPageID, isReferencePage: $0.isReferencePage) }
         guard !restored.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
         for id in pages {
             if let known = owners[id] { owner = known }
@@ -524,7 +527,7 @@ public struct TiyiPracticeActions: View {
                         .help(error)
                 }
                 Button("插入作答页", systemImage: "doc.badge.plus") { do { try workspace.appendPage() } catch { workspace.errorMessage = error.localizedDescription } }.accessibilityIdentifier("practice-add-page")
-                if workspace.onAnswer != nil {
+                if workspace.onAnswer != nil && workspace.currentSection?.isReferencePage != true {
                     Button("答案与解析", systemImage: "text.book.closed") { if let id = workspace.currentSection?.id { workspace.onAnswer?(id) } }
                 }
                 Button(workspace.isCompleted ? "标记为未完成" : "标记完成", systemImage: "checkmark.circle") { do { try workspace.onToggleCompleted?() } catch { workspace.errorMessage = error.localizedDescription } }
