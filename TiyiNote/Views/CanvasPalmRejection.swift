@@ -39,6 +39,21 @@ import UIKit
 /// Passive observation of both touch types on their common ancestor. It never
 /// competes with PencilKit; only finger navigation recognizers are suspended.
 final class CanvasPalmRejectionGestureRecognizer: UIGestureRecognizer {
+    /// Continuous PDF pages share navigation recognizers. A page that mounts after Pencil-down
+    /// has not seen that contact, and removing one page must not release another page's lock.
+    private final class NavigationLock {
+        var owners: Set<ObjectIdentifier> = []
+        let wasEnabled: Bool
+        init(wasEnabled: Bool) { self.wasEnabled = wasEnabled }
+    }
+    private static let navigationLocks = NSMapTable<UIGestureRecognizer, NavigationLock>(
+        keyOptions: .weakMemory, valueOptions: .strongMemory
+    )
+
+    static func isNavigationSuspended(_ gesture: UIGestureRecognizer) -> Bool {
+        navigationLocks.object(forKey: gesture)?.owners.isEmpty == false
+    }
+
     var onNavigationRestored: (() -> Void)?
     private var contacts = CanvasPalmRejectionState<ObjectIdentifier>()
     private let suspendedNavigation = NSHashTable<UIGestureRecognizer>.weakObjects()
@@ -116,9 +131,15 @@ final class CanvasPalmRejectionGestureRecognizer: UIGestureRecognizer {
                 for gesture in host.gestureRecognizers ?? []
                 where gesture is UIPanGestureRecognizer || gesture is UIPinchGestureRecognizer {
                     let direct = NSNumber(value: UITouch.TouchType.direct.rawValue)
-                    if gesture.isEnabled && gesture.allowedTouchTypes.contains(direct) {
+                    let pencil = NSNumber(value: UITouch.TouchType.pencil.rawValue)
+                    if gesture.allowedTouchTypes.contains(direct)
+                        && !gesture.allowedTouchTypes.contains(pencil) {
+                        let lock = Self.navigationLocks.object(forKey: gesture)
+                            ?? NavigationLock(wasEnabled: gesture.isEnabled)
+                        lock.owners.insert(ObjectIdentifier(self))
+                        Self.navigationLocks.setObject(lock, forKey: gesture)
                         suspendedNavigation.add(gesture)
-                        gesture.isEnabled = false
+                        if gesture.isEnabled { gesture.isEnabled = false }
                     }
                 }
             }
@@ -134,7 +155,13 @@ final class CanvasPalmRejectionGestureRecognizer: UIGestureRecognizer {
     private func restoreNavigation(reapplyPolicy: Bool = true) {
         let gestures = suspendedNavigation.allObjects
         suspendedNavigation.removeAllObjects()
-        for gesture in gestures { gesture.isEnabled = true }
+        for gesture in gestures {
+            guard let lock = Self.navigationLocks.object(forKey: gesture) else { continue }
+            lock.owners.remove(ObjectIdentifier(self))
+            guard lock.owners.isEmpty else { continue }
+            Self.navigationLocks.removeObject(forKey: gesture)
+            gesture.isEnabled = lock.wasEnabled
+        }
         if reapplyPolicy && !gestures.isEmpty { onNavigationRestored?() }
     }
 }

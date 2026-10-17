@@ -180,6 +180,7 @@ enum CloudOperationPayloadTransport {
 /// Region capture deliberately uses geometry, so printed PDF content can be circled without OCR or objects.
 struct QuestionCaptureOverlay: View {
     let projection: PageProjection
+    let allowsDirectDrawing: Bool
     let onConfirm: (CGRect) -> Void
     @State private var points: [CGPoint] = []
     @State private var crop: CGRect?
@@ -188,8 +189,10 @@ struct QuestionCaptureOverlay: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .topLeading) {
-                LassoInputView(shouldBeginDrag: { point, _ in
-                    crop.map { !projection.displayRect($0, displaySize: geometry.size).contains(point) } ?? true
+                LassoInputView(shouldBeginDrag: { point, touchType in
+                    // A finger navigates on iPad; Pencil creates a new question selection.
+                    guard allowsDirectDrawing || touchType != .direct else { return false }
+                    return crop.map { !projection.displayRect($0, displaySize: geometry.size).contains(point) } ?? true
                 }, onBegan: { point in
                         crop = nil
                         points = [projection.logicalPoint(point, displaySize: geometry.size)]

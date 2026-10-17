@@ -1459,7 +1459,10 @@ private struct CanvasModeButton: View {
         .disabled(onToggle == nil)
         .accessibilityIdentifier("canvas-interaction-mode")
         .accessibilityLabel(isEditing ? "书写" : "只读")
-        .accessibilityHint(onToggle == nil ? "当前文稿不可编辑" : (isEditing ? "切换为只读" : "开启书写"))
+        .accessibilityHint(onToggle == nil ? "当前文稿不可编辑" :
+            (UIDevice.current.userInterfaceIdiom == .phone
+                ? (isEditing ? "切换为只读，单指移动页面" : "开启手指书写")
+                : (isEditing ? "切换为只读" : "开启书写")))
     }
 }
 

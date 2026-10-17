@@ -105,20 +105,23 @@ final class CanvasController: NSObject, ObservableObject {
     private var isShapePreviewVisible = false
     private var authoritativeSnappedDrawing: PKDrawing?
     private var isAnnotationInputEditable = true
+    private let directDrawingOverride: Bool?
     var allowsDirectDrawing: Bool {
+        if let directDrawingOverride { return directDrawingOverride }
 #if targetEnvironment(macCatalyst)
-        true
+        return true
 #else
-        UIDevice.current.userInterfaceIdiom == .phone || Self.allowsFingerDrawing
+        return UIDevice.current.userInterfaceIdiom == .phone || Self.allowsFingerDrawing
 #endif
     }
     var navigationTouchCount: Int {
-        // A single resting little finger must never move paper between strokes.
-        isAnnotationInputEditable
-            && (allowsDirectDrawing || selectedToolKind.usesInkSettings || selectedToolKind == .eraser) ? 2 : 1
+        // Pencil owns editing on iPad; fingers always navigate, regardless of the tool.
+        // Direct drawing (iPhone, Catalyst and simulated Pencil) reserves one contact for ink.
+        isAnnotationInputEditable && allowsDirectDrawing ? 2 : 1
     }
 
-    override init() {
+    init(allowsDirectDrawing: Bool? = nil) {
+        directDrawingOverride = allowsDirectDrawing
         let canvasView = TiyiPencilCanvasView(frame: .zero)
         self.canvasView = canvasView
         super.init()

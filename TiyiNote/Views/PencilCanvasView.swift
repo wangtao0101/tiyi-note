@@ -82,7 +82,7 @@ struct PencilCanvasView: UIViewRepresentable {
                 return
             }
             canvasContainer = container
-            let minimumTouches = parent.pagesNavigateFromSidebarOnly ? parent.controller.navigationTouchCount : 2
+            let minimumTouches = parent.controller.navigationTouchCount
             if navigationHost === host {
                 canvasPan?.minimumNumberOfTouches = minimumTouches
                 return
@@ -354,12 +354,14 @@ final class PageCanvasContainerView: UIView {
                 if !isPagePan {
                     // A handout page is an infinite world. Fingers move its camera; only the
                     // page sidebar changes chapters. Keep the pager for programmatic selection.
-                    // In writing mode two fingers move an unbounded camera;
-                    // they must not also turn its page underneath the ink.
+                    // The unbounded camera owns dragging with either input policy;
+                    // its ancestor pager must never move the page at the same time.
                     let pagingLocked = scrollView.gestureRecognizers?.contains {
                         ($0 as? PageMultiTouchPagingGuard)?.isPagingLocked == true
                     } == true
                     scrollView.panGestureRecognizer.isEnabled = !suppressesFingerPaging
+                        && logicalViewport == nil
+                        && !CanvasPalmRejectionGestureRecognizer.isNavigationSuspended(scrollView.panGestureRecognizer)
                         && (usesContinuousPDFScrolling || touchCount == 1) && !pagingLocked
                     scrollView.isDirectionalLockEnabled = !usesContinuousPDFScrolling
                     if !suppressesFingerPaging, (touchCount == 1 || logicalViewport != nil),
@@ -459,7 +461,10 @@ private final class PageMultiTouchPagingGuard: UIGestureRecognizer {
 
     private func restorePaging() {
         if shouldRestorePan {
-            pager?.panGestureRecognizer.isEnabled = true
+            if let pan = pager?.panGestureRecognizer,
+               !CanvasPalmRejectionGestureRecognizer.isNavigationSuspended(pan) {
+                pan.isEnabled = true
+            }
             shouldRestorePan = false
         }
     }

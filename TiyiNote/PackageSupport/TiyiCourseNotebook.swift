@@ -24,7 +24,7 @@ import CryptoKit
     @Published var markerWidth = 10.0 { didSet { applyTool() } }
     @Published var eraserSize = CanvasEraserSize.small { didSet { applyTool() } }
     @Published var eraserMode = CanvasEraserMode.precision { didSet { applyTool() } }
-    @Published var isMoving = false { didSet { applyTool() } }
+    @Published var isMoving = UIDevice.current.userInterfaceIdiom == .phone { didSet { applyTool() } }
     private var pendingSave: Task<Void, Never>?
     private var isDirty = false
     private var interactionID = UUID()
@@ -234,11 +234,20 @@ private struct CourseNotebookPalette: View {
         DockableToolPaletteView(selectedTool: $notebook.tool, selectedPenVariant: notebook.penVariant,
                                 selectedColor: $notebook.color, penWidth: $notebook.width,
                                 markerWidth: $notebook.markerWidth, eraserSize: $notebook.eraserSize,
-                                dockEdge: $edge, dockProgress: $progress, commands: AnyView(commands), commandCount: 6,
+                                dockEdge: $edge, dockProgress: $progress, commands: AnyView(commands),
+                                commandCount: UIDevice.current.userInterfaceIdiom == .phone ? 7 : 6,
                                 selectionStyle: notebook.controller.selectionStyle)
     }
 
     @ViewBuilder private var commands: some View {
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            DockPaletteButton(symbol: notebook.isMoving ? "hand.raised" : "pencil.tip",
+                              title: notebook.isMoving ? "浏览" : "手指书写", isSelected: notebook.isMoving) {
+                notebook.isMoving.toggle()
+            }
+            .accessibilityIdentifier("course-notebook-interaction-mode")
+            .accessibilityHint(notebook.isMoving ? "开启手指书写" : "切换为浏览，单指移动画板")
+        }
         DockPaletteButton(symbol: notebook.penVariant.symbolName, title: "画笔",
                           isSelected: notebook.tool.isPenVariant && !notebook.isMoving) {
             if notebook.tool.isPenVariant && !notebook.isMoving { showsPenSettings = true }

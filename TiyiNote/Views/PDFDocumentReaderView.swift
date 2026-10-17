@@ -888,7 +888,8 @@ private struct PDFPageAnnotationView: View {
                 if selectedTool == .explain,
                    let page = documentStore.page(at: resolvedPageIndex, in: documentID) {
                     let bounds = displayRect(for: CGRect(origin: .zero, size: logicalPageSize), in: geometry.size)
-                    PracticeTextSelectionOverlay(page: page) { text in
+                    PracticeTextSelectionOverlay(page: page,
+                        allowsDirectDrawing: isAnnotationEditingEnabled && controller.allowsDirectDrawing) { text in
                         NotificationCenter.default.post(name: .tiyiPracticeTextSelection,
                             object: TiyiPracticeTextSelectionEvent(documentID: documentID, pageID: pageID, text: text))
                     }
@@ -946,7 +947,8 @@ private struct PDFPageAnnotationView: View {
 
                 if allowsQuestionCapture && isAnnotationEditingEnabled {
                     if selectedTool == .question && allowsInitialPDFRenderDuringHandwriting {
-                        QuestionCaptureOverlay(projection: projection, onConfirm: captureQuestion)
+                        QuestionCaptureOverlay(projection: projection,
+                            allowsDirectDrawing: controller.allowsDirectDrawing, onConfirm: captureQuestion)
                             .id("question-capture-\(pageID)")
                     }
                 }
@@ -2173,8 +2175,10 @@ private struct PracticeTextSelectionOverlay: View {
     }
 
     let page: PDFPage
+    let allowsDirectDrawing: Bool
     let onSelect: (String?) -> Void
     @State private var selectedRect: CGRect?
+    @State private var selectionStart: CGPoint?
 
     var body: some View {
         GeometryReader { geometry in
@@ -2189,15 +2193,24 @@ private struct PracticeTextSelectionOverlay: View {
                         .allowsHitTesting(false)
                 }
             }
-            .gesture(DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    updateSelection(from: value.startLocation, to: value.location,
+            .overlay {
+                LassoInputView(shouldBeginDrag: { _, touchType in
+                    allowsDirectDrawing || touchType != .direct
+                }, onBegan: { point in
+                    selectionStart = point
+                }, onMoved: { point in
+                    updateSelection(from: selectionStart ?? point, to: point,
                                     size: geometry.size, submitsSelection: false)
-                }
-                .onEnded { value in
-                    updateSelection(from: value.startLocation, to: value.location,
+                }, onEnded: { point in
+                    updateSelection(from: selectionStart ?? point, to: point,
                                     size: geometry.size, submitsSelection: true)
-                })
+                    selectionStart = nil
+                }, onTap: { point in
+                    updateSelection(from: point, to: point, size: geometry.size, submitsSelection: true)
+                }, onDoubleTap: { point in
+                    updateSelection(from: point, to: point, size: geometry.size, submitsSelection: true)
+                }, onCancelled: { selectionStart = nil })
+            }
         }
     }
 
@@ -4956,6 +4969,7 @@ struct LassoInputView: UIViewRepresentable {
             pan.maximumNumberOfTouches = 2
             pan.allowedScrollTypesMask = .all
             pan.require(toFail: lassoGesture)
+            view.navigationPan = pan
             let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleNavigationPinch(_:)))
             for gesture in [pan, pinch] as [UIGestureRecognizer] {
                 gesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
@@ -4963,12 +4977,18 @@ struct LassoInputView: UIViewRepresentable {
                 gesture.delegate = context.coordinator
                 view.addGestureRecognizer(gesture)
             }
+            view.palmRejectionRecognizer.attach(to: view)
         }
         return view
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
         context.coordinator.parent = self
+        (uiView as? LassoInputContainerView)?.navigationPan?.minimumNumberOfTouches = navigationTouchCount
+    }
+
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
+        (uiView as? LassoInputContainerView)?.palmRejectionRecognizer.detach()
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
@@ -4979,6 +4999,11 @@ struct LassoInputView: UIViewRepresentable {
         }
 
         @objc func handleNavigationPan(_ gesture: UIPanGestureRecognizer) {
+            guard (gesture.view as? LassoInputContainerView)?.palmRejectionRecognizer.blocksFingerActions != true else {
+                gesture.setTranslation(.zero, in: gesture.view)
+                if gesture.state == .cancelled { parent.onCanvasNavigation?(.finished) }
+                return
+            }
             if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
                 let delta = gesture.translation(in: gesture.view)
                 gesture.setTranslation(.zero, in: gesture.view)
@@ -4988,6 +5013,11 @@ struct LassoInputView: UIViewRepresentable {
         }
 
         @objc func handleNavigationPinch(_ gesture: UIPinchGestureRecognizer) {
+            guard (gesture.view as? LassoInputContainerView)?.palmRejectionRecognizer.blocksFingerActions != true else {
+                gesture.scale = 1
+                if gesture.state == .cancelled { parent.onCanvasNavigation?(.finished) }
+                return
+            }
             if gesture.state == .began || gesture.state == .changed || gesture.state == .ended {
                 parent.onCanvasNavigation?(.zoom(gesture.scale, anchor: gesture.location(in: gesture.view)))
                 gesture.scale = 1
@@ -5035,7 +5065,7 @@ struct LassoInputView: UIViewRepresentable {
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             guard let panGesture = gestureRecognizer as? LassoPanGestureRecognizer else {
-                return true
+                return (gestureRecognizer.view as? LassoInputContainerView)?.palmRejectionRecognizer.blocksFingerActions != true
             }
             return parent.shouldBeginDrag(
                 panGesture.initialLocation,
@@ -5047,6 +5077,8 @@ struct LassoInputView: UIViewRepresentable {
 
 private final class LassoInputContainerView: UIView {
     weak var lassoGestureRecognizer: UIGestureRecognizer?
+    weak var navigationPan: UIPanGestureRecognizer?
+    let palmRejectionRecognizer = CanvasPalmRejectionGestureRecognizer()
     var confinesNavigation = false
     private weak var coordinatedScrollView: UIScrollView?
 

@@ -2219,59 +2219,81 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
     }
 
-    func testLittleFingerMovementCannotNavigateWhileWritingToolsAreSelected() throws {
+    func testQuestionToolLetsOneFingerScrollAndTwoFingersZoom() throws {
+        guard UIDevice.current.userInterfaceIdiom == .pad else { throw XCTSkip("iPad Pencil input policy") }
+        let app = launchIsolatedApp(prefix: "pdf-question-finger-navigation",
+                                    additionalLaunchArguments: ["--pencil-only-ui-test"])
+        let reader = app.scrollViews["document-page-pager"]
+        let first = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        app.buttons["tool-question"].tap()
+        let before = first.frame.minY
+        let start = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.7))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -160)),
+                    withVelocity: .slow, thenHoldForDuration: 0)
+        XCTAssertLessThan(first.frame.minY, before - 40)
+        XCTAssertFalse(app.descendants(matching: .any)["question-selection-box"].exists)
+        let width = first.frame.width
+        try pinchCanvas(reader, scale: 1.3, in: app)
+        XCTAssertGreaterThan(first.frame.width, width * 1.1)
+    }
+
+    func testIPhoneBrowsingAndFingerWritingUseSeparateGestures() throws {
+        guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("iPhone input policy") }
+        let app = launchIsolatedApp(prefix: "pdf-phone-input-policy")
+        let reader = app.scrollViews["document-page-pager"]
+        let first = app.descendants(matching: .any)["page-canvas-0"]
+        let mode = app.buttons["canvas-interaction-mode"]
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        XCTAssertEqual(mode.label, "只读")
+        let before = first.frame.minY
+        let start = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.6))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -100)),
+                    withVelocity: .slow, thenHoldForDuration: 0)
+        XCTAssertLessThan(first.frame.minY, before - 20)
+        waitForValue("笔迹 0", of: first)
+        mode.tap()
+        XCTAssertTrue(app.buttons["tool-pen"].waitForExistence(timeout: 3))
+        XCTAssertEqual(mode.label, "书写")
+        let beforeWriting = first.frame
+        drawStroke(on: first, from: CGVector(dx: 0.2, dy: 0.5), to: CGVector(dx: 0.6, dy: 0.5))
+        waitForValue("笔迹 1", of: first)
+        XCTAssertEqual(first.frame.minY, beforeWriting.minY, accuracy: 2)
+        mode.tap()
+        waitUntil(timeout: 5) { mode.label == "只读" }
+        let afterWriting = first.frame.minY
+        let next = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.6))
+        next.press(forDuration: 0.05, thenDragTo: next.withOffset(CGVector(dx: 0, dy: -80)),
+                   withVelocity: .slow, thenHoldForDuration: 0)
+        XCTAssertLessThan(first.frame.minY, afterWriting - 20)
+        waitForValue("笔迹 1", of: first)
+    }
+
+    func testSingleFingerNavigationAcrossWritingAndSelectionTools() throws {
         XCUIDevice.shared.orientation = .portrait
-        let app = launchIsolatedApp(prefix: "practice-sidebar-palm-navigation",
+        let app = launchIsolatedApp(prefix: "practice-sidebar-single-finger-navigation",
                                     additionalLaunchArguments: ["--pencil-only-ui-test"])
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
-        // Wait for the initial workspace layout to settle before taking the
-        // camera baseline; merely finding the canvas can precede that layout.
-        app.buttons["tool-pen"].tap()
-        let initial = try canvasViewportRect(of: canvas)
-        for tool in ["tool-pen", "tool-marker", "tool-eraser"] {
+        for tool in ["tool-pen", "tool-marker", "tool-eraser", "tool-lasso", "tool-text", "tool-pen"] {
             if app.buttons[tool].value as? String != "selected" { app.buttons[tool].tap() }
-            let frame = canvas.frame
-            // A resting little finger shifts repeatedly, then lifts and lands
-            // again between strokes. Single direct contacts must never pan.
-            var paths: [SynthesizedTouchPath] = []
-            for contact in 0..<12 {
-                let start = CGPoint(x: frame.minX + frame.width * 0.72,
-                                    y: frame.minY + frame.height * 0.65)
-                let t = Double(contact) * 0.24
-                paths.append(SynthesizedTouchPath(samples: [(start, t),
-                    (CGPoint(x: start.x - 30, y: start.y + 25), t + 0.06),
-                    (CGPoint(x: start.x + 22, y: start.y - 32), t + 0.12),
-                    (CGPoint(x: start.x - 15, y: start.y - 40), t + 0.18)], liftOffset: t + 0.20))
-            }
-            try synthesizeTouchPaths(paths, on: canvas, in: app)
-            XCTAssertEqual(try canvasViewportRect(of: canvas), initial, "Little finger moved paper under \(tool)")
+            let before = try canvasViewportRect(of: canvas)
+            let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.78, dy: 0.7))
+            blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: -90, dy: -100)))
+            let after = try canvasViewportRect(of: canvas)
+            XCTAssertGreaterThan(after.minX, before.minX + 20, "Horizontal camera movement under \(tool)")
+            XCTAssertGreaterThan(after.minY, before.minY + 20, "Vertical camera movement under \(tool)")
+            XCTAssertEqual(after.width, before.width, accuracy: 1)
             waitForValue("笔迹 0", of: canvas)
-            XCTAssertEqual(app.buttons[tool].value as? String, "selected")
         }
-        // Deliberate two-finger navigation is still available in writing mode.
-        app.buttons["tool-pen"].tap()
+        let beforeZoom = try canvasViewportRect(of: canvas)
         try pinchCanvas(canvas, scale: 1.3, in: app)
-        XCTAssertLessThan(try canvasViewportRect(of: canvas).width, initial.width * 0.9)
+        XCTAssertLessThan(try canvasViewportRect(of: canvas).width, beforeZoom.width * 0.9)
         let beforePan = try canvasViewportRect(of: canvas)
-        let frame = canvas.frame
-        try synthesizeTouchPaths([0.35, 0.65].map { x in
-            SynthesizedTouchPath(samples: [
-                (CGPoint(x: frame.minX + frame.width * x, y: frame.minY + frame.height * 0.65), 0),
-                (CGPoint(x: frame.minX + frame.width * x + 55, y: frame.minY + frame.height * 0.65 - 45), 0.3)
-            ], liftOffset: 0.35)
-        }, on: canvas, in: app)
-        XCTAssertNotEqual(try canvasViewportRect(of: canvas), beforePan)
-        // Switching out of writing restores intentional single-finger navigation.
-        app.buttons["tool-lasso"].tap()
-        let beforeFingerPan = try canvasViewportRect(of: canvas)
-        let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.75))
-        blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: -60, dy: -40)))
-        XCTAssertNotEqual(try canvasViewportRect(of: canvas), beforeFingerPan)
-        app.buttons["tool-pen"].tap()
-        let beforeWriting = try canvasViewportRect(of: canvas)
-        blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: 60, dy: 40)))
-        XCTAssertEqual(try canvasViewportRect(of: canvas), beforeWriting)
+        let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.78, dy: 0.7))
+        blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: 80, dy: 70)))
+        XCTAssertLessThan(try canvasViewportRect(of: canvas).minY, beforePan.minY - 20)
+        XCTAssertFalse(app.descendants(matching: .any)["lasso-selection-box"].exists)
     }
 
     func testWritingNavigationDoesNotTurnNotebookPages() throws {
@@ -2291,7 +2313,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let blank = canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.75))
         blank.press(forDuration: 0.05, thenDragTo: blank.withOffset(CGVector(dx: 0, dy: -240)))
         XCTAssertEqual(pager.value as? String, "1 / 2")
-        XCTAssertEqual(try canvasViewportRect(of: canvas), initial)
+        XCTAssertGreaterThan(try canvasViewportRect(of: canvas).minY, initial.minY + 40)
         let frame = canvas.frame
         try synthesizeTouchPaths([0.35, 0.65].map { x in
             let start = CGPoint(x: frame.minX + frame.width * x, y: frame.minY + frame.height * 0.72)
@@ -2929,8 +2951,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let first = app.descendants(matching: .any)["page-canvas-0"]
         let second = app.descendants(matching: .any)["page-canvas-1"]
         XCTAssertTrue(first.waitForExistence(timeout: 5))
-        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
-        app.buttons["tool-lasso"].tap()
+        // Pencil writing and single-finger browsing work without changing tools.
+        app.buttons["tool-pen"].tap()
         let originalTop = first.frame.minY
 
         func dragUp(_ distance: CGFloat) {
@@ -3038,21 +3060,29 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let counter = app.scrollViews["document-page-pager"]
         let reset = app.buttons["zoom-reset"]
         waitUntil(timeout: 5) { (counter.value as? String ?? "") == "1 / 2" && pager.exists }
-        // Single-finger browsing is explicit; writing tools reserve it for palm rejection.
-        app.buttons["tool-lasso"].tap()
+        // Pencil writing and single-finger browsing work without changing tools.
+        app.buttons["tool-pen"].tap()
 
         // Exercise both directions and both sides of the fit-page boundary. The trailing finger
         // travels far enough to turn a page if the pager takes over when the pinch ends early.
         for pageIndex in 0...1 {
             let canvas = app.descendants(matching: .any)["page-canvas-\(pageIndex)"]
-            let fittedFrame = canvas.frame
+            let fittedWidth = pager.frame.width - 64
             for startsZoomed in [false, true] {
                 reset.tap()
+                // Resetting a continuous PDF can move its scroll offset. Select the
+                // target page explicitly before synthesizing viewport-based touches.
+                app.buttons["打开页面缩略图"].tap()
+                let thumbnail = app.buttons["page-thumbnail-\(pageIndex)"]
+                XCTAssertTrue(thumbnail.waitForExistence(timeout: 3))
+                thumbnail.tap()
+                app.buttons.matching(identifier: "关闭页面缩略图").firstMatch.tap()
+                waitUntil(timeout: 4) { (counter.value as? String ?? "") == "\(pageIndex + 1) / 2" }
                 if startsZoomed {
-                    canvas.pinch(withScale: 1.55, velocity: 1)
+                    try pinchCanvas(pager, scale: 1.55, in: app)
                     waitUntil(timeout: 4) { !reset.label.contains("100%") }
                 }
-                let frame = fittedFrame
+                let frame = pager.frame.insetBy(dx: 40, dy: 40)
                 let direction: CGFloat = pageIndex == 0 ? -1 : 1
                 let startY = frame.midY - direction * frame.height * 0.15
                 let initialDragY = startY + direction * 28
@@ -3076,7 +3106,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
                 waitUntil(timeout: 4) {
                     (counter.value as? String ?? "") == "\(pageIndex + 1) / 2"
                         && !reset.label.contains("100%")
-                        && canvas.frame.width < fittedFrame.width
+                        && canvas.frame.width < fittedWidth
                 }
             }
 
