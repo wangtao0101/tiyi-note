@@ -266,6 +266,7 @@ final class PageCanvasContainerView: UIView {
             logicalViewport: logicalViewport
         )
         guard appliedLayoutConfiguration != configuration else { return }
+        if controller.isUsingTool { controller.recordInkDiagnostic("layout_during_contact") }
         appliedLayoutConfiguration = configuration
         controller.prepareForViewportChange()
 

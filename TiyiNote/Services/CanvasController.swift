@@ -47,6 +47,21 @@ final class CanvasController: NSObject, ObservableObject {
     private static let maximumUndoDepth = 80
     let selectionStyle = CanvasSelectionStyle()
     let canvasView: PKCanvasView
+    private let diagnosticCanvasID = UUID().uuidString
+    var diagnosticPageID: String?
+
+    func recordInkDiagnostic(_ action: String, nativeCount: Int? = nil, sampleCount: Int? = nil,
+                             scribble: ScribbleEraseGesture? = nil, removedInk: Int? = nil,
+                             removedObjects: Int? = nil) {
+        InkTransactionDiagnostics.record(canvas: diagnosticCanvasID, page: diagnosticPageID,
+            action: action, known: knownStrokeCount, native: nativeCount,
+            cutoff: authoritativeInkCreationCutoff, samples: sampleCount,
+            erasePasses: scribble?.passCount,
+            erasePathFraction: scribble.map { Double($0.repeatedPathFraction) },
+            removedInk: removedInk, removedObjects: removedObjects,
+            tool: selectedToolKind.rawValue, undoDepth: undoActions.count, redoDepth: redoActions.count,
+            queuedHistory: pendingHistoryCommands.count)
+    }
 
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
@@ -81,6 +96,10 @@ final class CanvasController: NSObject, ObservableObject {
     private var postLiftDrawingRetryCount = 0
     private var undoActions: [DrawingHistoryAction] = []
     private var redoActions: [DrawingHistoryAction] = []
+    private var pendingHistoryCommands: [CanvasHistoryCommand] = []
+    /// Preserve an explicit edit through the first real ink contact as well as idle callbacks.
+    /// A stale PencilKit prefix can otherwise arrive after begin has released idle authority.
+    private var postEditInkBaseline: (drawing: PKDrawing, cutoff: Date, knownDates: Set<Date>)?
     private var eraserBaselineDrawing: PKDrawing?
     private var knownStrokeCount = 0
     private var selectedToolKind = CanvasToolKind.pen
@@ -103,7 +122,19 @@ final class CanvasController: NSObject, ObservableObject {
     private var shapePreview: UIImageView?
     private var originalCanvasMask: CALayer?
     private var isShapePreviewVisible = false
-    private var authoritativeSnappedDrawing: PKDrawing?
+    private var authoritativeSnappedDrawing: PKDrawing? {
+        didSet {
+            if authoritativeSnappedDrawing == nil {
+                authoritativeInkCreationCutoff = nil
+                authoritativeKnownStrokeDates.removeAll(keepingCapacity: true)
+            }
+        }
+    }
+    /// Native callbacks carry no transaction ID. Stroke creation dates let the post-edit guard
+    /// reject the completed contact's stale tiles without deleting a later contact delivered before
+    /// PencilKit's tool-begin callback. The cutoff includes erased native strokes, not just survivors.
+    private var authoritativeInkCreationCutoff: Date?
+    private var authoritativeKnownStrokeDates: Set<Date> = []
     private var isAnnotationInputEditable = true
     private let directDrawingOverride: Bool?
     var allowsDirectDrawing: Bool {
@@ -179,8 +210,15 @@ final class CanvasController: NSObject, ObservableObject {
                 && self.canvasView.window != nil && self.canvasView.drawingGestureRecognizer.isEnabled
         }
         heldInkRecognizer.onContactBegan = { [weak self] in
-            self?.beginToolInteraction()
-            self?.beginShapeTracking()
+            guard let self else { return }
+            if self.isUsingTool, self.completedInkContactCount > 0, self.heldShape != nil {
+                // The previous Pencil-up may precede native stroke delivery. Never replace
+                // PKDrawing once the next contact is down: retain the original freehand ink.
+                self.recordInkDiagnostic("held_commit_yielded_to_new_contact")
+                self.discardShapePreview()
+            }
+            self.beginToolInteraction()
+            self.beginShapeTracking()
         }
         heldInkRecognizer.onHold = { [weak self] points in self?.previewHeldShape(points) ?? false }
         heldInkRecognizer.onResume = { [weak self] in
@@ -192,7 +230,8 @@ final class CanvasController: NSObject, ObservableObject {
         }
         heldInkRecognizer.onContactEnded = { [weak self] points, cancelled in
             guard let self else { return }
-            self.completedInkContactCount += 1
+            self.recordInkDiagnostic(cancelled ? "contact_cancelled" : "contact_ended", sampleCount: points.count)
+            if !cancelled { self.completedInkContactCount += 1 }
             if cancelled {
                 self.pendingScribbles.removeAll()
                 self.discardShapePreview()
@@ -202,6 +241,7 @@ final class CanvasController: NSObject, ObservableObject {
                 let worldPoints = points.map { CGPoint(x: $0.x + self.canvasWorldOrigin.x,
                                                        y: $0.y + self.canvasWorldOrigin.y) }
                 if let gesture = ScribbleEraseRecognizer.recognize(worldPoints, displayScale: scale) {
+                    self.recordInkDiagnostic("scribble_candidate", sampleCount: points.count, scribble: gesture)
                     self.pendingScribbles.append(PendingScribbleErase(gesture: gesture, strokeIndex: index, scale: scale))
                     self.discardShapePreview()
                 }
@@ -242,6 +282,7 @@ final class CanvasController: NSObject, ObservableObject {
         }
         if nextOrigin != canvasWorldOrigin, !isUsingTool {
             let worldDrawing = drawing
+            recordInkDiagnostic("origin_rebase", nativeCount: worldDrawing.strokes.count)
             canvasWorldOrigin = nextOrigin
             installCanvasDrawing(worldDrawing, preservingShapeAuthority: true)
         }
@@ -253,11 +294,14 @@ final class CanvasController: NSObject, ObservableObject {
     var strokeCount: Int { knownStrokeCount }
 
     func installInitialDrawing(_ drawing: PKDrawing) {
+        recordInkDiagnostic("load", nativeCount: drawing.strokes.count)
         cancelStrokeTransform()
         installCanvasDrawing(drawing)
         canvasView.undoManager?.removeAllActions()
         undoActions.removeAll()
         redoActions.removeAll()
+        pendingHistoryCommands.removeAll()
+        postEditInkBaseline = nil
         toolInteractionOriginDrawing = nil
         toolInteractionDidChangeDrawing = false
         erasedElements.removeAll()
@@ -280,6 +324,7 @@ final class CanvasController: NSObject, ObservableObject {
         // in-flight stroke. The page view defers those revisions; keep this controller-level guard
         // as the final invariant against replacing a live transaction.
         guard !isUsingTool else { return }
+        recordInkDiagnostic("sync_install", nativeCount: drawing.strokes.count)
 #if DEBUG
         synchronizedDrawingInstallCount += 1
 #endif
@@ -287,7 +332,9 @@ final class CanvasController: NSObject, ObservableObject {
             installInitialDrawing(drawing)
             return
         }
+        let previous = self.drawing
         installCanvasDrawing(drawing)
+        retainExplicitEditAuthority(drawing, replacing: previous)
         refreshHistoryState()
     }
 
@@ -376,50 +423,77 @@ final class CanvasController: NSObject, ObservableObject {
     }
 
     func configureAnnotationInput(isEditable: Bool = true) {
+        let wasEditable = isAnnotationInputEditable
         isAnnotationInputEditable = isEditable
-        if !isEditable { cancelHeldInkRecognition() }
-        heldInkRecognizer.allowedTouchTypes = allowsDirectDrawing ? [
+        if wasEditable && !isEditable { cancelHeldInkRecognition() }
+        let touchTypes = allowsDirectDrawing ? [
             NSNumber(value: UITouch.TouchType.direct.rawValue),
             NSNumber(value: UITouch.TouchType.pencil.rawValue),
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
         ] : [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
-        shapeEraserRecognizer.allowedTouchTypes = heldInkRecognizer.allowedTouchTypes
-        guard isEditable else {
-            canvasView.drawingGestureRecognizer.isEnabled = false
-            canvasView.drawingPolicy = .pencilOnly
-            return
+        // SwiftUI can update this representable at Pencil-down or after a tiny scroll. Reassigning
+        // an unchanged input policy must not reconfigure PencilKit's live recognizers mid-contact.
+        if heldInkRecognizer.allowedTouchTypes != touchTypes { heldInkRecognizer.allowedTouchTypes = touchTypes }
+        if shapeEraserRecognizer.allowedTouchTypes != touchTypes { shapeEraserRecognizer.allowedTouchTypes = touchTypes }
+        let policy: PKCanvasViewDrawingPolicy = isEditable && allowsDirectDrawing ? .anyInput : .pencilOnly
+        if canvasView.drawingPolicy != policy { canvasView.drawingPolicy = policy }
+        let enabled = isEditable && (selectedToolKind.usesInkSettings || selectedToolKind == .eraser)
+        if canvasView.drawingGestureRecognizer.isEnabled != enabled {
+            canvasView.drawingGestureRecognizer.isEnabled = enabled
         }
-
-        canvasView.drawingGestureRecognizer.isEnabled = selectedToolKind != .lasso && selectedToolKind != .text && selectedToolKind != .question && selectedToolKind != .explain
-        canvasView.drawingPolicy = allowsDirectDrawing ? .anyInput : .pencilOnly
-        canvasView.drawingGestureRecognizer.allowedTouchTypes = allowsDirectDrawing ? [
-            NSNumber(value: UITouch.TouchType.direct.rawValue),
-            NSNumber(value: UITouch.TouchType.pencil.rawValue),
-            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
-        ] : [
-            NSNumber(value: UITouch.TouchType.pencil.rawValue)
-        ]
+        if canvasView.drawingGestureRecognizer.allowedTouchTypes != touchTypes {
+            canvasView.drawingGestureRecognizer.allowedTouchTypes = touchTypes
+        }
     }
 
     func undo() {
-        cancelStrokeTransform()
-        guard let action = undoActions.popLast(),
-              let inverse = applyHistoryAction(action) else { return }
-        redoActions.append(inverse)
-        selectionHistoryRevision &+= 1
-        onDrawingChanged?(false)
-        refreshHistoryState()
+        requestHistoryCommand(.undo)
     }
 
     func redo() {
+        requestHistoryCommand(.redo)
+    }
+
+    private func requestHistoryCommand(_ command: CanvasHistoryCommand) {
         cancelStrokeTransform()
-        guard let action = redoActions.popLast(),
+        recordInkDiagnostic("\(command.rawValue)_requested")
+        if isUsingTool || hasActiveDrawingContact {
+            if !isUsingTool { beginToolInteraction() }
+            pendingHistoryCommands.append(command)
+            recordInkDiagnostic("history_queued")
+            if !hasActiveDrawingContact {
+                toolInteractionEndWorkItem?.cancel()
+                finishShapeTrackingAfterPencilLift()
+            }
+            return
+        }
+        performHistoryCommand(command)
+    }
+
+    private func performHistoryCommand(_ command: CanvasHistoryCommand) {
+        let previous = self.drawing
+        guard let action = command == .undo ? undoActions.last : redoActions.last,
               let inverse = applyHistoryAction(action) else { return }
-        undoActions.append(inverse)
+        if command == .undo {
+            undoActions.removeLast()
+            redoActions.append(inverse)
+        } else {
+            redoActions.removeLast()
+            undoActions.append(inverse)
+        }
+        let committed = self.drawing
+        retainExplicitEditAuthority(committed, replacing: previous)
+        recordInkDiagnostic("\(command.rawValue)_applied", nativeCount: committed.strokes.count)
         selectionHistoryRevision &+= 1
         trimUndoHistoryIfNeeded()
         onDrawingChanged?(false)
         refreshHistoryState()
+    }
+
+    private func drainHistoryCommands() {
+        while !isUsingTool, !hasActiveDrawingContact, !pendingHistoryCommands.isEmpty {
+            performHistoryCommand(pendingHistoryCommands.removeFirst())
+        }
     }
 
     func clear() {
@@ -642,7 +716,9 @@ final class CanvasController: NSObject, ObservableObject {
         cancelStrokeTransform()
         let elements = pageElementsProvider?() ?? []
         recordUndoAction(.restorePageContent(drawing: original, elements: [], replacingIDs: [element.id]))
-        installCanvasDrawing(PKDrawing(strokes: original.strokes.enumerated().compactMap { $0.offset == index ? nil : $0.element }))
+        let committed = PKDrawing(strokes: original.strokes.enumerated().compactMap { $0.offset == index ? nil : $0.element })
+        installCanvasDrawing(committed)
+        retainExplicitEditAuthority(committed, replacing: original)
         onPageElementsUpdated(elements + [element], true)
         onDrawingChanged?(false)
         refreshHistoryState()
@@ -681,7 +757,9 @@ final class CanvasController: NSObject, ObservableObject {
         guard let session = strokeTransformSession else { return }
         strokeTransformSession = nil
         if didInstallStrokeTransformPreview {
+            let previous = self.drawing
             installCanvasDrawing(session.originalDrawing)
+            retainExplicitEditAuthority(session.originalDrawing, replacing: previous)
         }
         didInstallStrokeTransformPreview = false
         setToolInteractionActive(false)
@@ -734,6 +812,7 @@ final class CanvasController: NSObject, ObservableObject {
         guard newDrawing != previousDrawing else { return }
         recordUndoAction(.restoreDrawing(previousDrawing))
         installCanvasDrawing(newDrawing)
+        retainExplicitEditAuthority(newDrawing, replacing: previousDrawing)
         onDrawingChanged?(false)
         refreshHistoryState()
         _ = actionName
@@ -763,6 +842,37 @@ final class CanvasController: NSObject, ObservableObject {
             eraserBaselineDrawing = drawing
         }
         isInstallingDrawing = false
+    }
+
+    private func retainDrawingAuthority(_ drawing: PKDrawing, replacing nativeDrawing: PKDrawing, contactStartIndex: Int) {
+        authoritativeSnappedDrawing = drawing
+        authoritativeKnownStrokeDates = Set((nativeDrawing.strokes + drawing.strokes).map { $0.path.creationDate })
+        // A page can contain strokes created on a device with a different wall clock. Only the
+        // contacts participating in this edit define its cutoff; older page content does not.
+        authoritativeInkCreationCutoff = (Array(nativeDrawing.strokes.dropFirst(contactStartIndex))
+            + drawing.strokes.dropFirst(contactStartIndex))
+            .map { $0.path.creationDate }.max()
+        recordInkDiagnostic("edit_authority", nativeCount: nativeDrawing.strokes.count)
+    }
+
+    private func retainExplicitEditAuthority(_ drawing: PKDrawing, replacing previous: PKDrawing) {
+        authoritativeSnappedDrawing = drawing
+        authoritativeKnownStrokeDates = Set((previous.strokes + drawing.strokes).map { $0.path.creationDate })
+        // Undo can restore very old strokes or remove the newest contact entirely. Its boundary
+        // is the command time, rather than the creation date of whichever stroke survives last.
+        let cutoff = Date()
+        authoritativeInkCreationCutoff = cutoff
+        postEditInkBaseline = (drawing, cutoff, authoritativeKnownStrokeDates)
+        recordInkDiagnostic("explicit_edit_authority", nativeCount: previous.strokes.count)
+    }
+
+    private func committingHeldDrawing(_ snapped: PKDrawing, over native: PKDrawing) -> PKDrawing {
+        guard let cutoff = snapped.strokes.last?.path.creationDate else { return native }
+        let laterContacts = native.strokes.dropFirst(max(0, snapped.strokes.count - 1))
+            .filter { $0.path.creationDate > cutoff }
+        guard !laterContacts.isEmpty else { return snapped }
+        recordInkDiagnostic("held_commit_preserved_tail", nativeCount: native.strokes.count)
+        return PKDrawing(strokes: snapped.strokes + laterContacts)
     }
 
     private func drawingByTransformingStrokes(
@@ -931,6 +1041,9 @@ final class CanvasController: NSObject, ObservableObject {
                     guard gesture.bounds.intersects(path.boundingBoxOfPath.insetBy(dx: -1 / scale, dy: -1 / scale)) else { return false }
                     return gesture.covers(CanvasHitGeometry.contours(in: path, spacing: 3 / scale), minimumCoverage: 0.70)
                 }
+                recordInkDiagnostic(removedIndices.isEmpty && removedElements.isEmpty ? "scribble_no_target" : "scribble_delete",
+                    nativeCount: nativeStrokes.count, scribble: gesture,
+                    removedInk: removedIndices.count, removedObjects: removedElements.count)
             }
             if removedIndices.isEmpty && removedElements.isEmpty {
                 strokes.append(nativeStrokes[index])
@@ -951,10 +1064,12 @@ final class CanvasController: NSObject, ObservableObject {
             strokes = strokes.enumerated().compactMap { removedIndices.contains($0.offset) ? nil : $0.element }
         }
         if didErase || committingHeldShape {
+            let contactStartIndex = knownStrokeCount
             let remainingDrawing = PKDrawing(strokes: strokes)
             installCanvasDrawing(remainingDrawing)
             // A late PencilKit callback must not resurrect either erased content or the gesture.
-            authoritativeSnappedDrawing = remainingDrawing
+            retainDrawingAuthority(remainingDrawing, replacing: finalDrawing, contactStartIndex: contactStartIndex)
+            if didErase { recordInkDiagnostic("scribble_erase", nativeCount: remainingDrawing.strokes.count) }
         } else {
             knownStrokeCount = nativeStrokes.count
         }
@@ -976,6 +1091,7 @@ final class CanvasController: NSObject, ObservableObject {
         // callback from the gesture that produced it. A genuinely new Pencil contact starts a new
         // transaction and can safely release that guard.
         authoritativeSnappedDrawing = nil
+        if !selectedToolKind.usesInkSettings { postEditInkBaseline = nil }
         if selectedToolKind == .eraser, toolInteractionOriginDrawing == nil {
             toolInteractionOriginDrawing = eraserBaselineDrawing ?? self.drawing
         } else if selectedToolKind != .eraser {
@@ -1020,23 +1136,54 @@ final class CanvasController: NSObject, ObservableObject {
         guard isUsingTool,
               !hasActiveDrawingContact else { return }
 
-        if let shape = heldShape, shape.kind == .line,
-           let originCount = shapeGestureOriginStrokeCount {
-            // The public drawing excludes the live Pencil stroke. Once PencilKit has delivered
-            // it, straighten its locations only: native nib size, pressure, texture and color
-            // are the authority, not a conversion from the toolbar's base width.
-            let nativeStrokes = drawing.strokes
-            if nativeStrokes.count == originCount + 1,
-               let source = nativeStrokes.last {
-                let line = Self.straightenedStroke(source, endpoints: shape.points)
-                heldShape = (PKDrawing(strokes: Array(nativeStrokes.prefix(originCount)) + [line]),
-                             shape.kind, shape.points)
-            } else if postLiftDrawingRetryCount < 4 {
+        if let baseline = postEditInkBaseline, selectedToolKind.usesInkSettings {
+            let native = self.drawing
+            let appended = native.strokes.filter {
+                $0.path.creationDate > baseline.cutoff && !baseline.knownDates.contains($0.path.creationDate)
+            }
+            if appended.count < completedInkContactCount, postLiftDrawingRetryCount < 8 {
                 postLiftDrawingRetryCount += 1
                 let work = DispatchWorkItem { [weak self] in self?.finishShapeTrackingAfterPencilLift() }
                 toolInteractionEndWorkItem = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
                 return
+            }
+            // Read once at the first lift after an explicit edit, never on live Pencil samples.
+            // Keep the edited prefix even if native state is replaying a pre-Undo page.
+            let reconciled = PKDrawing(strokes: baseline.drawing.strokes + appended)
+            postEditInkBaseline = nil
+            installCanvasDrawing(reconciled)
+            retainDrawingAuthority(reconciled, replacing: native, contactStartIndex: baseline.drawing.strokes.count)
+            knownStrokeCount = baseline.drawing.strokes.count
+            completedInkContactCount = appended.count
+            toolInteractionDidChangeDrawing = !appended.isEmpty
+            recordInkDiagnostic("post_edit_contact_reconciled", nativeCount: native.strokes.count)
+        }
+
+        if let shape = heldShape,
+           let previewStroke = shape.drawing.strokes.last {
+            // The public drawing excludes the live Pencil stroke. Once PencilKit has delivered
+            // it, straighten its locations only: native nib size, pressure, texture and color
+            // are the authority, not a conversion from the toolbar's base width.
+            let nativeStrokes = drawing.strokes
+            let originCount = shape.drawing.strokes.count - 1
+            let expectedCount = max(shape.drawing.strokes.count, knownStrokeCount + completedInkContactCount)
+            let hasOriginalContact = nativeStrokes.indices.contains(originCount)
+                && nativeStrokes[originCount].path.creationDate <= previewStroke.path.creationDate
+            if (nativeStrokes.count < expectedCount || !hasOriginalContact), postLiftDrawingRetryCount < 8 {
+                if postLiftDrawingRetryCount == 0 { recordInkDiagnostic("held_waiting_for_native", nativeCount: nativeStrokes.count) }
+                postLiftDrawingRetryCount += 1
+                let work = DispatchWorkItem { [weak self] in self?.finishShapeTrackingAfterPencilLift() }
+                toolInteractionEndWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
+                return
+            }
+            if shape.kind == .line, nativeStrokes.indices.contains(originCount),
+               nativeStrokes[originCount].path.creationDate <= previewStroke.path.creationDate {
+                let source = nativeStrokes[originCount]
+                let line = Self.straightenedStroke(source, endpoints: shape.points)
+                heldShape = (PKDrawing(strokes: Array(shape.drawing.strokes.prefix(originCount)) + [line]),
+                             shape.kind, shape.points)
             }
         }
 
@@ -1046,7 +1193,8 @@ final class CanvasController: NSObject, ObservableObject {
             // waits until all live contacts finish, then evaluates only their nearby content.
             let expectedCount = knownStrokeCount + completedInkContactCount
             let snappedShape = heldShape.flatMap { $0.drawing.strokes.count == expectedCount ? $0 : nil }
-            let finalDrawing = snappedShape?.drawing ?? self.drawing
+            let nativeDrawing = self.drawing
+            let finalDrawing = snappedShape.map { committingHeldDrawing($0.drawing, over: nativeDrawing) } ?? nativeDrawing
             if finalDrawing.strokes.count < knownStrokeCount + completedInkContactCount, postLiftDrawingRetryCount < 4 {
                 postLiftDrawingRetryCount += 1
                 let work = DispatchWorkItem { [weak self] in self?.finishShapeTrackingAfterPencilLift() }
@@ -1071,13 +1219,24 @@ final class CanvasController: NSObject, ObservableObject {
             lastSnappedShapeKind = snappedShape?.kind
             setToolInteractionActive(false)
             refreshHistoryState()
+            drainHistoryCommands()
             return
         }
         if didChangeDrawing {
             if selectedToolKind.usesInkSettings {
                 // One Pencil contact produces one PencilKit stroke. Store the inverse command;
                 // the stroke itself is captured only if the user actually asks for Undo.
-                let count = max(1, completedInkContactCount)
+                let count: Int
+                if completedInkContactCount > 0 {
+                    count = completedInkContactCount
+                } else {
+                    // A trailing drawing callback can arrive after its contact was already
+                    // committed. It is not evidence of another stroke or another Undo step.
+                    // Only this exceptional, unobserved-contact path reads native state.
+                    let nativeCount = self.drawing.strokes.count
+                    recordInkDiagnostic("untracked_native_callback", nativeCount: nativeCount)
+                    count = max(0, nativeCount - knownStrokeCount)
+                }
                 for _ in 0..<count { recordUndoAction(.removeTrailingStrokes(1)) }
                 knownStrokeCount += count
             } else if selectedToolKind == .eraser, erasedElements.isEmpty,
@@ -1111,8 +1270,16 @@ final class CanvasController: NSObject, ObservableObject {
             // Keep the ready bitmap over the canvas until PencilKit has rendered the committed
             // drawing. Removing it at assignment time exposes PencilKit's empty replacement frame.
             self.heldShape = nil
-            installCanvasDrawing(heldShape.drawing)
-            authoritativeSnappedDrawing = heldShape.drawing
+            let nativeDrawing = self.drawing
+            let committed = committingHeldDrawing(heldShape.drawing, over: nativeDrawing)
+            // Some newer contacts may already have reached native state before their lifecycle
+            // callbacks. Keep their individual undo steps as well as their ink.
+            for _ in 0..<max(0, committed.strokes.count - knownStrokeCount) {
+                recordUndoAction(.removeTrailingStrokes(1))
+            }
+            installCanvasDrawing(committed)
+            retainDrawingAuthority(committed, replacing: nativeDrawing,
+                contactStartIndex: max(0, heldShape.drawing.strokes.count - 1))
             lastSnappedShapeKind = heldShape.kind
         } else {
             discardShapePreview()
@@ -1128,11 +1295,13 @@ final class CanvasController: NSObject, ObservableObject {
         }
         setToolInteractionActive(false)
         refreshHistoryState()
+        drainHistoryCommands()
     }
 
     private func setToolInteractionActive(_ isActive: Bool) {
         guard isUsingTool != isActive else { return }
         isUsingTool = isActive
+        recordInkDiagnostic(isActive ? "begin" : "end")
         if !isActive { scheduleInkPreviewHandoff() }
         onToolInteractionChanged?(isActive)
     }
@@ -1413,6 +1582,10 @@ private enum DrawingHistoryAction {
     case restorePageContent(drawing: PKDrawing?, elements: [CanvasPageElement], replacingIDs: Set<UUID>)
 }
 
+private enum CanvasHistoryCommand: String {
+    case undo, redo
+}
+
 /// Rasterize once at gesture start, then move only a CALayer for each input sample.
 /// The native drawing stays unchanged until commit, so cancellation is lossless and
 /// autosave cannot persist a partially transformed page.
@@ -1545,7 +1718,25 @@ extension CanvasController: PKCanvasViewDelegate {
             beginToolInteraction()
         }
         if let authoritativeSnappedDrawing {
-            if self.drawing != authoritativeSnappedDrawing {
+            let incoming = self.drawing
+            let newStrokes = authoritativeInkCreationCutoff.map { cutoff in
+                incoming.strokes.filter {
+                    $0.path.creationDate > cutoff && !authoritativeKnownStrokeDates.contains($0.path.creationDate)
+                }
+            } ?? []
+            if !newStrokes.isEmpty {
+                recordInkDiagnostic("late_glyph_preserved", nativeCount: incoming.strokes.count)
+                // A whole new glyph can finish before the delayed begin/end delegate callbacks.
+                // Merge only its newer contacts onto the committed edit; replaying the complete
+                // native callback could also resurrect the erased content or the unstraightened ink.
+                beginToolInteraction()
+                installCanvasDrawing(PKDrawing(strokes: authoritativeSnappedDrawing.strokes + newStrokes))
+                knownStrokeCount = authoritativeSnappedDrawing.strokes.count
+                completedInkContactCount = newStrokes.count
+                toolInteractionDidChangeDrawing = true
+                requestToolInteractionFinish()
+            } else if incoming != authoritativeSnappedDrawing {
+                recordInkDiagnostic("late_native_rejected", nativeCount: incoming.strokes.count)
                 installCanvasDrawing(
                     authoritativeSnappedDrawing,
                     preservingShapeAuthority: true
@@ -1573,6 +1764,10 @@ extension CanvasController: PKCanvasViewDelegate {
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        guard authoritativeSnappedDrawing == nil || hasActiveDrawingContact else {
+            recordInkDiagnostic("late_tool_begin_ignored")
+            return
+        }
         beginToolInteraction()
     }
 

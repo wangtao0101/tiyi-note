@@ -6,6 +6,8 @@ import Foundation
 /// This deliberately does not join separate strokes or infer words using handwriting recognition.
 struct ScribbleEraseGesture {
     let bounds: CGRect
+    let passCount: Int
+    let repeatedPathFraction: CGFloat
     private let origin: CGPoint
     private let displayScale: CGFloat
     private let sweepAreas: [CGPath]
@@ -16,6 +18,12 @@ struct ScribbleEraseGesture {
     fileprivate init(points: [CGPoint], passes: [ClosedRange<Int>], origin: CGPoint, displayScale: CGFloat) {
         self.origin = origin
         self.displayScale = displayScale
+        passCount = passes.count
+        let lengths = zip(points, points.dropFirst()).map { hypot($1.x - $0.x, $1.y - $0.y) }
+        let repeatedLength = passes.reduce(CGFloat.zero) { total, range in
+            total + lengths[range.lowerBound..<range.upperBound].reduce(0, +)
+        }
+        repeatedPathFraction = repeatedLength / max(lengths.reduce(0, +), 0.001)
         let extent = ScribbleEraseRecognizer.bounds(passes.flatMap { Array(points[$0]) })
         let radius = max(6, min(14, hypot(extent.width, extent.height) * 0.065))
         let paths = passes.map { range -> CGPath in
@@ -160,9 +168,10 @@ enum ScribbleEraseRecognizer {
                     let previous = points[index], next = points[index + 1]
                     runLength += hypot(next.x - previous.x, next.y - previous.y)
                 }
-                // A curved entry/exit should not veto the repeated motion in the middle.
+                // A short curved entry/exit may be ignored, but the repeated motion must still
+                // account for almost the whole contact before it can delete any content.
                 if chord < excursion || runLength > chord * 1.8 {
-                    if passes.count >= 4 { break }
+                    if passes.count >= 6 { break }
                     passes.removeAll(); vectors.removeAll()
                     totalChord = 0; totalRunLength = 0
                     directPassCount = 0
@@ -177,9 +186,12 @@ enum ScribbleEraseRecognizer {
             let reversals = zip(vectors, vectors.dropFirst()).filter {
                 $0.dx * $1.dx + $0.dy * $1.dy < -0.25
             }.count
-            guard passes.count >= 4, totalRunLength <= totalChord * 1.45,
+            // Two back-and-forth motions also describe ordinary m/w/3 handwriting. Require
+            // three deliberate round trips, rather than treating those ambiguous strokes as edits.
+            guard passes.count >= 6, totalRunLength >= length * 0.85,
+                  totalRunLength <= totalChord * 1.45,
                   directPassCount >= Int(ceil(CGFloat(passes.count) * 0.75)),
-                  reversals >= max(3, Int(ceil(CGFloat(vectors.count - 1) * 0.75))) else { continue }
+                  reversals >= max(5, Int(ceil(CGFloat(vectors.count - 1) * 0.75))) else { continue }
             return ScribbleEraseGesture(points: points, passes: passes, origin: origin, displayScale: displayScale)
         }
         return nil
@@ -192,7 +204,7 @@ enum ScribbleEraseRecognizer {
         }
         let rotation = turns.reduce(CGFloat.zero, +)
         let travel = turns.reduce(CGFloat.zero) { $0 + abs($1) }
-        guard abs(rotation) >= 4.8 * .pi, abs(rotation) >= travel * 0.65 else { return nil }
+        guard abs(rotation) >= 5.9 * .pi, abs(rotation) >= travel * 0.65 else { return nil }
         let direction: CGFloat = rotation > 0 ? 1 : -1
         var progress: CGFloat = 0
         var nextLoop: CGFloat = 2 * .pi

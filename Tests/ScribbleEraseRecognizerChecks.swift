@@ -97,15 +97,47 @@ struct ScribbleEraseRecognizerChecks {
             let t = CGFloat(i) / 96
             return CGPoint(x: 50 * cos(t * .pi * 4), y: 8 * sin(t * .pi * 4) + t * 6)
         }
-        check(ScribbleEraseRecognizer.recognize(rounded, displayScale: 1) != nil,
-              "two rounded back-and-forth motions should work")
+        check(ScribbleEraseRecognizer.recognize(rounded, displayScale: 1) == nil,
+              "two rounded motions are ambiguous handwriting, so retain them")
         let uneven = [CGPoint(x: 0, y: 0), CGPoint(x: 48, y: 4), CGPoint(x: 5, y: 9),
                       CGPoint(x: 42, y: 7), CGPoint(x: 1, y: 15)]
-        check(ScribbleEraseRecognizer.recognize(uneven, displayScale: 1) != nil,
-              "short uneven scratch without six perfect traversals")
+        check(ScribbleEraseRecognizer.recognize(uneven, displayScale: 1) == nil,
+              "short uneven motion must not silently delete ink")
+        let deliberateUneven = uneven + [CGPoint(x: 45, y: 12), CGPoint(x: 2, y: 18)]
+        check(ScribbleEraseRecognizer.recognize(deliberateUneven, displayScale: 1) != nil,
+              "three deliberate uneven round trips still erase")
         let repeatedW = (0...8).map { CGPoint(x: CGFloat($0) * 10, y: $0.isMultiple(of: 2) ? 0 : 35) }
         check(ScribbleEraseRecognizer.recognize(repeatedW, displayScale: 1) == nil,
               "writing WW across the page is not a scribble")
+
+        // Four sweeps also describe ordinary tall m/w and a wide, continuously written 3.
+        // Test screen-equivalent handwriting at every supported scale and orientation.
+        let foldedPrefix = (0...8).map { CGPoint(x: $0.isMultiple(of: 2) ? 0 : 100, y: CGFloat($0) * 4) }
+        let loopExit = (1...90).map { index in
+            let t = CGFloat(index) / 90 * 2 * .pi
+            return CGPoint(x: 30 * sin(t), y: 62 - 30 * cos(t))
+        }
+        let foldedWriting: [(String, [CGPoint])] = [
+            ("tall w", (0...4).map { CGPoint(x: CGFloat($0) * 5, y: $0.isMultiple(of: 2) ? 0 : 50) }),
+            ("tall m", (0...4).map { CGPoint(x: CGFloat($0) * 5, y: $0.isMultiple(of: 2) ? 50 : 0) }),
+            ("wide 3", (0...120).map { index in
+                let t = CGFloat(index) / 60 * .pi
+                return CGPoint(x: 50 * sin(t.truncatingRemainder(dividingBy: .pi)), y: 20 * t / .pi)
+            }),
+            ("folded contact with long loop exit", foldedPrefix + loopExit)
+        ]
+        for (name, stroke) in foldedWriting {
+            for zoom: CGFloat in [0.1, 0.25, 1, 3, 8] {
+                for angle: CGFloat in [0, .pi / 6, .pi / 2, .pi * 0.83] {
+                    let points = stroke.map { point in
+                        CGPoint(x: (point.x * cos(angle) - point.y * sin(angle)) / zoom - 12000,
+                                y: (point.x * sin(angle) + point.y * cos(angle)) / zoom - 8000)
+                    }
+                    check(ScribbleEraseRecognizer.recognize(points, displayScale: zoom) == nil,
+                          "retain ordinary \(name) at \(zoom), rotated \(angle)")
+                }
+            }
+        }
 
         // Only normalized erase gestures, with no document content, identifiers or timestamps.
         // Captured Pencil strokes reproduce the small rounded motion rejected by the first version.

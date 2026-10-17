@@ -2130,7 +2130,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertTrue(marker.waitForExistence(timeout: 10))
         app.buttons["tool-lasso"].tap()
         try synthesizeClosedTouchPath(around: marker.frame.insetBy(dx: -22, dy: -22), on: canvas, in: app)
-        let selection = app.descendants(matching: .any)["lasso-selection-box"]
+        let selection = app.descendants(matching: .any)["lasso-selection-outline"]
         XCTAssertTrue(selection.waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["question-selection-open"].exists)
         XCTAssertTrue(app.buttons["删除"].isEnabled)
@@ -2189,9 +2189,9 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         )
         XCTAssertFalse(feedback.exists)
 
-        // Like Freeform, releasing the lasso immediately presents one tight,
-        // deterministic object frame instead of leaving a second dotted selection mode.
-        XCTAssertTrue(selectionBox.waitForExistence(timeout: 3))
+        // Freehand selection retains the drawn contour until explicit transform mode.
+        enterLassoTransformMode(in: app)
+        XCTAssertTrue(selectionBox.exists)
 
         // Enclosing just one corner must work too; the shape's center is outside this loop.
         let shapeFrame = shape.frame
@@ -2201,6 +2201,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             around: CGRect(x: shapeFrame.minX - 14, y: shapeFrame.minY - 14, width: 30, height: 30),
             on: canvas, in: app
         )
+        enterLassoTransformMode(in: app)
         XCTAssertTrue(selectionBox.waitForExistence(timeout: 3))
         XCTAssertEqual(selectionBox.frame.width, shapeFrame.width, accuracy: 2)
 
@@ -2570,6 +2571,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         try synthesizeClosedTouchPath(around: CGRect(
             x: points[0].x - 20, y: points[0].y - 20,
             width: points.last!.x - points[0].x + 40, height: 40), on: canvas, in: app)
+        enterLassoTransformMode(in: app)
         let selection = app.descendants(matching: .any)["lasso-selection-box"]
         XCTAssertTrue(selection.waitForExistence(timeout: 4))
         let viewport = try canvasViewportRect(of: canvas)
@@ -2633,6 +2635,119 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertNotEqual(try canvasViewportRect(of: canvas), realViewport)
     }
 
+    func testFreehandOutlineMovesTransformsAndPreservesEveryStrokeAfterRelaunch() throws {
+        for prefix in ["pdf-freehand-outline", "practice-sidebar-freehand-outline"] {
+            let app = launchIsolatedApp(prefix: prefix, additionalLaunchArguments: ["--lasso-outline-detail-ui-test"])
+            let canvas = app.descendants(matching: .any)["page-canvas-0"]
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            app.buttons["tool-lasso"].tap()
+            app.buttons["tool-pen"].tap()
+            drawStroke(on: canvas, from: CGVector(dx: 0.15, dy: 0.12), to: CGVector(dx: 0.30, dy: 0.13))
+            waitForValue("笔迹 1", of: canvas)
+            let frame = canvas.frame
+            let origin = CGPoint(x: frame.minX + frame.width * 0.23, y: frame.minY + frame.height * 0.24)
+            func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: origin.x + x, y: origin.y + y) }
+            let strokes = [[point(10, 10), point(75, 5), point(150, 20)],
+                           [point(15, 75), point(8, 110), point(25, 155)],
+                           [point(120, 110), point(150, 130), point(170, 150)]]
+            for (index, stroke) in strokes.enumerated() {
+                try synthesizeTouchPath(stroke, on: canvas, in: app, holdBeforeLift: 0.04)
+                waitForValue("笔迹 \(index + 2)", of: canvas)
+            }
+            let originalInk = try lassoStrokeFingerprints(of: canvas)
+            XCTAssertEqual(originalInk.count, 4)
+            app.buttons["tool-lasso"].tap()
+            let contour = [point(-25, -25), point(195, -30), point(200, 55), point(65, 55),
+                           point(65, 190), point(-30, 195), point(-25, -25)]
+            try synthesizeTouchPath(contour, on: canvas, in: app, holdBeforeLift: 0.04)
+            let outline = app.descendants(matching: .any)["lasso-selection-outline"]
+            let box = app.descendants(matching: .any)["lasso-selection-box"]
+            let adjust = app.buttons["lasso-transform-toggle"]
+            XCTAssertTrue(outline.waitForExistence(timeout: 3))
+            XCTAssertFalse(box.exists)
+            XCTAssertFalse(app.descendants(matching: .any)["lasso-rotation-handle"].exists)
+            XCTAssertFalse(app.descendants(matching: .any)["lasso-resize-bottomRight"].exists)
+            XCTAssertEqual(try lassoStrokeFingerprints(of: canvas), originalInk, "Selecting must not write the dashed contour into ink")
+            let originalOutline = try lassoOutlinePoints(of: outline)
+            XCTAssertGreaterThan(originalOutline.count, 6)
+            let start = canvas.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: point(20, 105).x - frame.minX, dy: point(20, 105).y - frame.minY))
+            start.press(forDuration: 0.10, thenDragTo: start.withOffset(CGVector(dx: 70, dy: 35)))
+            waitUntil(timeout: 3) { (try? self.lassoStrokeFingerprints(of: canvas)) != originalInk }
+            let movedInk = try lassoStrokeFingerprints(of: canvas)
+            XCTAssertEqual(movedInk.count, 4)
+            XCTAssertEqual(movedInk[0], originalInk[0])
+            XCTAssertEqual(movedInk[3], originalInk[3], "Ink in the concave outline's empty notch must stay untouched")
+            XCTAssertNotEqual(movedInk[1], originalInk[1])
+            XCTAssertNotEqual(movedInk[2], originalInk[2])
+            let movedOutline = try lassoOutlinePoints(of: outline)
+            XCTAssertEqual(movedOutline.count, originalOutline.count)
+            let delta = CGPoint(x: movedOutline[0].x - originalOutline[0].x, y: movedOutline[0].y - originalOutline[0].y)
+            XCTAssertGreaterThan(hypot(delta.x, delta.y), 10)
+            for (before, after) in zip(originalOutline, movedOutline) {
+                XCTAssertEqual(after.x - before.x, delta.x, accuracy: 0.01)
+                XCTAssertEqual(after.y - before.y, delta.y, accuracy: 0.01)
+            }
+            XCTAssertFalse(box.exists)
+            let freehandImage = XCTAttachment(screenshot: app.screenshot())
+            freehandImage.name = "\(prefix) retained outline after moving"
+            freehandImage.lifetime = .keepAlways; add(freehandImage)
+            XCTAssertTrue(adjust.waitForExistence(timeout: 3))
+            adjust.tap()
+            XCTAssertTrue(box.waitForExistence(timeout: 3))
+            XCTAssertFalse(outline.exists)
+            XCTAssertEqual(try lassoStrokeFingerprints(of: canvas), movedInk, "Opening transform controls must not mutate ink")
+            let resize = app.descendants(matching: .any)["lasso-resize-bottomRight"]
+            XCTAssertTrue(resize.waitForExistence(timeout: 3))
+            let resizeStart = resize.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            resizeStart.press(forDuration: 0.1, thenDragTo: resizeStart.withOffset(CGVector(dx: 45, dy: 30)))
+            let resizedInk = try lassoStrokeFingerprints(of: canvas)
+            XCTAssertNotEqual(resizedInk[1], movedInk[1])
+            XCTAssertEqual(resizedInk[0], originalInk[0]); XCTAssertEqual(resizedInk[3], originalInk[3])
+            let rotation = app.descendants(matching: .any)["lasso-rotation-handle"]
+            XCTAssertTrue(rotation.waitForExistence(timeout: 3))
+            let rotateStart = rotation.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            rotateStart.press(forDuration: 0.1, thenDragTo: rotateStart.withOffset(CGVector(dx: 60, dy: -28)))
+            let finalInk = try lassoStrokeFingerprints(of: canvas)
+            XCTAssertNotEqual(finalInk[1], resizedInk[1])
+            XCTAssertEqual(finalInk[0], originalInk[0]); XCTAssertEqual(finalInk[3], originalInk[3])
+            let controlsImage = XCTAttachment(screenshot: app.screenshot())
+            controlsImage.name = "\(prefix) explicit transform controls"
+            controlsImage.lifetime = .keepAlways; add(controlsImage)
+            adjust.tap()
+            XCTAssertTrue(outline.waitForExistence(timeout: 3))
+            XCTAssertFalse(box.exists)
+            XCTAssertEqual(try lassoOutlinePoints(of: outline).count, originalOutline.count)
+            XCTAssertEqual(try lassoStrokeFingerprints(of: canvas), finalInk)
+            app.buttons["撤销"].tap()
+            XCTAssertTrue(outline.waitForNonExistence(timeout: 3), "History must clear stale selected stroke indices")
+            XCTAssertEqual(try lassoStrokeFingerprints(of: canvas), resizedInk)
+            app.buttons["重做"].tap()
+            XCTAssertEqual(try lassoStrokeFingerprints(of: canvas), finalInk)
+            app.buttons["tool-pen"].tap()
+            try synthesizeTouchPath([point(40, 255), point(75, 250), point(110, 265)], on: canvas, in: app, holdBeforeLift: 0.04)
+            waitForValue("笔迹 5", of: canvas)
+            let saved = try lassoStrokeFingerprints(of: canvas)
+            XCTAssertEqual(Array(saved.prefix(4)), finalInk, "Writing after Undo/Redo must retain the entire edited page")
+            let savedGeometry = try lassoStrokeFingerprints(of: canvas, persistedGeometry: true)
+            let savedDetails = try lassoStrokeDetails(of: canvas)
+            RunLoop.current.run(until: Date().addingTimeInterval(3))
+            app.terminate()
+            app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+            app.launch()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+            waitForValue("笔迹 5", of: canvas)
+            let reopenedDetails = try lassoStrokeDetails(of: canvas)
+            for (index, pair) in zip(savedDetails, reopenedDetails).enumerated() {
+                let differences = zip(pair.0, pair.1).enumerated().filter { $0.element.0 != $0.element.1 }
+                XCTAssertTrue(differences.isEmpty, "Stroke \(index), counts \(pair.0.count)/\(pair.1.count), differences \(Array(differences.prefix(8)))")
+            }
+            XCTAssertEqual(try lassoStrokeFingerprints(of: canvas, persistedGeometry: true), savedGeometry,
+                "Every stroke's geometry and style must survive save/reopen; PencilKit may normalize dynamic samples")
+            app.terminate()
+        }
+    }
+
     func testStrokeSelectionMoveResizeRotateUndoRedoAndPersistence() throws {
         let app = launchIsolatedApp(prefix: "stroke-object-transform")
         let canvas = app.descendants(matching: .any)
@@ -2659,6 +2774,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             on: canvas,
             in: app
         )
+        enterLassoTransformMode(in: app)
 
         let selectionBox = app.descendants(matching: .any)
             .matching(identifier: "lasso-selection-box")
@@ -3501,6 +3617,148 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         waitForValue("笔迹 0", of: relaunchedCanvas, timeout: 5)
     }
 
+    func testUndoRedoThenImmediateWritingKeepsThePageAfterRelaunch() throws {
+        let app = launchIsolatedApp(prefix: "pdf-undo-next-writing")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-lasso"].tap()
+        app.buttons["tool-pen"].tap()
+        drawStroke(on: canvas)
+        waitForValue("笔迹 1", of: canvas)
+        let frame = canvas.frame
+        let paths = (0..<24).map { index -> SynthesizedTouchPath in
+            let start = CGPoint(x: frame.minX + frame.width * (0.2 + CGFloat(index % 6) * 0.1),
+                y: frame.minY + frame.height * (0.25 + CGFloat(index / 6) * 0.1))
+            let t = Double(index) * 0.16
+            return SynthesizedTouchPath(samples: [(start, t),
+                (CGPoint(x: start.x + 15, y: start.y + 8), t + 0.11)], liftOffset: t + 0.13)
+        }
+        try synthesizeTouchPaths(paths, on: canvas, in: app)
+        waitForValue("笔迹 25", of: canvas)
+        let originalGeometry = drawingGeometryValue(of: canvas)
+        for count in [24, 23, 22, 21] {
+            app.buttons["撤销"].tap()
+            waitForValue("笔迹 \(count)", of: canvas)
+        }
+        for count in [22, 23, 24, 25] {
+            app.buttons["重做"].tap()
+            waitForValue("笔迹 \(count)", of: canvas)
+        }
+        XCTAssertEqual(drawingGeometryValue(of: canvas), originalGeometry)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 24", of: canvas)
+        let next = (0..<3).map { index -> SynthesizedTouchPath in
+            let start = CGPoint(x: frame.minX + frame.width * 0.3, y: frame.minY + frame.height * 0.72 + CGFloat(index) * 12)
+            let t = Double(index) * 0.16
+            return SynthesizedTouchPath(samples: [(start, t),
+                (CGPoint(x: start.x + 30, y: start.y + 5), t + 0.11)], liftOffset: t + 0.13)
+        }
+        try synthesizeTouchPaths(next, on: canvas, in: app)
+        waitForValue("笔迹 27", of: canvas)
+        XCTAssertFalse(app.buttons["重做"].isEnabled)
+        let geometry = drawingGeometryValue(of: canvas)
+        RunLoop.current.run(until: Date().addingTimeInterval(3))
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 27", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+    }
+
+    func testFoldedHandwritingWithScribbleEnabledSurvivesSaveAndRelaunch() throws {
+        for prefix in ["pdf-folded-handwriting", "practice-sidebar-folded-handwriting"] {
+            let app = launchIsolatedApp(prefix: prefix)
+            let canvas = app.descendants(matching: .any)["page-canvas-0"]
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            setScribbleErase(true, in: app)
+            drawStroke(on: canvas)
+            waitForValue("笔迹 1", of: canvas)
+            let frame = canvas.frame
+            for cycle in 0..<3 {
+                let center = CGPoint(x: frame.midX - 30,
+                    y: frame.minY + frame.height * (0.28 + CGFloat(cycle) * 0.18))
+                let target = [CGPoint(x: center.x - 4, y: center.y), CGPoint(x: center.x + 4, y: center.y)]
+                try synthesizeTouchPath(target, on: canvas, in: app, holdBeforeLift: 0.04)
+                waitForValue("笔迹 \(2 + cycle * 2)", of: canvas)
+                let writing: [CGPoint]
+                if cycle < 2 {
+                    writing = (0...4).map { index in
+                        CGPoint(x: center.x - 10 + CGFloat(index) * 5,
+                            y: center.y - 25 + ((index.isMultiple(of: 2) == (cycle == 0)) ? 0 : 50))
+                    }
+                } else {
+                    writing = (0...120).map { index in
+                        let t = CGFloat(index) / 60 * .pi
+                        return CGPoint(x: center.x + 50 * sin(t.truncatingRemainder(dividingBy: .pi)),
+                            y: center.y - 20 + 20 * t / .pi)
+                    }
+                }
+                let samples = writing.enumerated().map {
+                    (point: $0.element, offset: Double($0.offset) / Double(writing.count - 1) * 0.6)
+                }
+                try synthesizeTouchPaths([SynthesizedTouchPath(samples: samples, liftOffset: 0.64)], on: canvas, in: app)
+                waitForValue("笔迹 \(3 + cycle * 2)", of: canvas)
+                let geometry = drawingGeometryValue(of: canvas)
+                app.buttons["撤销"].tap()
+                waitForValue("笔迹 \(2 + cycle * 2)", of: canvas)
+                app.buttons["重做"].tap()
+                waitForValue("笔迹 \(3 + cycle * 2)", of: canvas)
+                XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+            }
+            let geometry = drawingGeometryValue(of: canvas)
+            RunLoop.current.run(until: Date().addingTimeInterval(3))
+            app.terminate()
+            app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+            app.launch()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+            waitForValue("笔迹 7", of: canvas)
+            XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+            app.terminate()
+        }
+    }
+
+    func testHeldShapesImmediatelyFollowedByGlyphsSurviveAutosaveAndRelaunch() throws {
+        let app = launchIsolatedApp(prefix: "pdf-held-followed-by-glyph")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-lasso"].tap()
+        app.buttons["tool-pen"].tap()
+        // Start from an established writing session, matching the last glyph in a line of ink.
+        drawStroke(on: canvas)
+        waitForValue("笔迹 1", of: canvas)
+        let frame = canvas.frame
+        for cycle in 0..<3 {
+            let y = frame.minY + frame.height * (0.25 + CGFloat(cycle) * 0.18)
+            let center = CGPoint(x: frame.minX + frame.width * 0.28, y: y)
+            let radius = frame.width * 0.06
+            let circle = (0...60).map { i -> (CGPoint, TimeInterval) in
+                let angle = CGFloat(i) / 60 * 2 * .pi
+                return (CGPoint(x: center.x + cos(angle) * radius, y: center.y + sin(angle) * radius),
+                        Double(i) / 60 * 0.4)
+            }
+            var paths = [SynthesizedTouchPath(samples: circle, liftOffset: 1.15)]
+            for stroke in 0..<3 {
+                let start = CGPoint(x: frame.minX + frame.width * 0.55, y: y + CGFloat(stroke) * 12)
+                let t = 1.155 + Double(stroke) * 0.16
+                paths.append(SynthesizedTouchPath(samples: [(start, t),
+                    (CGPoint(x: start.x + 35, y: start.y + 5), t + 0.11)], liftOffset: t + 0.13))
+            }
+            try synthesizeTouchPaths(paths, on: canvas, in: app)
+            waitForValue("笔迹 \(1 + (cycle + 1) * 4)", of: canvas)
+        }
+        let geometry = drawingGeometryValue(of: canvas)
+        RunLoop.current.run(until: Date().addingTimeInterval(3))
+        waitForValue("笔迹 13", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 13", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+    }
+
     func testContinuousStrokeSurvivesPauseAutosaveAndRelaunch() throws {
         let app = launchIsolatedApp(prefix: "continuous-stroke-persistence")
         let canvas = app.descendants(matching: .any)
@@ -4119,6 +4377,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
             on: canvas,
             in: app
         )
+        enterLassoTransformMode(in: app)
         XCTAssertTrue(app.buttons["删除"].waitForExistence(timeout: 4))
         XCTAssertFalse(app.descendants(matching: .any)["lasso-vertex-0"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["lasso-resize-bottomRight"].exists)
@@ -5954,6 +6213,41 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let predicate = NSPredicate(format: "value CONTAINS %@", expectedValue)
         expectation(for: predicate, evaluatedWith: element)
         waitForExpectations(timeout: timeout)
+    }
+
+    private func lassoStrokeFingerprints(of canvas: XCUIElement, persistedGeometry: Bool = false) throws -> [String] {
+        let value = try XCTUnwrap(canvas.value as? String)
+        let prefix = persistedGeometry ? "逐笔稳定 " : "逐笔 "
+        let field = try XCTUnwrap(value.components(separatedBy: "；").first { $0.hasPrefix(prefix) })
+        let fingerprints = field.replacingOccurrences(of: prefix, with: "").components(separatedBy: "|")
+        XCTAssertTrue(fingerprints.allSatisfy { $0.count == 64 })
+        return fingerprints
+    }
+
+    private func lassoOutlinePoints(of outline: XCUIElement) throws -> [CGPoint] {
+        let value = try XCTUnwrap(outline.value as? String)
+        return try value.components(separatedBy: "|").map { pair in
+            let coordinates = pair.components(separatedBy: ",")
+            XCTAssertEqual(coordinates.count, 2)
+            return CGPoint(x: try XCTUnwrap(Double(coordinates[0])), y: try XCTUnwrap(Double(coordinates[1])))
+        }
+    }
+
+    private func lassoStrokeDetails(of canvas: XCUIElement) throws -> [[String]] {
+        let value = try XCTUnwrap(canvas.value as? String)
+        let field = try XCTUnwrap(value.components(separatedBy: "；").first { $0.hasPrefix("逐笔内容 ") })
+        let data = try XCTUnwrap(Data(base64Encoded: String(field.dropFirst("逐笔内容 ".count))))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String]])
+    }
+
+    private func enterLassoTransformMode(in app: XCUIApplication) {
+        let outline = app.descendants(matching: .any)["lasso-selection-outline"]
+        XCTAssertTrue(outline.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.descendants(matching: .any)["lasso-selection-box"].exists)
+        let adjust = app.buttons["lasso-transform-toggle"]
+        XCTAssertTrue(adjust.waitForExistence(timeout: 3))
+        adjust.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["lasso-selection-box"].waitForExistence(timeout: 3))
     }
 
     private func drawingGeometryValue(of element: XCUIElement) -> String? {

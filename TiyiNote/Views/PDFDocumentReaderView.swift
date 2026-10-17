@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import PDFKit
 import PencilKit
 import SwiftUI
@@ -1074,6 +1075,7 @@ private struct PDFPageAnnotationView: View {
     }
 
     private func preparePageCanvas() {
+        controller.diagnosticPageID = "\(documentID)/\(pageID)"
         if !drawingPersistence.hasLoadedDrawing {
             let initialDrawing = documentStore.loadDrawing(
                 forPage: resolvedPageIndex,
@@ -1214,7 +1216,7 @@ private struct PDFPageAnnotationView: View {
         let drawing = controller.drawing
         let bounds = drawing.bounds
         guard !bounds.isNull, !bounds.isInfinite else { return "范围 空" }
-        return String(
+        let value = String(
             format: "范围 %.2f,%.2f,%.2f,%.2f",
             bounds.minX,
             bounds.minY,
@@ -1232,6 +1234,52 @@ private struct PDFPageAnnotationView: View {
                 point.size.width * hypot(stroke.transform.a, stroke.transform.b),
                 point.size.height * hypot(stroke.transform.c, stroke.transform.d))
         } ?? "")
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--lasso-outline-detail-ui-test") {
+            // Strict hashes verify in-memory edits, including pressure and timing. Persistence
+            // hashes use the store's stable geometry precision because PencilKit normalizes
+            // dynamic samples during serialization. Both are limited to synthetic UI fixtures.
+            var stableFingerprints: [String] = []
+            var stableContents: [[String]] = []
+            let fingerprints = drawing.strokes.map { stroke -> String in
+                var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+                stroke.ink.color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+                let transform = stroke.transform
+                // PencilKit can also encode monoline as pen. Compare the encoded ink type,
+                // rather than treating that native serialization alias as a lost/restyled stroke.
+                let encodedStroke = (try? PKDrawing(data: PKDrawing(strokes: [stroke]).dataRepresentation()))?.strokes.first
+                var stableContent = [(encodedStroke ?? stroke).ink.inkType.rawValue,
+                    String(format: "%.3f,%.3f,%.3f,%.3f", red, green, blue, alpha),
+                    String(format: "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f", transform.a, transform.b,
+                        transform.c, transform.d, transform.tx, transform.ty),
+                    "points:\(stroke.path.count)",
+                    String(describing: stroke.maskedPathRanges)]
+                stableContent += stroke.path.map { point in
+                    String(format: "%.2f,%.2f,%.2f,%.2f", point.location.x, point.location.y,
+                        point.size.width, point.size.height)
+                }
+                stableContents.append(stableContent)
+                stableFingerprints.append(SHA256.hash(data: Data(stableContent.joined(separator: "|").utf8))
+                    .map { String(format: "%02x", $0) }.joined())
+                let samples = stroke.path.map { point in
+                    [Double(point.location.x), Double(point.location.y), point.timeOffset,
+                     Double(point.size.width), Double(point.size.height), Double(point.opacity),
+                     Double(point.force), Double(point.azimuth), Double(point.altitude)]
+                }
+                let content: [Any] = [stroke.ink.inkType.rawValue,
+                    [Double(red), Double(green), Double(blue), Double(alpha)], stroke.randomSeed,
+                    stroke.path.creationDate.timeIntervalSinceReferenceDate,
+                    [transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty],
+                    stroke.maskedPathRanges.map { [$0.lowerBound, $0.upperBound] }, samples]
+                guard let data = try? JSONSerialization.data(withJSONObject: content) else { return "invalid" }
+                return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            }
+            return value + "；逐笔 " + fingerprints.joined(separator: "|")
+                + "；逐笔稳定 " + stableFingerprints.joined(separator: "|")
+                + "；逐笔内容 " + ((try? JSONSerialization.data(withJSONObject: stableContents))?.base64EncodedString() ?? "")
+        }
+#endif
+        return value
     }
 
     private func releasePageCanvas() {
@@ -1503,6 +1551,7 @@ private struct PDFPageAnnotationView: View {
             // it on MainActor is required by PencilKit; every serialization and diff step below is
             // performed by a cancellable background task.
             let drawing = controller.drawing
+            controller.recordInkDiagnostic("idle_snapshot", nativeCount: drawing.strokes.count)
             let capturedGeneration = pendingState.generation
 
             // `PKDrawing.dataRepresentation()` and per-stroke identity preparation both scale with
@@ -1538,6 +1587,7 @@ private struct PDFPageAnnotationView: View {
             !drawingPersistence.isInteractionSessionActive else { return }
 
             drawingPersistence.pendingDrawing = nil
+            controller.recordInkDiagnostic("idle_saved", nativeCount: drawing.strokes.count)
             drawingPersistence.collaborationContext = updatedContext
             drawingPersistence.submittedDrawing = drawing
             documentStore.setEditorDrawingPersistencePending(
@@ -1587,6 +1637,7 @@ private struct PDFPageAnnotationView: View {
         cancelScheduledDrawingPersistence()
         guard let pendingDrawing = drawingPersistence.pendingDrawing else { return }
         let drawing = controller.drawing
+        controller.recordInkDiagnostic("checkpoint_snapshot", nativeCount: drawing.strokes.count)
         drawingPersistence.pendingDrawing = nil
         drawingPersistence.collaborationContext = documentStore.scheduleSave(
             drawing,
@@ -2038,6 +2089,7 @@ private struct PDFPageAnnotationView: View {
         else { return }
 
         if documentStore.flushPendingSaves(forPage: resolvedPageIndex, in: documentID) {
+            controller.recordInkDiagnostic("checkpoint_saved")
             drawingPersistence.isDrawingDirty = false
             arePageElementsDirty = false
         }
@@ -3158,6 +3210,7 @@ private struct LassoSelectionOverlay: View {
     @State private var assistantSelectionBounds: CGRect?
     @State private var liveLassoPath: [CGPoint] = []
     @State private var selection: LassoStrokeSelection?
+    @State private var showsTransformControls = false
     @State private var transformOriginSelection: LassoStrokeSelection?
     @State private var transformOriginElements: [UUID: CanvasPageElement] = [:]
     @State private var inputDragMode: LassoInputDragMode?
@@ -3214,7 +3267,11 @@ private struct LassoSelectionOverlay: View {
                     if allowsLassoCreation,
                        let selection,
                        !isEditingText {
-                        selectionBox(for: selection, in: geometry.size)
+                        if selection.outline == nil || showsTransformControls {
+                            selectionBox(for: selection, in: geometry.size)
+                        } else if selectionContainsLockedElement {
+                            selectionLockBadge(for: selection, in: geometry.size)
+                        }
                     }
 
                     if allowsLassoCreation, let selection, !isEditingText {
@@ -3238,6 +3295,9 @@ private struct LassoSelectionOverlay: View {
                             canGroup: canGroupSelection,
                             canUngroup: canUngroupSelection,
                             isLocked: selectionContainsLockedElement,
+                            showsTransformToggle: selection.outline != nil,
+                            isTransforming: showsTransformControls,
+                            onToggleTransform: { showsTransformControls.toggle() },
                             onEditText: editSelectedText,
                             onCropImage: cropSelectedImage,
                             onEditShape: editSelectedShape,
@@ -3295,7 +3355,14 @@ private struct LassoSelectionOverlay: View {
         }
         .onAppear(perform: consumeRequestedSelectionIfPossible)
         .onReceive(controller.$selectionHistoryRevision.dropFirst()) { _ in
-            guard transformOriginSelection == nil, let selected = selection else { return }
+            guard let selected = selection else { return }
+            // History can remove/reorder strokes. A freehand contour must never silently attach
+            // its old indices to different ink; reselect after Undo/Redo instead.
+            if selected.outline != nil {
+                clearSelection()
+                return
+            }
+            guard transformOriginSelection == nil else { return }
             guard selected.content.elementIDs.allSatisfy({ id in pageElements.contains { $0.id == id } }),
                   selected.content.strokeIndices.allSatisfy({ controller.drawing.strokes.indices.contains($0) }) else {
                 clearSelection()
@@ -3345,6 +3412,7 @@ private struct LassoSelectionOverlay: View {
             ),
             rotationRadians: CGFloat(singleElement?.rotationRadians ?? 0)
         )
+        showsTransformControls = false
         requestedSelection = nil
     }
 
@@ -3479,6 +3547,7 @@ private struct LassoSelectionOverlay: View {
                 for point in logicalPath.dropFirst() {
                     path.addLine(to: displayPoint(for: point, in: displaySize))
                 }
+                if liveLassoPath.isEmpty { path.closeSubpath() }
             }
             .stroke(
                 TiyiNoteTheme.lassoBlue,
@@ -3490,11 +3559,36 @@ private struct LassoSelectionOverlay: View {
                 )
             )
             .allowsHitTesting(false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("套索自由选区")
+            .accessibilityIdentifier("lasso-selection-outline")
+            .accessibilityValue(outlineAccessibilityValue)
         }
     }
 
     private var currentOutlinePath: [CGPoint] {
-        liveLassoPath
+        if !liveLassoPath.isEmpty { return liveLassoPath }
+        return showsTransformControls ? [] : selection?.outline?.points ?? []
+    }
+
+    private var outlineAccessibilityValue: String {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--text-interaction-ui-test") {
+            return currentOutlinePath.map { String(format: "%.4f,%.4f", $0.x, $0.y) }.joined(separator: "|")
+        }
+#endif
+        return ""
+    }
+
+    private func selectionLockBadge(for selection: LassoStrokeSelection, in displaySize: CGSize) -> some View {
+        let bounds = selectionDisplayBounds(for: selection, in: displaySize)
+        return Image(systemName: "lock.fill")
+            .font(.system(size: 12, weight: .bold))
+            .foregroundStyle(Color.white)
+            .frame(width: 25, height: 25)
+            .background(TiyiNoteTheme.lassoBlue, in: Circle())
+            .position(x: bounds.midX, y: bounds.midY)
+            .allowsHitTesting(false)
     }
 
     @ViewBuilder
@@ -3513,7 +3607,7 @@ private struct LassoSelectionOverlay: View {
             .frame(width: displayBounds.width, height: displayBounds.height)
             .overlay {
                 Rectangle()
-                    .stroke(TiyiNoteTheme.lassoBlue, lineWidth: vertices == nil ? 1.15 : 0)
+                    .stroke(TiyiNoteTheme.lassoBlue, lineWidth: vertices == nil || selection.outline != nil ? 1.15 : 0)
                     .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
@@ -3523,13 +3617,7 @@ private struct LassoSelectionOverlay: View {
             .accessibilityIdentifier("lasso-selection-box")
 
         if selectionContainsLockedElement {
-            Image(systemName: "lock.fill")
-                .font(.system(size: 12, weight: .bold))
-                .foregroundStyle(Color.white)
-                .frame(width: 25, height: 25)
-                .background(TiyiNoteTheme.lassoBlue, in: Circle())
-                .position(x: displayBounds.midX, y: displayBounds.midY)
-                .allowsHitTesting(false)
+            selectionLockBadge(for: selection, in: displaySize)
         }
 
         if !selectionContainsQuestionElement {
@@ -3541,7 +3629,8 @@ private struct LassoSelectionOverlay: View {
             .allowsHitTesting(false)
         }
 
-        if !selectionContainsLockedElement && !selectionContainsQuestionElement {
+        if !selectionContainsLockedElement && !selectionContainsQuestionElement,
+           selection.outline == nil || showsTransformControls {
             if let vertices {
                 Path { path in
                     path.addLines(vertices.map { displayPoint(for: $0, in: displaySize) })
@@ -3641,7 +3730,8 @@ private struct LassoSelectionOverlay: View {
     // paper's pan must wait for this recognizer, including contacts on the handles.
     private func selectionDragMode(at point: CGPoint, displaySize: CGSize) -> LassoInputDragMode? {
         guard let selection else { return nil }
-        if !selectionContainsLockedElement && !selectionContainsQuestionElement {
+        if !selectionContainsLockedElement && !selectionContainsQuestionElement,
+           selection.outline == nil || showsTransformControls {
             let bounds = selectionDisplayBounds(for: selection, in: displaySize)
             if let vertices = editableSelectionVertices(for: selection, displaySize: displaySize) {
                 if let index = vertices.indices.min(by: {
@@ -3754,9 +3844,16 @@ private struct LassoSelectionOverlay: View {
             edited.setShapeVertices(vertices)
             pageElements[elementIndex] = edited
         }
-        updateSelection(LassoStrokeSelection(content: originalSelection.content,
+        var updated = LassoStrokeSelection(content: originalSelection.content,
             logicalBounds: logicalBounds(for: originalSelection.content, fallback: originalSelection.logicalBounds),
-            rotationRadians: 0))
+            rotationRadians: 0, outline: originalSelection.outline)
+        let source = originalSelection.axisAlignedBounds, destination = updated.axisAlignedBounds
+        if source.width > 0, source.height > 0 {
+            let sx = destination.width / source.width, sy = destination.height / source.height
+            updated.outline = originalSelection.outline?.applying(CGAffineTransform(a: sx, b: 0, c: 0, d: sy,
+                tx: destination.minX - source.minX * sx, ty: destination.minY - source.minY * sy))
+        }
+        updateSelection(updated)
     }
 
     private func updateSelectionDrag(to displayPoint: CGPoint, displaySize: CGSize) -> CGAffineTransform? {
@@ -3787,6 +3884,7 @@ private struct LassoSelectionOverlay: View {
         default: return nil
         }
         liveVertices = vertexDragOrigin?.map { $0.applying(transform) }
+        updated.outline = origin.outline?.applying(transform)
         updateSelection(updated)
         return transform
     }
@@ -3797,6 +3895,7 @@ private struct LassoSelectionOverlay: View {
         transformOriginSelection = nil
         transformOriginElements = [:]
         selection = nil
+        showsTransformControls = false
         feedbackText = nil
         liveLassoPath = [logicalPoint(for: displayPoint, in: displaySize)]
     }
@@ -3842,7 +3941,8 @@ private struct LassoSelectionOverlay: View {
             let region = CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
                 width: (xs.max() ?? 0) - (xs.min() ?? 0), height: (ys.max() ?? 0) - (ys.min() ?? 0))
             guard region.width > 4, region.height > 4 else { selection = nil; return }
-            selection = LassoStrokeSelection(content: content, logicalBounds: region, rotationRadians: 0)
+            selection = LassoStrokeSelection(content: content, logicalBounds: region, rotationRadians: 0,
+                outline: LassoSelectionOutline(points: completedPath))
             return
         }
 
@@ -3857,7 +3957,8 @@ private struct LassoSelectionOverlay: View {
         selection = LassoStrokeSelection(
             content: content,
             logicalBounds: bounds,
-            rotationRadians: CGFloat(singleElement?.rotationRadians ?? 0)
+            rotationRadians: CGFloat(singleElement?.rotationRadians ?? 0),
+            outline: LassoSelectionOutline(points: completedPath)
         )
     }
 
@@ -3893,6 +3994,7 @@ private struct LassoSelectionOverlay: View {
             ),
             rotationRadians: CGFloat(singleElement?.rotationRadians ?? 0)
         )
+        showsTransformControls = false
         return true
     }
 
@@ -3905,6 +4007,7 @@ private struct LassoSelectionOverlay: View {
         controller.cancelStrokeTransform()
         selection = LassoStrokeSelection(content: LassoSelectionContent(strokeIndices: [index]),
                                          logicalBounds: bounds, rotationRadians: 0)
+        showsTransformControls = false
         return true
     }
 
@@ -4017,7 +4120,7 @@ private struct LassoSelectionOverlay: View {
             }
         } else { shapeStyleDraft = nil; return }
         updateSelection(LassoStrokeSelection(content: LassoSelectionContent(elementIDs: [element.id]),
-            logicalBounds: element.logicalBounds, rotationRadians: CGFloat(element.rotationRadians)))
+            logicalBounds: element.logicalBounds, rotationRadians: CGFloat(element.rotationRadians), outline: selection?.outline))
         shapeStyleDraft = nil
     }
 
@@ -4107,8 +4210,10 @@ private struct LassoSelectionOverlay: View {
                 dx: offset.width,
                 dy: offset.height
             ),
-            rotationRadians: selection.rotationRadians
+            rotationRadians: selection.rotationRadians,
+            outline: selection.outline?.applying(CGAffineTransform(translationX: offset.width, y: offset.height))
         )
+        showsTransformControls = false
         showTransientFeedback("已复制一份")
     }
 
@@ -4278,6 +4383,7 @@ private struct LassoSelectionOverlay: View {
         controller.cancelStrokeTransform()
         liveLassoPath = []
         selection = nil
+        showsTransformControls = false
         transformOriginSelection = nil
         transformOriginElements = [:]
         inputDragMode = nil
@@ -4495,6 +4601,10 @@ private struct LassoSelectionOverlay: View {
         guard let selection else { return false }
         let point = logicalPoint(for: displayPoint, in: displaySize)
 
+        if let outline = selection.outline, !showsTransformControls {
+            return outline.contains(point, tolerance: 8 / displayScale(in: displaySize))
+        }
+
         let center = selection.logicalBounds.midPoint
         let cosine = cos(-selection.rotationRadians)
         let sine = sin(-selection.rotationRadians)
@@ -4570,6 +4680,7 @@ private struct LassoSelectionOverlay: View {
             displaySize: displaySize,
             halfWidth: selectionContainsQuestionElement ? (selectedQuestionElement != nil ? 39 : 21)
                 : (selectedEditableTextID != nil || selectedCroppableImageID != nil || selectedEditableShapeID != nil || selectedInkShapeIndex != nil ? 150 : 128)
+                    + (selection.outline != nil ? 18 : 0)
         )
     }
 
@@ -4608,10 +4719,32 @@ private struct LassoSelectionOverlay: View {
 
 }
 
+/// UI-only world coordinates. The contour shares the content's affine transform but never
+/// becomes a PencilKit stroke, an eraser mask, or a persisted document object.
+struct LassoSelectionOutline: Equatable {
+    let points: [CGPoint]
+
+    func applying(_ transform: CGAffineTransform) -> Self {
+        Self(points: points.map { $0.applying(transform) })
+    }
+
+    func contains(_ point: CGPoint, tolerance: CGFloat) -> Bool {
+        guard points.count >= 3 else { return false }
+        let path = CGMutablePath()
+        path.addLines(between: points)
+        path.closeSubpath()
+        if path.contains(point) { return true }
+        guard tolerance > 0 else { return false }
+        return path.copy(strokingWithWidth: tolerance * 2, lineCap: .round, lineJoin: .round,
+            miterLimit: 10).contains(point)
+    }
+}
+
 private struct LassoStrokeSelection: Equatable {
     let content: LassoSelectionContent
     var logicalBounds: CGRect
     var rotationRadians: CGFloat
+    var outline: LassoSelectionOutline? = nil
 
     var axisAlignedBounds: CGRect {
         guard abs(rotationRadians) > 0.0001 else { return logicalBounds }
@@ -4699,6 +4832,9 @@ private struct LassoActionBar: View {
     let canGroup: Bool
     let canUngroup: Bool
     let isLocked: Bool
+    let showsTransformToggle: Bool
+    let isTransforming: Bool
+    let onToggleTransform: () -> Void
     let onEditText: () -> Void
     let onCropImage: () -> Void
     let onEditShape: () -> Void
@@ -4756,6 +4892,14 @@ private struct LassoActionBar: View {
             )
             }
             if showsObjectActions {
+                if showsTransformToggle {
+                    actionButton(title: isTransforming ? "完成" : "调整",
+                        symbol: isTransforming ? "checkmark" : "arrow.up.left.and.arrow.down.right",
+                        tint: canModifySelection ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textTertiary,
+                        isEnabled: canModifySelection, action: onToggleTransform)
+                        .accessibilityLabel(isTransforming ? "完成选区调整" : "缩放或旋转选中内容")
+                        .accessibilityIdentifier("lasso-transform-toggle")
+                }
                 actionButton(
                     title: "复制",
                     symbol: "doc.on.doc",

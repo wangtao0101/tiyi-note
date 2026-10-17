@@ -367,7 +367,7 @@ private struct PenVariantSettingsPopover: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("涂抹删除")
                         .font(.system(size: 14, weight: .semibold))
-                    Text("用笔连续来回划或绕圈涂抹，抬笔删除")
+                    Text("往返涂抹至少三轮，或连续绕圈三圈，抬笔删除")
                         .font(.system(size: 11))
                         .foregroundStyle(Color.black.opacity(0.52))
                 }

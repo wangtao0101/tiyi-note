@@ -201,34 +201,40 @@ private struct TextInteractionUITestHost: View {
         if configuration.token.hasPrefix("library-")
             || configuration.token.hasPrefix("pdf-") {
             let isSearchFixture = configuration.token.hasPrefix("pdf-")
-            let pdfURL = workspace.appendingPathComponent(
-                isSearchFixture ? "UITest Search.pdf" : "UITest PDF.pdf"
-            )
-            let renderer = UIGraphicsPDFRenderer(
-                bounds: CGRect(x: 0, y: 0, width: 612, height: 792)
-            )
-            try! renderer.writePDF(to: pdfURL) { context in
-                context.beginPage()
-                ((isSearchFixture ? "First page searchable text" : "UITest PDF") as NSString).draw(
-                    at: CGPoint(x: 72, y: 96),
-                    withAttributes: [
-                        .font: UIFont.systemFont(ofSize: 28, weight: .semibold),
-                        .foregroundColor: UIColor.black
-                    ]
+            let pdfName = isSearchFixture ? "UITest Search.pdf" : "UITest PDF.pdf"
+            if configuration.reuseExistingWorkspace,
+               let existing = store.documents(in: nil).first(where: { $0.kind == .pdf && $0.title == pdfName }) {
+                workspacePDFDocument = existing
+            } else {
+                let pdfURL = workspace.appendingPathComponent(
+                    pdfName
                 )
-                if isSearchFixture {
+                let renderer = UIGraphicsPDFRenderer(
+                    bounds: CGRect(x: 0, y: 0, width: 612, height: 792)
+                )
+                try! renderer.writePDF(to: pdfURL) { context in
                     context.beginPage()
-                    ("Second page contains NeedleTarget for search verification" as NSString).draw(
+                    ((isSearchFixture ? "First page searchable text" : "UITest PDF") as NSString).draw(
                         at: CGPoint(x: 72, y: 96),
                         withAttributes: [
-                            .font: UIFont.systemFont(ofSize: 24),
+                            .font: UIFont.systemFont(ofSize: 28, weight: .semibold),
                             .foregroundColor: UIColor.black
                         ]
                     )
+                    if isSearchFixture {
+                        context.beginPage()
+                        ("Second page contains NeedleTarget for search verification" as NSString).draw(
+                            at: CGPoint(x: 72, y: 96),
+                            withAttributes: [
+                                .font: UIFont.systemFont(ofSize: 24),
+                                .foregroundColor: UIColor.black
+                            ]
+                        )
+                    }
                 }
+                workspacePDFDocument = try! store.importPDFs(from: [pdfURL]).first
+                try? fileManager.removeItem(at: pdfURL)
             }
-            workspacePDFDocument = try! store.importPDFs(from: [pdfURL]).first
-            try? fileManager.removeItem(at: pdfURL)
         }
         let activeDocumentID = workspacePDFDocument?.id ?? firstDocument.id
         if configuration.token.hasPrefix("library-return-context") {
