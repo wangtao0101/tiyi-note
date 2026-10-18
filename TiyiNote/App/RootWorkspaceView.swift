@@ -351,7 +351,7 @@ struct RootWorkspaceView: View {
                 await cloudSyncCoordinator.setExcludedDocumentIDs(Set(zonesByDocumentID.keys))
             }
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, !cloudKitOperationWasCancelled(error) else { return }
             // Shared-zone discovery is background maintenance. Apple gateway/network failures
             // retry automatically and must not interrupt the user with a collaboration alert.
             if cloudKitTransientRetryDelay(for: error) == nil {

@@ -418,10 +418,16 @@ enum FamilyLibraryInvitation {
             try saveCatalog()
             lastDiscovery = Date()
         } catch {
-            if !(error is CancellationError), cloudKitTransientRetryDelay(for: error) == nil {
-                errorMessage = error.localizedDescription
-            }
+            handleRefreshFailure(error)
         }
+    }
+
+    func handleRefreshFailure(_ error: Error) {
+        // An interrupted discovery must retain cached libraries and pending local edits.
+        // It is normal when SwiftUI removes the view or CloudKit cancels its operation.
+        guard !Task.isCancelled, !cloudKitOperationWasCancelled(error),
+              cloudKitTransientRetryDelay(for: error) == nil else { return }
+        errorMessage = error.localizedDescription
     }
 
     func maintain() async {

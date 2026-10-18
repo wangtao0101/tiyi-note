@@ -419,7 +419,7 @@ actor CloudLibrarySyncCoordinator {
                 try await performSyncPass(isAutomatic: isAutomatic)
             } while needsAnotherPass
             await reportStatus(.succeeded(Date()))
-        } catch is CancellationError {
+        } catch where cloudKitOperationWasCancelled(error) {
             // Pencil input and the editor transition intentionally cancel automatic maintenance.
             // Cancellation is neither an error nor a reason to create another retry.
             await reportStatus(.idle)
@@ -2806,6 +2806,19 @@ actor CloudLibrarySyncCoordinator {
             throw CancellationError()
         }
     }
+}
+
+/// CloudKit async APIs can return CKError.operationCancelled rather than Swift's
+/// CancellationError. A partial failure is cancellation only when every item was cancelled;
+/// mixed permission/schema failures must still be reported.
+func cloudKitOperationWasCancelled(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+    guard let cloudError = error as? CKError else { return false }
+    if cloudError.code == .operationCancelled { return true }
+    guard cloudError.code == .partialFailure,
+          let errors = cloudError.partialErrorsByItemID, !errors.isEmpty else { return false }
+    return errors.values.allSatisfy(cloudKitOperationWasCancelled)
 }
 
 /// CloudKit sometimes wraps an Apple gateway 5xx in `serverRejectedRequest` (code 15).
