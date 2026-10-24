@@ -37,21 +37,33 @@ extension Notification.Name {
     public func configureWordConverter(_ converter: @escaping WordConverter) { wordConverter = converter; supportsWordImport = true }
     @Published private(set) var supportsWordImport = false
     private let stagingDirectory: URL
-    let libraries: DocumentLibraryManager
+    private var loadedLibraries: DocumentLibraryManager?
+    private let makeLibraries: @MainActor () -> DocumentLibraryManager
+    var hasLoadedLibraries: Bool { loadedLibraries != nil }
+    var libraries: DocumentLibraryManager {
+        if let loadedLibraries { return loadedLibraries }
+        let manager = makeLibraries()
+        loadedLibraries = manager
+        return manager
+    }
     var store: DrawingDocumentStore { libraries.currentStore }
 
-    public func maintainLibraries() async { await libraries.maintain() }
+    /// A global share receiver must not mount document libraries just to check for maintenance.
+    public func maintainLibraries() async { await loadedLibraries?.maintain() }
 
     public convenience init() {
         self.init(stagingDirectory: URL.applicationSupportDirectory.appendingPathComponent("TiyiIncomingPDFs", isDirectory: true))
     }
 
-    init(stagingDirectory: URL, store: DrawingDocumentStore? = nil, libraries: DocumentLibraryManager? = nil) {
+    init(stagingDirectory: URL, store: DrawingDocumentStore? = nil, libraries: DocumentLibraryManager? = nil,
+         makeLibraries: (@MainActor () -> DocumentLibraryManager)? = nil) {
         self.stagingDirectory = stagingDirectory
-        self.libraries = libraries ?? DocumentLibraryManager(
+        loadedLibraries = libraries
+        self.makeLibraries = makeLibraries ?? { DocumentLibraryManager(
             directory: store == nil ? nil : stagingDirectory.deletingLastPathComponent()
                 .appendingPathComponent(stagingDirectory.lastPathComponent + "-libraries"),
-            defaults: store == nil ? .standard : UserDefaults(suiteName: UUID().uuidString)!, personalStore: store)
+            defaults: store == nil ? .standard : UserDefaults(suiteName: UUID().uuidString)!, personalStore: store,
+            requiresPresentationForMaintenance: true) }
         do {
             try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
             pending = try FileManager.default.contentsOfDirectory(at: stagingDirectory, includingPropertiesForKeys: nil)

@@ -69,6 +69,10 @@ struct LibraryBrowserView: View {
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
+    @StateObject private var organization = LibraryOrganizationController()
+    // Start collapsed even for installations that used the earlier always-visible tree.
+    // From here on, remember the user's explicit choice to show or hide it.
+    @AppStorage("library.directoryTree.expandedByUser") private var showsDirectoryTree = false
     @State private var isSelecting = false
     @State private var selectedFolderIDs = Set<String>()
     @State private var selectedDocumentIDs = Set<String>()
@@ -90,7 +94,40 @@ struct LibraryBrowserView: View {
     @AppStorage("library.sortOrder") private var sortRawValue = LibrarySortOrder.modifiedNewest.rawValue
 
     var body: some View {
-        libraryPage(folderID: scope == .documents ? browsingState.selectedFolderID : nil)
+        libraryWorkspace
+        .environmentObject(organization)
+        .onAppear { configureOrganization() }
+        .onDisappear {
+            organization.onDidMove = nil
+            organization.onExternalDrop = nil
+            organization.drag = nil
+        }
+        .onChange(of: ObjectIdentifier(documentStore)) { _, _ in configureOrganization() }
+        .onChange(of: organization.errorMessage) { _, message in
+            if let message { errorMessage = message; organization.errorMessage = nil }
+        }
+        .overlay(alignment: .bottom) {
+            if let feedback = organization.feedback {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("已移动 \(feedback.count) 项到 \(feedback.title)")
+                        .font(.subheadline).lineLimit(2)
+                    HStack(spacing: 20) {
+                        Button("撤销") { organization.undo() }
+                        Button("查看位置") {
+                            browsingState.searchText = ""
+                            browsingState.kindFilter = .all
+                            navigate(to: feedback.destination)
+                            organization.feedback = nil
+                        }
+                        Spacer(minLength: 0)
+                        Button { organization.feedback = nil } label: { Image(systemName: "xmark") }
+                            .accessibilityLabel("关闭移动提示")
+                    }.font(.subheadline)
+                }
+                .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .padding(16).padding(.bottom, isSelecting ? 60 : 0)
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("document-library")
         .accessibilityLabel("文稿")
@@ -131,15 +168,14 @@ struct LibraryBrowserView: View {
                 documentStore: documentStore,
                 request: request,
                 onMove: { destinationID in
-                    try documentStore.moveItems(
-                        folderIDs: request.folderIDs,
-                        documentIDs: request.documentIDs,
-                        to: destinationID,
-                        causalContext: request.collaborationContext
+                    try organization.move(
+                        LibraryMoveSelection(folderIDs: request.folderIDs, documentIDs: request.documentIDs, store: documentStore),
+                        to: destinationID, context: request.collaborationContext
                     )
                     finishSelecting()
                 }
             )
+            .environmentObject(organization)
         }
         .sheet(item: $copyRequest) { request in
             LibraryCopySheet(
@@ -196,6 +232,40 @@ struct LibraryBrowserView: View {
         }
     }
 
+    @ViewBuilder private var libraryWorkspace: some View {
+#if targetEnvironment(macCatalyst)
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                if showsDirectoryTree {
+                    LibraryMacDirectoryPane(documentStore: documentStore,
+                                            selectedID: browsingState.selectedFolderID,
+                                            availableWidth: geometry.size.width) { id in
+                        browsingState.searchText = ""
+                        navigate(to: id)
+                    }
+                }
+                libraryPage(folderID: scope == .documents ? browsingState.selectedFolderID : nil)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+#else
+        libraryPage(folderID: scope == .documents ? browsingState.selectedFolderID : nil)
+#endif
+    }
+
+    private func configureOrganization() {
+        organization.configure(store: documentStore)
+        organization.onDidMove = finishSelecting
+        let dropLibraryID = imports?.libraries.selectedID
+        organization.onExternalDrop = { result, folderID in
+            switch result {
+            case .success(let staged):
+                importDroppedPDFs(staged, into: folderID, libraryID: dropLibraryID)
+            case .failure(let error): present(error)
+            }
+        }
+    }
+
     private var scope: LibraryScope { browsingState.scope }
 
     private func libraryPage(folderID: String?) -> some View {
@@ -239,14 +309,6 @@ struct LibraryBrowserView: View {
             },
             onEmptyTrash: {
                 destructiveAction = .emptyTrash
-            },
-            onDropPDFs: { result in
-                switch result {
-                case .success(let staged):
-                    importDroppedPDFs(staged, into: folderID)
-                case .failure(let error):
-                    present(error)
-                }
             },
             canEditDocument: canEditDocument,
             libraryPicker: libraryPicker
@@ -298,6 +360,15 @@ struct LibraryBrowserView: View {
 
     private var libraryNavigationBar: some View {
         HStack(spacing: 10) {
+#if targetEnvironment(macCatalyst)
+            Button { showsDirectoryTree.toggle() } label: {
+                LibraryToolbarIcon(symbol: "sidebar.left", isActive: showsDirectoryTree, frameSize: 32)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showsDirectoryTree ? "收起目录树" : "显示目录树")
+            .accessibilityIdentifier("library-directory-tree-toggle")
+            .help(showsDirectoryTree ? "收起目录树" : "显示目录树")
+#endif
             LibraryInlineSearchField(text: $browsingState.searchText, fillsAvailableWidth: isCompact)
 
             Spacer(minLength: 0)
@@ -429,12 +500,22 @@ struct LibraryBrowserView: View {
         folderIDs: Set<String>,
         documentIDs: Set<String>
     ) {
+        let selection = LibraryMoveSelection(folderIDs: folderIDs, documentIDs: documentIDs, store: documentStore)
+        let title = selection.count == 1
+            ? (selection.folderIDs.first.flatMap { documentStore.folder(withID: $0)?.title }
+                ?? selection.documentIDs.first.flatMap { documentStore.document(withID: $0)?.title } ?? "已选 1 项")
+            : "已选 \(selection.count) 项"
+        var initialFolderID = scope == .documents ? browsingState.selectedFolderID : nil
+        if selection.count == 1 {
+            if let id = selection.folderIDs.first { initialFolderID = documentStore.folder(withID: id)?.parentID }
+            else if let id = selection.documentIDs.first { initialFolderID = documentStore.document(withID: id)?.parentID }
+        }
+        if let id = initialFolderID, selection.folderIDs.contains(id) { initialFolderID = documentStore.folder(withID: id)?.parentID }
         moveRequest = LibraryMoveRequest(
-            folderIDs: folderIDs,
-            documentIDs: documentIDs,
+            folderIDs: selection.folderIDs, documentIDs: selection.documentIDs,
+            initialFolderID: initialFolderID, itemTitle: title,
             collaborationContext: documentStore.libraryMoveCollaborationContext(
-                folderIDs: folderIDs,
-                documentIDs: documentIDs
+                folderIDs: selection.folderIDs, documentIDs: selection.documentIDs
             )
         )
     }
@@ -455,15 +536,12 @@ struct LibraryBrowserView: View {
                 causalContext: request.collaborationContext
             )
         } else {
-            let folder = try documentStore.createFolder(
+            _ = try documentStore.createFolder(
                 named: title,
                 in: request.parentID,
                 color: color,
                 icon: icon
             )
-            if isCompact {
-                navigate(to: folder.id)
-            }
         }
     }
 
@@ -554,19 +632,19 @@ struct LibraryBrowserView: View {
     }
 
     @discardableResult
-    private func importDroppedPDFs(_ staged: StagedDocumentDrop, into folderID: String?) -> Bool {
-        guard PlatformCapabilities.current.canImportPDF, scope == .documents else { return false }
+    private func importDroppedPDFs(_ staged: StagedDocumentDrop, into folderID: String?, libraryID: String? = nil) -> Bool {
+        guard PlatformCapabilities.current.canImportPDF, documentStore.libraryWriteAllowed else { return false }
         let fileExtension = staged.url.pathExtension
         let isPDF = fileExtension.caseInsensitiveCompare("pdf") == .orderedSame
         let isEditableDocument = fileExtension.caseInsensitiveCompare("tiyinote") == .orderedSame
         guard isPDF || isEditableDocument || ImageDocumentSource.accepts(staged.url) || (imports?.supportsWordImport == true && ["doc", "docx"].contains(fileExtension.lowercased())) else { return false }
-        importDocuments([staged.url], into: folderID, stagedDrop: staged)
+        importDocuments([staged.url], into: folderID, stagedDrop: staged, libraryID: libraryID)
         return true
     }
 
-    private func importDocuments(_ urls: [URL], into folderID: String?, stagedDrop: StagedDocumentDrop? = nil) {
+    private func importDocuments(_ urls: [URL], into folderID: String?, stagedDrop: StagedDocumentDrop? = nil, libraryID: String? = nil) {
         let accessedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
-        let importLibraryID = imports?.libraries.selectedID
+        let importLibraryID = libraryID ?? imports?.libraries.selectedID
         Task {
             defer {
                 for url in accessedURLs { url.stopAccessingSecurityScopedResource() }
@@ -767,12 +845,10 @@ private struct LibraryContentPage: View {
     let onImportPDF: () -> Void
     let onScanDocument: () -> Void
     let onEmptyTrash: () -> Void
-    let onDropPDFs: (Result<StagedDocumentDrop, Error>) -> Void
     let canEditDocument: (String) -> Bool
     var libraryPicker: AnyView? = nil
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @State private var isDropTargeted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -784,82 +860,7 @@ private struct LibraryContentPage: View {
             }
         }
         .background(TiyiNoteTheme.chrome)
-        .overlay {
-            if isDropTargeted, PlatformCapabilities.current.canImportPDF {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(TiyiNoteTheme.selectionBackground)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 22, style: .continuous)
-                            .stroke(
-                                TiyiNoteTheme.selectionBorder,
-                                style: StrokeStyle(lineWidth: 2, dash: [8, 5])
-                            )
-                    }
-                    .padding(12)
-                    .allowsHitTesting(false)
-            }
-        }
-        .onDrop(
-            of: [
-                UTType.fileURL.identifier,
-                UTType.pdf.identifier,
-                UTType.tiyiNoteDocument.identifier,
-                UTType.tiyiWordDoc.identifier,
-                UTType.tiyiWordDocx.identifier,
-                UTType.image.identifier
-            ],
-            isTargeted: $isDropTargeted,
-            perform: receiveDroppedFiles
-        )
-    }
-
-    /// Copy provider-owned files inside the callback, before scheduling any asynchronous work.
-    private func receiveDroppedFiles(_ providers: [NSItemProvider]) -> Bool {
-        guard PlatformCapabilities.current.canImportPDF else { return false }
-        let fileProviders = providers.filter {
-            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.tiyiNoteDocument.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.tiyiWordDoc.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.tiyiWordDocx.identifier)
-                || $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
-        }
-        guard !fileProviders.isEmpty else { return false }
-
-        let dropHandler = onDropPDFs
-        for provider in fileProviders {
-            let type = [UTType.tiyiNoteDocument, .pdf, .tiyiWordDocx, .tiyiWordDoc, .png, .jpeg, .heic, .tiff, .image].first {
-                provider.hasItemConformingToTypeIdentifier($0.identifier)
-            }
-            if let type {
-                provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
-                    let result = Result {
-                        guard let url else { throw error ?? CocoaError(.fileReadUnknown) }
-                        var name = provider.suggestedName ?? url.lastPathComponent
-                        if URL(fileURLWithPath: name).pathExtension.isEmpty, let ext = type.preferredFilenameExtension {
-                            name += "." + ext
-                        }
-                        return try StagedDocumentDrop(copying: url, suggestedName: name)
-                    }
-                    DispatchQueue.main.async { dropHandler(result) }
-                }
-            } else {
-                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
-                    let result = Result {
-                        let url: URL?
-                        if let data = item as? Data {
-                            url = URL(dataRepresentation: data, relativeTo: nil)
-                        } else {
-                            url = item as? URL
-                        }
-                        guard let url else { throw error ?? CocoaError(.fileReadUnknown) }
-                        return try StagedDocumentDrop(copying: url)
-                    }
-                    DispatchQueue.main.async { dropHandler(result) }
-                }
-            }
-        }
-        return true
+        .libraryDropTarget(folderID, enabled: scope == .documents)
     }
 
     private var pageHeader: some View {
@@ -878,7 +879,8 @@ private struct LibraryContentPage: View {
                     LibraryBreadcrumbs(
                         folderID: folderID,
                         folders: documentStore.folders,
-                        onNavigate: onNavigate
+                        onNavigate: onNavigate,
+                        supportsDrop: scope == .documents
                     )
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -895,7 +897,8 @@ private struct LibraryContentPage: View {
                         LibraryBreadcrumbs(
                             folderID: folderID,
                             folders: documentStore.folders,
-                            onNavigate: onNavigate
+                            onNavigate: onNavigate,
+                        supportsDrop: scope == .documents
                         )
                         .frame(minWidth: 0, maxWidth: .infinity)
                     } else {
@@ -1111,6 +1114,11 @@ private struct LibraryContentPage: View {
                             onTap: { tapFolder(folder) },
                             onCommand: onCommand
                         )
+                        .libraryDraggable(
+                            folderIDs: selectedFolderIDs.contains(folder.id) ? selectedFolderIDs : [folder.id],
+                            documentIDs: selectedFolderIDs.contains(folder.id) ? selectedDocumentIDs : [],
+                            enabled: scope != .trash, title: folder.title)
+                        .libraryDropTarget(folder.id, enabled: scope != .trash)
                         .id(folder.id)
                     }
                     ForEach(documents) { document in
@@ -1129,6 +1137,10 @@ private struct LibraryContentPage: View {
                             onTap: { tapDocument(document) },
                             onCommand: onCommand
                         )
+                        .libraryDraggable(
+                            folderIDs: selectedDocumentIDs.contains(document.id) ? selectedFolderIDs : [],
+                            documentIDs: selectedDocumentIDs.contains(document.id) ? selectedDocumentIDs : [document.id],
+                            enabled: scope != .trash, title: document.title)
                         .id(document.id)
                     }
                 }
@@ -1152,6 +1164,11 @@ private struct LibraryContentPage: View {
                             onTap: { tapFolder(folder) },
                             onCommand: onCommand
                         )
+                        .libraryDraggable(
+                            folderIDs: selectedFolderIDs.contains(folder.id) ? selectedFolderIDs : [folder.id],
+                            documentIDs: selectedFolderIDs.contains(folder.id) ? selectedDocumentIDs : [],
+                            enabled: scope != .trash, title: folder.title)
+                        .libraryDropTarget(folder.id, enabled: scope != .trash)
                         .id(folder.id)
                     }
                     ForEach(documents) { document in
@@ -1170,6 +1187,10 @@ private struct LibraryContentPage: View {
                             onTap: { tapDocument(document) },
                             onCommand: onCommand
                         )
+                        .libraryDraggable(
+                            folderIDs: selectedDocumentIDs.contains(document.id) ? selectedFolderIDs : [],
+                            documentIDs: selectedDocumentIDs.contains(document.id) ? selectedDocumentIDs : [document.id],
+                            enabled: scope != .trash, title: document.title)
                         .id(document.id)
                     }
                 }
@@ -1862,10 +1883,11 @@ private struct SelectionIndicator: View {
     }
 }
 
-private struct LibraryBreadcrumbs: View {
+struct LibraryBreadcrumbs: View {
     let folderID: String?
     let folders: [LibraryFolder]
     let onNavigate: (String?) -> Void
+    var supportsDrop = false
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -1873,6 +1895,7 @@ private struct LibraryBreadcrumbs: View {
                 Button("文稿") { onNavigate(nil) }
                     .foregroundStyle(TiyiNoteTheme.textSecondary)
                     .frame(height: 36)
+                    .libraryDropTarget(nil, enabled: supportsDrop)
                 ForEach(LibraryPath.ancestors(endingAt: folderID, folders: folders)) { folder in
                     Image(systemName: "chevron.right")
                         .font(.system(size: 9, weight: .medium))
@@ -1881,6 +1904,7 @@ private struct LibraryBreadcrumbs: View {
                         .fontWeight(folder.id == folderID ? .semibold : .regular)
                         .foregroundStyle(folder.id == folderID ? TiyiNoteTheme.textPrimary : TiyiNoteTheme.textSecondary)
                         .frame(height: 36)
+                        .libraryDropTarget(folder.id, enabled: supportsDrop)
                 }
             }
             .font(.system(size: 14))
@@ -1915,22 +1939,20 @@ private struct LibrarySelectionBar: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(TiyiNoteTheme.textPrimary)
                 Spacer()
-                if scope == .trash {
-                    Button("恢复", action: onRestore)
-                        .disabled(selectionCount == 0)
-                    Button("永久删除", role: .destructive, action: onDeletePermanently)
-                        .disabled(selectionCount == 0)
-                } else {
-                    Button("复制到…", action: onCopy)
-                        .disabled(!canCopy)
-                        .accessibilityIdentifier("library-copy-selected")
-                    Button("移动", action: onMove)
-                        .disabled(selectionCount == 0)
-                    Button("删除", role: .destructive, action: onTrash)
-                        .disabled(selectionCount == 0)
-                }
-                Button("取消", action: onCancel)
+                Button("取消", action: onCancel).frame(minHeight: 36)
             }
+            HStack(spacing: 20) {
+                if scope == .trash {
+                    Button("恢复", action: onRestore).disabled(selectionCount == 0)
+                    Button("永久删除", role: .destructive, action: onDeletePermanently).disabled(selectionCount == 0)
+                } else {
+                    Button("复制到…", action: onCopy).disabled(!canCopy)
+                        .accessibilityIdentifier("library-copy-selected")
+                    Button("移动", action: onMove).disabled(selectionCount == 0)
+                    Button("删除", role: .destructive, action: onTrash).disabled(selectionCount == 0)
+                }
+                Spacer(minLength: 0)
+            }.frame(minHeight: 40)
             if includesFolders && scope != .trash {
                 Text("复制仅支持文件，请取消勾选文件夹")
                     .font(.system(size: 12))
@@ -2614,81 +2636,6 @@ private struct LibraryCopyButtonStyle: ButtonStyle {
     }
 }
 
-private struct LibraryMoveSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject var documentStore: DrawingDocumentStore
-    let request: LibraryMoveRequest
-    let onMove: (String?) throws -> Void
-
-    @State private var errorMessage: String?
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Button {
-                    move(to: nil)
-                } label: {
-                    Label("文稿根目录", systemImage: "books.vertical.fill")
-                }
-                ForEach(destinations) { folder in
-                    Button {
-                        move(to: folder.id)
-                    } label: {
-                        Label {
-                            Text(LibraryPath.pathTitle(for: folder.id, folders: documentStore.folders))
-                                .lineLimit(2)
-                        } icon: {
-                            Image(systemName: folder.icon.systemImageName)
-                                .foregroundStyle(folder.color.swiftUIColor)
-                        }
-                    }
-                }
-                if let errorMessage {
-                    Text(errorMessage).foregroundStyle(TiyiNoteTheme.danger)
-                }
-            }
-            .navigationTitle("移动到")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
-    }
-
-    private var destinations: [LibraryFolder] {
-        documentStore.folders
-            .filter { folder in
-                guard folder.trashedAt == nil,
-                      !request.folderIDs.contains(folder.id) else { return false }
-                return !request.folderIDs.contains(where: { movingID in
-                    LibraryPath.isDescendant(
-                        folder.id,
-                        of: movingID,
-                        folders: documentStore.folders
-                    )
-                })
-            }
-            .sorted {
-                LibraryPath.pathTitle(for: $0.id, folders: documentStore.folders)
-                    .localizedStandardCompare(
-                        LibraryPath.pathTitle(for: $1.id, folders: documentStore.folders)
-                    ) == .orderedAscending
-            }
-    }
-
-    private func move(to destinationID: String?) {
-        do {
-            try onMove(destinationID)
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-}
-
 private struct CloudSyncStatusSheet: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     let onSyncNow: () async -> Void
@@ -2985,10 +2932,12 @@ private struct CanvasCreationRequest: Identifiable {
     let parentID: String?
 }
 
-private struct LibraryMoveRequest: Identifiable {
+struct LibraryMoveRequest: Identifiable {
     let id = UUID()
     let folderIDs: Set<String>
     let documentIDs: Set<String>
+    let initialFolderID: String?
+    let itemTitle: String
     let collaborationContext: LibraryMoveCollaborationContext
 }
 
@@ -3036,13 +2985,13 @@ private enum LibraryDestructiveAction {
     }
 }
 
-private struct LibraryFolderNode: Identifiable {
+struct LibraryFolderNode: Identifiable {
     let folder: LibraryFolder
     let children: [LibraryFolderNode]?
     var id: String { folder.id }
 }
 
-private enum LibraryPath {
+enum LibraryPath {
     static func tree(from folders: [LibraryFolder]) -> [LibraryFolderNode] {
         buildNodes(parentID: nil, folders: folders, visited: [])
     }
@@ -3106,7 +3055,7 @@ private enum LibraryPath {
     }
 }
 
-private extension LibraryFolderColor {
+extension LibraryFolderColor {
     var swiftUIColor: Color {
         switch self {
         case .blue: Color(red: 0.20, green: 0.58, blue: 0.96)

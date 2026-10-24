@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D1A600000000000000000001 /* LibraryOrganization.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A600000000000000000002 /* LibraryOrganization.swift */; };
 		CA7200000000000000000001 /* CanvasImageImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7200000000000000000002 /* CanvasImageImportView.swift */; };
 		CA7100000000000000000001 /* CanvasImageImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7100000000000000000002 /* CanvasImageImport.swift */; };
 		DCA000000000000000000001 /* PDFRasterDiskCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA000000000000000000002 /* PDFRasterDiskCache.swift */; };
@@ -72,6 +73,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		D1A600000000000000000002 /* LibraryOrganization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryOrganization.swift; sourceTree = "<group>"; };
 		CA7200000000000000000002 /* CanvasImageImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasImageImportView.swift; sourceTree = "<group>"; };
 		CA7100000000000000000002 /* CanvasImageImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasImageImport.swift; sourceTree = "<group>"; };
 		DCA000000000000000000002 /* PDFRasterDiskCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFRasterDiskCache.swift; sourceTree = "<group>"; };
@@ -229,6 +231,7 @@
 				CA7200000000000000000002 /* CanvasImageImportView.swift */,
 				DCC000000000000000000006 /* DocumentScanView.swift */,
 				100000000000000000000220 /* LibraryBrowserView.swift */,
+				D1A600000000000000000002 /* LibraryOrganization.swift */,
 				100000000000000000000205 /* CanvasScreen.swift */,
 				100000000000000000000230 /* CanvasViewport.swift */,
 				100000000000000000000234 /* CanvasHitGeometry.swift */,
@@ -411,6 +414,7 @@
 				100000000000000000000116 /* LibraryModels.swift in Sources */,
 				100000000000000000000117 /* RootWorkspaceView.swift in Sources */,
 				100000000000000000000118 /* LibraryBrowserView.swift in Sources */,
+				D1A600000000000000000001 /* LibraryOrganization.swift in Sources */,
 				DCC000000000000000000005 /* DocumentScanView.swift in Sources */,
 				DCC000000000000000000003 /* DocumentScanCamera.swift in Sources */,
 				DCC000000000000000000001 /* DocumentScanStore.swift in Sources */,

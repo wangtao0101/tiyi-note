@@ -142,6 +142,7 @@ enum FamilyLibraryInvitation {
     @Published private(set) var isRefreshing = false
     private let directory: URL
     private let defaults: UserDefaults
+    private let requiresPresentationForMaintenance: Bool
     private var personalStore: DrawingDocumentStore?
     private var stores: [String: DrawingDocumentStore] = [:]
     private var coordinators: [String: CloudLibrarySyncCoordinator] = [:]
@@ -160,9 +161,11 @@ enum FamilyLibraryInvitation {
         let libraries: [DocumentLibrary]
     }
 
-    init(directory: URL? = nil, defaults: UserDefaults = .standard, personalStore: DrawingDocumentStore? = nil) {
+    init(directory: URL? = nil, defaults: UserDefaults = .standard, personalStore: DrawingDocumentStore? = nil,
+         requiresPresentationForMaintenance: Bool = false) {
         self.directory = directory ?? URL.applicationSupportDirectory.appendingPathComponent("TiyiNote/Libraries", isDirectory: true)
         self.defaults = defaults
+        self.requiresPresentationForMaintenance = requiresPresentationForMaintenance
         self.personalStore = personalStore
         do {
             try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
@@ -363,6 +366,7 @@ enum FamilyLibraryInvitation {
     /// Discovery must finish successfully before absence can revoke a cached mount. Transient errors
     /// preserve every library, including its pending offline edits and selected/default state.
     func refresh(force: Bool = false) async {
+        guard discoveryIsAllowed else { return }
         guard FamilyLibraryCloud.isAvailable else { return }
         guard !isRefreshing else {
             needsForcedRefresh = needsForcedRefresh || force
@@ -381,17 +385,19 @@ enum FamilyLibraryInvitation {
             let container = try FamilyLibraryCloud.container()
             let requestGeneration = accountGeneration
             let account = try await container.userRecordID().recordName
-            guard requestGeneration == accountGeneration else { return }
+            guard requestGeneration == accountGeneration, discoveryIsAllowed, !Task.isCancelled else { return }
             await bindAccount(account)
-            guard accountID == account else { return }
+            guard accountID == account, discoveryIsAllowed, !Task.isCancelled else { return }
             let generation = accountGeneration
             async let owned = container.privateCloudDatabase.allRecordZones()
             async let shared = container.sharedCloudDatabase.allRecordZones()
             let groups = try await [(true, owned), (false, shared)]
+            guard discoveryIsAllowed, !Task.isCancelled else { return }
             var found: [DocumentLibrary] = []
             for (isOwner, zones) in groups {
                 let database = isOwner ? container.privateCloudDatabase : container.sharedCloudDatabase
                 for zone in zones {
+                    guard discoveryIsAllowed, !Task.isCancelled else { return }
                     guard let id = FamilyLibraryCloud.libraryID(zoneName: zone.zoneID.zoneName) else { continue }
                     let record: CKRecord
                     do {
@@ -412,9 +418,9 @@ enum FamilyLibraryInvitation {
                         accountID: account, zoneName: zone.zoneID.zoneName, ownerName: zone.zoneID.ownerName, isOwner: isOwner))
                 }
             }
-            guard generation == accountGeneration, !Task.isCancelled else { return }
+            guard generation == accountGeneration, discoveryIsAllowed, !Task.isCancelled else { return }
             await replaceFamilies(found, expectedGeneration: generation)
-            guard generation == accountGeneration else { return }
+            guard generation == accountGeneration, discoveryIsAllowed, !Task.isCancelled else { return }
             try saveCatalog()
             lastDiscovery = Date()
         } catch {
@@ -441,8 +447,13 @@ enum FamilyLibraryInvitation {
     }
 
     private var maintenanceIsAllowed: Bool {
+        guard discoveryIsAllowed else { return false }
         let loaded = Array(stores.values) + [personalStore].compactMap { $0 }
         return !loaded.contains { $0.isDrawingInteractionActive || $0.hasPendingLocalDrawingPersistence || $0.hadRecentDrawingInteraction(within: 10) }
+    }
+
+    private var discoveryIsAllowed: Bool {
+        !requiresPresentationForMaintenance || isPresentingDocuments
     }
 
     @discardableResult

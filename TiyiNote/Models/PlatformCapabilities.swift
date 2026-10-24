@@ -19,9 +19,8 @@ struct PlatformCapabilities {
             supportsDocumentTabs: true
         )
 #else
-        let isPad = UIDevice.current.userInterfaceIdiom == .pad
         return PlatformCapabilities(
-            canManageLibrary: isPad,
+            canManageLibrary: true,
             canImportPDF: true,
             canScanDocuments: true,
             canEditAnnotations: true,

@@ -5,7 +5,9 @@ final class TiyiNoteQuestionUITests: XCTestCase {
         let app = launch("question-canvas")
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 10))
+#if !targetEnvironment(macCatalyst)
         canvas.pinch(withScale: 1.3, velocity: 1)
+#endif
         let before = canvas.value as? String
         circle(in: app, canvas: canvas)
         XCTAssertFalse(app.buttons["question-cancel"].exists)

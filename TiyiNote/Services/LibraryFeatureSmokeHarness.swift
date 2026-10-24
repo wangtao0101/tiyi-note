@@ -55,6 +55,135 @@ private enum LibraryFeatureSmokeHarness {
         }
     }
 
+    private static func validateLibraryOrganization(token: String) async throws {
+        let workspace = FileManager.default.temporaryDirectory.appendingPathComponent("organization-" + token)
+        let defaultsKey = "com.tiyi.note.organization." + token
+        let defaults = UserDefaults(suiteName: defaultsKey)!
+        let recentKey = "library.move.recent." + workspace.standardizedFileURL.path
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            defaults.removePersistentDomain(forName: defaultsKey)
+            UserDefaults.standard.removeObject(forKey: recentKey)
+        }
+        let store = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: workspace, includesBundledSamples: false)
+        let a = try store.createFolder(named: "A", in: nil)
+        let b = try store.createFolder(named: "B", in: nil)
+        let nested = try store.createFolder(named: "Nested", in: a.id)
+        let destination = try store.createFolder(named: "Destination", in: b.id)
+        let first = try store.createCanvas(named: "First", in: a.id, backgroundStyle: .blank, backgroundColor: .white)
+        let second = try store.createCanvas(named: "Second", in: nested.id, backgroundStyle: .blank, backgroundColor: .white)
+        let third = try store.createCanvas(named: "Third", in: nil, backgroundStyle: .blank, backgroundColor: .white)
+        let controller = LibraryOrganizationController()
+        controller.configure(store: store)
+        func selection(_ documents: Set<String> = [], folders: Set<String> = []) -> LibraryMoveSelection {
+            LibraryMoveSelection(folderIDs: folders, documentIDs: documents, store: store)
+        }
+        let subtree = selection([second.id], folders: [a.id, nested.id])
+        guard subtree.folderIDs == [a.id], subtree.documentIDs.isEmpty,
+              !subtree.allows(a.id, in: store), !subtree.allows(nested.id, in: store),
+              !selection([first.id]).allows(a.id, in: store) else {
+            throw SmokeError.validationFailed("子树选择或无效目标校验失败")
+        }
+        let documents: Set<String> = [first.id, second.id, third.id]
+        try controller.move(selection(documents), to: destination.id,
+                            context: store.libraryMoveCollaborationContext(folderIDs: [], documentIDs: documents))
+        guard documents.allSatisfy({ store.document(withID: $0)?.parentID == destination.id }),
+              LibraryOrganizationController.recentDestinations(store: store).first?.parentID == destination.id else {
+            throw SmokeError.validationFailed("跨目录批量移动或最近目标失败")
+        }
+        controller.undo()
+        guard store.document(withID: first.id)?.parentID == a.id,
+              store.document(withID: second.id)?.parentID == nested.id,
+              store.document(withID: third.id)?.parentID == nil,
+              controller.errorMessage == nil else {
+            throw SmokeError.validationFailed("跨目录移动无法原子撤销到多个原位置")
+        }
+        // Same-title conflict rolls back every member of the batch.
+        _ = try store.createCanvas(named: "First", in: destination.id, backgroundStyle: .blank, backgroundColor: .white)
+        do {
+            try store.moveItems(folderIDs: [], documentIDs: [first.id, second.id], to: destination.id)
+            throw SmokeError.validationFailed("同名冲突未被拒绝")
+        } catch LibraryStoreError.nameConflict { }
+        guard store.document(withID: first.id)?.parentID == a.id,
+              store.document(withID: second.id)?.parentID == nested.id else {
+            throw SmokeError.validationFailed("冲突导致批量移动部分生效")
+        }
+        do {
+            try store.moveItems(folderIDs: [a.id], documentIDs: [], to: nested.id)
+            throw SmokeError.validationFailed("目录循环未被拒绝")
+        } catch LibraryStoreError.folderCycle { }
+        // Moving into root checks root names rather than the item's old parent.
+        _ = try store.createCanvas(named: "Second", in: nil, backgroundStyle: .blank, backgroundColor: .white)
+        do {
+            try store.moveItems(folderIDs: [], documentIDs: [second.id], to: nil)
+            throw SmokeError.validationFailed("根目录同名冲突未被拒绝")
+        } catch LibraryStoreError.nameConflict { }
+        // A failed undo must leave every item at the destination.
+        try controller.move(selection([second.id, third.id]), to: destination.id,
+                            context: store.libraryMoveCollaborationContext(folderIDs: [], documentIDs: [second.id, third.id]))
+        _ = try store.createCanvas(named: "Second", in: nested.id, backgroundStyle: .blank, backgroundColor: .white)
+        controller.undo()
+        guard controller.errorMessage != nil,
+              store.document(withID: second.id)?.parentID == destination.id,
+              store.document(withID: third.id)?.parentID == destination.id else {
+            throw SmokeError.validationFailed("撤销冲突未保持事务原子性")
+        }
+        controller.errorMessage = nil
+        // Subsequent changes to parent revisions must not be overwritten by Undo.
+        try controller.move(selection([third.id]), to: b.id,
+                            context: store.libraryMoveCollaborationContext(folderIDs: [], documentIDs: [third.id]))
+        try store.moveItems(folderIDs: [], documentIDs: [third.id], to: a.id)
+        controller.undo()
+        guard controller.errorMessage != nil, store.document(withID: third.id)?.parentID == a.id else {
+            throw SmokeError.validationFailed("撤销覆盖了后续目录修改")
+        }
+        controller.errorMessage = nil
+        let provider = controller.beginDrag(folderIDs: [a.id], documentIDs: [])
+        guard provider.hasItemConformingToTypeIdentifier(LibraryOrganizationController.itemType.identifier),
+              !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
+              !controller.acceptsMove(to: nested.id), controller.acceptsMove(to: b.id) else {
+            throw SmokeError.validationFailed("内部拖动类型或目标校验失败")
+        }
+        let providerToken: Data? = await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: LibraryOrganizationController.itemType.identifier) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+        // SwiftUI may request another representation while hovering: each provider must keep
+        // its own original selection/context instead of relying on the most recent callback.
+        _ = controller.beginDrag(folderIDs: [], documentIDs: [third.id])
+        guard let captured = controller.consumeDrag(providerToken), captured.selection.folderIDs == [a.id] else {
+            throw SmokeError.validationFailed("拖动凭据未保留原始选择")
+        }
+        _ = controller.beginDrag(folderIDs: [a.id], documentIDs: [])
+        store.setLibraryWriteAllowed(false)
+        guard !controller.acceptsMove(to: b.id) else { throw SmokeError.validationFailed("只读文稿库接受移动") }
+        var rejectedReadOnlyMove = false
+        do { try store.moveItems(folderIDs: [], documentIDs: [third.id], to: nil) }
+        catch { rejectedReadOnlyMove = true }
+        guard rejectedReadOnlyMove else { throw SmokeError.validationFailed("只读文稿库允许移动") }
+        store.setLibraryWriteAllowed(true)
+        // Exercise the real external-provider staging path, then import into a noncurrent folder.
+        guard let source = Bundle.main.url(forResource: "Congruence", withExtension: "pdf") else {
+            throw SmokeError.validationFailed("缺少 PDF 导入样本")
+        }
+        let external = NSItemProvider(contentsOf: source)!
+        let result: Result<StagedDocumentDrop, Error> = await withCheckedContinuation { continuation in
+            let accepted = LibraryFileDrop.receive([external]) { continuation.resume(returning: $0) }
+            if !accepted { continuation.resume(returning: .failure(CocoaError(.fileReadUnknown))) }
+        }
+        let staged = try result.get()
+        let imported = try await store.importPDFsInBackground(from: [staged.url], into: destination.id, openAfterImport: false)
+        guard imported.count == 1, store.document(withID: imported[0].id)?.parentID == destination.id else {
+            throw SmokeError.validationFailed("外部拖入未保存到指定目录")
+        }
+        let reloaded = DrawingDocumentStore(userDefaults: defaults, workspaceDirectoryOverride: workspace, includesBundledSamples: false)
+        guard reloaded.document(withID: third.id)?.parentID == a.id,
+              reloaded.document(withID: imported[0].id)?.parentID == destination.id else {
+            throw SmokeError.validationFailed("移动或导入结果未持久化")
+        }
+    }
+
     static func run(configuration: LibraryFeatureSmokeConfiguration) async -> String {
         let token = configuration.token
         let fileManager = FileManager.default
@@ -68,6 +197,12 @@ private enum LibraryFeatureSmokeHarness {
         defaults.removePersistentDomain(forName: defaultsName)
 
         do {
+            try await validateLibraryOrganization(token: token)
+            if token.hasPrefix("organization-only-") {
+                try validateStaleFolderEditorMerge(token: token)
+                logger.info("TIYI_LIBRARY_SMOKE_PASS token=\(token, privacy: .public)")
+                return "目录移动、撤销与拖入验证通过"
+            }
             try await validateCanvasPhotoImport()
             if token.hasPrefix("photo-only-") {
                 logger.info("TIYI_LIBRARY_SMOKE_PASS token=\(token, privacy: .public)")

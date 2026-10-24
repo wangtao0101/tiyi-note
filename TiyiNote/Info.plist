@@ -57,6 +57,14 @@
 	<array>
 		<dict>
 			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string></array>
+			<key>UTTypeDescription</key>
+			<string>Tiyi 资料库项目</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.tiyi.note.library-item</string>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
 			<array>
 				<string>public.data</string>
 			</array>

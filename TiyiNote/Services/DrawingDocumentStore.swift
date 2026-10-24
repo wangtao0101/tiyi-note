@@ -1440,6 +1440,8 @@ final class DrawingDocumentStore: ObservableObject {
         signalLocalCloudChange()
     }
 
+    var libraryOrganizationKey: String { workspaceDirectory.standardizedFileURL.path }
+
     /// Moves all selected items as one registry transaction. No partial move is persisted.
     func moveItems(
         folderIDs: Set<String>,
@@ -1447,55 +1449,76 @@ final class DrawingDocumentStore: ObservableObject {
         to parentID: String?,
         causalContext: LibraryMoveCollaborationContext? = nil
     ) throws {
-        guard !folderIDs.isEmpty || !documentIDs.isEmpty else { return }
-        try validateParentFolder(parentID)
+        try moveItemPlacements(
+            folders: Dictionary(uniqueKeysWithValues: folderIDs.map { ($0, LibraryItemPlacement(parentID: parentID)) }),
+            documents: Dictionary(uniqueKeysWithValues: documentIDs.map { ($0, LibraryItemPlacement(parentID: parentID)) }),
+            causalContext: causalContext
+        )
+    }
 
-        let movingFolders = try folderIDs.map { folderID -> LibraryFolder in
-            guard let folder = folders.first(where: { $0.id == folderID }) else {
-                throw LibraryStoreError.folderNotFound(folderID)
+    /// Also used by undo: multiple original parents are restored in one transaction.
+    func moveItemPlacements(
+        folders folderPlacements: [String: LibraryItemPlacement],
+        documents documentPlacements: [String: LibraryItemPlacement],
+        causalContext: LibraryMoveCollaborationContext? = nil
+    ) throws {
+        guard !folderPlacements.isEmpty || !documentPlacements.isEmpty else { return }
+        for placement in Array(folderPlacements.values) + Array(documentPlacements.values) {
+            try validateParentFolder(placement.parentID)
+        }
+        let movingFolders = try folderPlacements.keys.map { id -> LibraryFolder in
+            guard let folder = folders.first(where: { $0.id == id }) else {
+                throw LibraryStoreError.folderNotFound(id)
             }
             guard folder.trashedAt == nil else { throw LibraryStoreError.itemIsInTrash }
             return folder
         }
-        let movingDocuments = try documentIDs.map { documentID -> LibraryDocumentMetadata in
-            guard let document = documentMetadata.first(where: { $0.id == documentID }) else {
-                throw LibraryStoreError.documentNotFound(documentID)
+        let movingDocuments = try documentPlacements.keys.map { id -> LibraryDocumentMetadata in
+            guard let document = documentMetadata.first(where: { $0.id == id }) else {
+                throw LibraryStoreError.documentNotFound(id)
             }
             guard document.trashedAt == nil else { throw LibraryStoreError.itemIsInTrash }
             return document
         }
-
-        if let parentID {
-            for folderID in folderIDs {
-                guard parentID != folderID,
-                      !descendantFolderIDs(of: folderID).contains(parentID) else {
-                    throw LibraryStoreError.folderCycle
+        // Validate the final graph and sibling names before emitting any collaboration stamps.
+        let proposedFolders = folders.map { folder in
+            var value = folder
+            if let placement = folderPlacements[value.id] { value.parentID = placement.parentID }
+            return value
+        }
+        let byID = Dictionary(uniqueKeysWithValues: proposedFolders.map { ($0.id, $0) })
+        for folder in movingFolders {
+            var visited: Set<String> = [folder.id]
+            var parent = byID[folder.id]?.parentID
+            while let id = parent {
+                guard visited.insert(id).inserted else { throw LibraryStoreError.folderCycle }
+                parent = byID[id]?.parentID
+            }
+        }
+        let destinations = Set(Array(folderPlacements.values) + Array(documentPlacements.values))
+        for destination in destinations {
+            var occupied = Set<String>()
+            for folder in proposedFolders where folder.trashedAt == nil && folder.parentID == destination.parentID {
+                guard occupied.insert(normalizedComparisonKey(folder.title)).inserted else {
+                    throw LibraryStoreError.nameConflict(folder.title)
+                }
+            }
+            for document in documentMetadata where document.trashedAt == nil {
+                let finalParent: String?
+                if let placement = documentPlacements[document.id] { finalParent = placement.parentID }
+                else { finalParent = document.parentID }
+                if finalParent == destination.parentID {
+                    guard occupied.insert(normalizedComparisonKey(document.title)).inserted else {
+                        throw LibraryStoreError.nameConflict(document.title)
+                    }
                 }
             }
         }
-
-        var occupied = Set<String>()
-        for folder in folders where folder.parentID == parentID
-            && folder.trashedAt == nil
-            && !folderIDs.contains(folder.id) {
-            occupied.insert(normalizedComparisonKey(folder.title))
-        }
-        for document in documentMetadata where document.parentID == parentID
-            && document.trashedAt == nil
-            && !documentIDs.contains(document.id) {
-            occupied.insert(normalizedComparisonKey(document.title))
-        }
-        for title in (movingFolders.map(\.title) + movingDocuments.map(\.title)).sorted() {
-            guard occupied.insert(normalizedComparisonKey(title)).inserted else {
-                throw LibraryStoreError.nameConflict(title)
-            }
-        }
-
         let changedFolderIDs = Set(movingFolders.compactMap {
-            $0.parentID != parentID ? $0.id : nil
+            $0.parentID != folderPlacements[$0.id]!.parentID ? $0.id : nil
         })
         let changedDocumentIDs = Set(movingDocuments.compactMap {
-            $0.parentID != parentID ? $0.id : nil
+            $0.parentID != documentPlacements[$0.id]!.parentID ? $0.id : nil
         })
         guard !changedFolderIDs.isEmpty || !changedDocumentIDs.isEmpty else { return }
 
@@ -1530,7 +1553,7 @@ final class DrawingDocumentStore: ObservableObject {
                 let stamp = nextMoveStamp(
                     observedContext: causalContext?.folderParents[folderID]
                 )
-                updatedFolders[index].parentID = parentID
+                updatedFolders[index].parentID = folderPlacements[folderID]!.parentID
                 updatedFolders[index].parentRevision = stamp
                 updatedFolders[index].modifiedAt = stamp.createdAt
             }
@@ -1541,7 +1564,7 @@ final class DrawingDocumentStore: ObservableObject {
                 let stamp = nextMoveStamp(
                     observedContext: causalContext?.documentParents[documentID]
                 )
-                updatedMetadata[index].parentID = parentID
+                updatedMetadata[index].parentID = documentPlacements[documentID]!.parentID
                 updatedMetadata[index].parentRevision = stamp
                 updatedMetadata[index].modifiedAt = stamp.createdAt
             }
@@ -8668,19 +8691,60 @@ extension DrawingDocumentStore {
         }
     }
 
-    func sparseAssetsToDownload() throws -> [SparseLibraryEntry] {
+    func sparseAssetsToDownload() async throws -> [SparseLibraryEntry] {
+        try Task.checkCancellation()
         let db = try sparseDatabase()
+        let databaseURL = registryURL
+        let fileManager = fileManager
         let documentIDs = Set(documentMetadata.map(\.id))
-        let covers = try db.entries(kind: "cover").filter { entry in
-            documentIDs.contains(entry.documentID) && !entry.pending
-                && (entry.filePath.map { !fileManager.fileExists(atPath: $0) } ?? true)
-        }
         let requested = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
-        let assets = try db.entries(kind: "asset").filter {
-            (requested.contains($0.id) || openDocumentIDs.contains($0.documentID))
-                && ($0.filePath.map { !fileManager.fileExists(atPath: $0) } ?? true)
+        let opened = Set(openDocumentIDs)
+        var missing: [SparseLibraryEntry] = []
+        for kind in ["cover", "asset"] {
+            if kind == "cover", documentIDs.isEmpty { continue }
+            if kind == "asset", requested.isEmpty && opened.isEmpty { continue }
+            var cursor: String?
+            while true {
+                try Task.checkCancellation()
+                // Statements finish before suspension: no background reader holds a lock against
+                // a live drawing save or the single-file workspace rollback journal.
+                let batch = try db.unresolvedDownloadCandidates(kind: kind, afterID: cursor, limit: 64)
+                guard let last = batch.last else { break }
+                cursor = last.id
+                let candidates = batch.filter { entry in
+                    kind == "cover" ? documentIDs.contains(entry.documentID) && !entry.pending
+                        : requested.contains(entry.id) || opened.contains(entry.documentID)
+                }
+                if !candidates.isEmpty {
+                    let scan = Task.detached(priority: .utility) {
+                        try SparseLibraryDatabase.missingDownloads(in: candidates,
+                            databaseURL: databaseURL, fileManager: fileManager)
+                    }
+                    let result = try await withTaskCancellationHandler {
+                        try await scan.value
+                    } onCancel: { scan.cancel() }
+                    try Task.checkCancellation()
+                    // A download/edit may finish while the file scan is suspended. Do not queue
+                    // a stale revision or acknowledge a newer local cover by downloading it.
+                    for entry in result {
+                        if let current = try db.entry(kind: entry.kind, id: entry.id, resolvingFilePath: false),
+                           current.revision == entry.revision, current.payload == entry.payload {
+                            missing.append(entry)
+                        }
+                    }
+                }
+                await Task.yield()
+                if batch.count < 64 { break }
+            }
         }
-        return covers + assets
+        try Task.checkCancellation()
+        let currentDocuments = Set(documentMetadata.map(\.id))
+        let currentRequested = Set(userDefaults.stringArray(forKey: "sparse.requestedPDFs") ?? [])
+        let currentOpened = Set(openDocumentIDs)
+        return missing.filter { entry in
+            entry.kind == "cover" ? currentDocuments.contains(entry.documentID)
+                : currentRequested.contains(entry.id) || currentOpened.contains(entry.documentID)
+        }
     }
 
     func requestSparsePDF(_ documentID: String) {

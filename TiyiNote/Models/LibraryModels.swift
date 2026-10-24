@@ -473,3 +473,8 @@ enum LibraryStoreError: LocalizedError, Equatable {
         }
     }
 }
+
+/// An explicit wrapper preserves root (nil) destinations in per-item move/undo dictionaries.
+struct LibraryItemPlacement: Hashable {
+    let parentID: String?
+}

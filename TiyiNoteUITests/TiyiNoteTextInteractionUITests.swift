@@ -3,6 +3,73 @@ import ObjectiveC
 import UIKit
 
 final class TiyiNoteTextInteractionUITests: XCTestCase {
+#if targetEnvironment(macCatalyst)
+    func testLibraryMacTreeDropMovesFileAndCanUndo() throws {
+        let app = launchIsolatedApp(prefix: "library-mac-tree-drop")
+        let source = app.staticTexts["UITest One"].firstMatch
+        XCTAssertTrue(source.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.otherElements["library-directory-tree"].exists)
+        app.buttons["library-directory-tree-toggle"].tap()
+        createFolder(named: "Tree Archive", in: app)
+        let target = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "library-tree-folder-")).firstMatch
+        XCTAssertTrue(target.waitForExistence(timeout: 3))
+        // Use actual pointer events: accessibility activation can bypass a view that
+        // incorrectly intercepts mouse clicks over the SwiftUI folder button.
+        target.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.5)).tap()
+        XCTAssertTrue(source.waitForNonExistence(timeout: 4))
+        app.buttons["library-tree-root"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(source.waitForExistence(timeout: 4))
+        source.press(forDuration: 0.5, thenDragTo: target)
+        XCTAssertTrue(source.waitForNonExistence(timeout: 5), app.debugDescription)
+        tapHittableButton("撤销", in: app)
+        XCTAssertTrue(source.waitForExistence(timeout: 4))
+    }
+#endif
+
+    func testLibraryMovePickerNavigateCreateConfirmAndUndo() throws {
+        let app = launchIsolatedApp(prefix: "library-organization-picker")
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 8))
+        createFolder(named: "归档目标", in: app)
+        tapHittableButton("选择项目", in: app)
+        app.staticTexts["UITest One"].firstMatch.tap()
+        tapHittableButton("移动", in: app)
+        XCTAssertTrue(app.navigationBars["移动到"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["move-confirm"].isEnabled)
+        tapHittableButton("归档目标", in: app)
+        XCTAssertTrue(app.navigationBars["移动到"].exists, "选择目录不应立即移动")
+        XCTAssertTrue(app.buttons["move-confirm"].isEnabled)
+        tapHittableButton("新建目标文件夹", in: app)
+        let field = app.alerts.textFields["文件夹名称"]
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap(); field.typeText("子目录")
+        app.alerts.buttons["创建"].tap()
+        XCTAssertTrue(app.buttons["子目录"].waitForExistence(timeout: 3))
+        app.buttons["move-confirm"].tap()
+        XCTAssertTrue(app.navigationBars["移动到"].waitForNonExistence(timeout: 4))
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForNonExistence(timeout: 3))
+        tapHittableButton("撤销", in: app)
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.waitForExistence(timeout: 4))
+        tapHittableButton("选择项目", in: app)
+        app.staticTexts["UITest One"].firstMatch.tap()
+        tapHittableButton("移动", in: app)
+        XCTAssertTrue(app.buttons["move-recent-destination"].waitForExistence(timeout: 3))
+        tapHittableButton("取消", in: app)
+        XCTAssertTrue(app.staticTexts["UITest One"].firstMatch.exists)
+    }
+
+    func testLibraryInternalDropMovesFileIntoFolderAndCanUndo() throws {
+        let app = launchIsolatedApp(prefix: "library-organization-drop")
+        let source = app.staticTexts["UITest One"].firstMatch
+        XCTAssertTrue(source.waitForExistence(timeout: 8))
+        createFolder(named: "拖动目标", in: app)
+        let target = app.staticTexts["拖动目标"].firstMatch
+        XCTAssertTrue(target.waitForExistence(timeout: 3))
+        source.press(forDuration: 0.5, thenDragTo: target)
+        XCTAssertTrue(source.waitForNonExistence(timeout: 5), app.debugDescription)
+        tapHittableButton("撤销", in: app)
+        XCTAssertTrue(source.waitForExistence(timeout: 4))
+    }
+
     func testCanvasImageSourcePickersCancelWithoutInsertion() throws {
         let app = launchIsolatedApp(prefix: "canvas-photo-source-picker")
         XCTAssertTrue(app.buttons["插入图片"].waitForExistence(timeout: 5))
@@ -5310,6 +5377,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         tapHittableButton("移动到", in: app)
         XCTAssertTrue(app.navigationBars["移动到"].waitForExistence(timeout: 3))
         tapHittableButton("归档", in: app)
+        tapHittableButton("移动到此处", in: app)
         XCTAssertTrue(app.navigationBars["移动到"].waitForNonExistence(timeout: 4))
 
         app.staticTexts["归档"].firstMatch.tap()
@@ -5481,6 +5549,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         tapHittableButton("移动", in: app)
         XCTAssertTrue(app.navigationBars["移动到"].waitForExistence(timeout: 3))
         tapHittableButton("批量归档", in: app)
+        tapHittableButton("移动到此处", in: app)
         XCTAssertTrue(app.navigationBars["移动到"].waitForNonExistence(timeout: 4))
         XCTAssertFalse(app.staticTexts["UITest One"].exists)
         XCTAssertFalse(app.staticTexts["UITest Two"].exists)

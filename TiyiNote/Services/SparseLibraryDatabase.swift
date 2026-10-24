@@ -115,14 +115,51 @@ final class SparseLibraryDatabase {
         }
     }
 
-    func entry(kind: String, id: String) throws -> SparseLibraryEntry? {
+    func entry(kind: String, id: String, resolvingFilePath: Bool = true) throws -> SparseLibraryEntry? {
         // Index lookup, including for immutable operation deduplication.
         try statement("SELECT kind,id,document_id,page_id,payload,file_path,revision,pending FROM entries WHERE kind=? AND id=?") { s in
             bind(kind, s, 1); bind(id, s, 2)
             guard sqlite3_step(s) == SQLITE_ROW else { return nil }
             return SparseLibraryEntry(kind: string(s, 0), id: string(s, 1), documentID: string(s, 2),
-                pageID: string(s, 3), payload: data(s, 4), filePath: sqlite3_column_type(s, 5) == SQLITE_NULL ? nil : resolvedPath(string(s, 5)),
+                pageID: string(s, 3), payload: data(s, 4), filePath: sqlite3_column_type(s, 5) == SQLITE_NULL ? nil
+                    : resolvingFilePath ? resolvedPath(string(s, 5)) : string(s, 5),
                 revision: sqlite3_column_int64(s, 6), pending: sqlite3_column_int(s, 7) != 0)
+        }
+    }
+
+    /// Keyset pagination keeps automatic asset discovery from monopolizing MainActor. Return
+    /// stored paths unchanged here; resolving old container paths can touch the filesystem and
+    /// belongs to the background scan, not the SQLite connection's actor.
+    func unresolvedDownloadCandidates(kind: String, afterID: String?, limit: Int) throws -> [SparseLibraryEntry] {
+        precondition(kind == "cover" || kind == "asset")
+        let cursor = afterID == nil ? "" : " AND id>?"
+        return try statement("SELECT kind,id,document_id,page_id,payload,file_path,revision,pending FROM entries WHERE kind=?\(cursor) ORDER BY id LIMIT ?") { s in
+            bind(kind, s, 1)
+            if let afterID { bind(afterID, s, 2) }
+            sqlite3_bind_int(s, afterID == nil ? 2 : 3, Int32(limit))
+            var result: [SparseLibraryEntry] = []
+            while true {
+                let status = sqlite3_step(s)
+                if status == SQLITE_DONE { break }
+                guard status == SQLITE_ROW else { throw failure() }
+                result.append(SparseLibraryEntry(kind: string(s, 0), id: string(s, 1),
+                    documentID: string(s, 2), pageID: string(s, 3), payload: data(s, 4),
+                    filePath: sqlite3_column_type(s, 5) == SQLITE_NULL ? nil : string(s, 5),
+                    revision: sqlite3_column_int64(s, 6), pending: sqlite3_column_int(s, 7) != 0))
+            }
+            return result
+        }
+    }
+
+    nonisolated static func missingDownloads(in entries: [SparseLibraryEntry], databaseURL: URL,
+                                            fileManager: FileManager) throws -> [SparseLibraryEntry] {
+        try entries.compactMap { entry in
+            try Task.checkCancellation()
+            let path = entry.filePath.flatMap { resolvedPath($0, databaseURL: databaseURL) }
+            guard path.map({ !fileManager.fileExists(atPath: $0) }) ?? true else { return nil }
+            return SparseLibraryEntry(kind: entry.kind, id: entry.id, documentID: entry.documentID,
+                pageID: entry.pageID, payload: entry.payload, filePath: path,
+                revision: entry.revision, pending: entry.pending)
         }
     }
 
@@ -164,8 +201,12 @@ final class SparseLibraryDatabase {
     /// Legacy rebasing matches the complete library suffix, never just a PDF filename, so files
     /// belonging to another account/library cannot be mistaken for this library's assets.
     private func storedPath(_ path: String) -> String {
+        Self.storedPath(path, databaseURL: url)
+    }
+
+    nonisolated private static func storedPath(_ path: String, databaseURL: URL) -> String {
         guard path.hasPrefix("/") else { return path }
-        let root = url.deletingLastPathComponent().standardizedFileURL.path + "/"
+        let root = databaseURL.deletingLastPathComponent().standardizedFileURL.path + "/"
         let absolute = URL(fileURLWithPath: path).standardizedFileURL.path
         if absolute.hasPrefix(root) { return String(absolute.dropFirst(root.count)) }
         let marker = "/Library/Application Support/"
@@ -180,10 +221,14 @@ final class SparseLibraryDatabase {
     }
 
     private func resolvedPath(_ path: String) -> String? {
-        let stored = storedPath(path)
+        Self.resolvedPath(path, databaseURL: url)
+    }
+
+    nonisolated private static func resolvedPath(_ path: String, databaseURL: URL) -> String? {
+        let stored = storedPath(path, databaseURL: databaseURL)
         if stored.hasPrefix("/") { return stored }
         guard !stored.isEmpty, !stored.split(separator: "/").contains("..") else { return nil }
-        return url.deletingLastPathComponent().appendingPathComponent(stored).standardizedFileURL.path
+        return databaseURL.deletingLastPathComponent().appendingPathComponent(stored).standardizedFileURL.path
     }
 
     private func migrateLocalPaths() throws {
