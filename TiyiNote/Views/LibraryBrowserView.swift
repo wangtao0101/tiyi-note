@@ -57,6 +57,19 @@ final class LibraryBrowserState {
     @ObservationIgnored var scrollOffset: CGFloat = 0
 }
 
+private struct LibraryTopStripPlacement: ViewModifier {
+    let usesScrollEdge: Bool
+    let header: AnyView
+    @ViewBuilder func body(content: Content) -> some View {
+        if usesScrollEdge {
+            content.safeAreaBar(edge: .top, spacing: 0) { header }
+                .scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            content.safeAreaInset(edge: .top, spacing: 0) { header }
+        }
+    }
+}
+
 struct LibraryBrowserView: View {
     @ObservedObject var documentStore: DrawingDocumentStore
     @Bindable var browsingState: LibraryBrowserState
@@ -66,6 +79,7 @@ struct LibraryBrowserView: View {
     let canEditDocument: (String) -> Bool
     var libraryPicker: AnyView? = nil
     var imports: TiyiPDFImportController? = nil
+    var libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)? = nil
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -315,9 +329,7 @@ struct LibraryBrowserView: View {
         )
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .navigationBar)
-        .safeAreaInset(edge: .top, spacing: 0) {
-            libraryNavigationBar
-        }
+        .modifier(LibraryTopStripPlacement(usesScrollEdge: libraryHeader != nil, header: AnyView(libraryNavigationBar)))
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if isSelecting {
                 LibrarySelectionBar(
@@ -358,7 +370,35 @@ struct LibraryBrowserView: View {
         horizontalSizeClass == .compact
     }
 
-    private var libraryNavigationBar: some View {
+    @ViewBuilder private var libraryNavigationBar: some View {
+        if let libraryHeader {
+            libraryHeader(headerContext)
+        } else {
+            defaultLibraryNavigationBar
+        }
+    }
+
+    private var headerContext: TiyiDocumentLibraryHeaderContext {
+        let folder = scope == .documents ? browsingState.selectedFolderID.flatMap { documentStore.folder(withID: $0) } : nil
+        let onBack: (() -> Void)? = folder.map { folder in { navigate(to: folder.parentID) } }
+#if targetEnvironment(macCatalyst)
+        let onToggleDirectory: (() -> Void)? = { showsDirectoryTree.toggle() }
+#else
+        let onToggleDirectory: (() -> Void)? = nil
+#endif
+        return TiyiDocumentLibraryHeaderContext(
+            title: folder?.title ?? (scope == .documents ? "文稿" : scope.title),
+            searchText: $browsingState.searchText,
+            onBack: onBack,
+            onToggleDirectory: onToggleDirectory,
+            isDirectoryVisible: showsDirectoryTree,
+            cloudStatusSymbol: cloudStatusSymbol,
+            cloudStatusLabel: cloudStatusLabel,
+            onShowCloudStatus: { showsCloudSyncStatus = true }
+        )
+    }
+
+    private var defaultLibraryNavigationBar: some View {
         HStack(spacing: 10) {
 #if targetEnvironment(macCatalyst)
             Button { showsDirectoryTree.toggle() } label: {

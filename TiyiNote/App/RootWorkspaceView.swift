@@ -19,6 +19,7 @@ struct RootWorkspaceView: View {
     let onExit: (() -> Void)?
     let librarySidebar: AnyView?
     let libraryContainer: ((AnyView) -> AnyView)?
+    let libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)?
     let imports: TiyiPDFImportController?
     let libraryManager: DocumentLibraryManager?
     let libraryID: String
@@ -44,6 +45,7 @@ struct RootWorkspaceView: View {
         onExit: (() -> Void)? = nil,
         librarySidebar: AnyView? = nil,
         libraryContainer: ((AnyView) -> AnyView)? = nil,
+        libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)? = nil,
         imports: TiyiPDFImportController? = nil,
         libraryManager: DocumentLibraryManager? = nil,
         libraryID: String = DocumentLibrary.personalID
@@ -52,6 +54,7 @@ struct RootWorkspaceView: View {
         self.onExit = onExit
         self.librarySidebar = librarySidebar
         self.libraryContainer = libraryContainer
+        self.libraryHeader = libraryHeader
         self.imports = imports
         self.libraryManager = libraryManager
         self.libraryID = libraryID
@@ -247,7 +250,8 @@ struct RootWorkspaceView: View {
             onOpenDocument: openDocument,
             canEditDocument: canEditDocument,
             libraryPicker: libraryManager.map { AnyView(DocumentLibraryPicker(manager: $0)) },
-            imports: imports
+            imports: imports,
+            libraryHeader: libraryHeader
         )
     }
 

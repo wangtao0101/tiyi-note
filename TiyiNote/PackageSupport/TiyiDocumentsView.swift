@@ -1,5 +1,17 @@
 import SwiftUI
 
+/// A host can restyle the library's top strip without owning its files or editor.
+public struct TiyiDocumentLibraryHeaderContext {
+    public let title: String
+    public let searchText: Binding<String>
+    public let onBack: (() -> Void)?
+    public let onToggleDirectory: (() -> Void)?
+    public let isDirectoryVisible: Bool
+    public let cloudStatusSymbol: String
+    public let cloudStatusLabel: String
+    public let onShowCloudStatus: () -> Void
+}
+
 /// The public entry point used by the Tiyi app. The document implementation stays private to
 /// this package so it can evolve without leaking the original standalone app's internal model.
 public struct TiyiDocumentsView: View {
@@ -8,13 +20,16 @@ public struct TiyiDocumentsView: View {
     private let onExit: () -> Void
     private let librarySidebar: AnyView?
     private let libraryContainer: ((AnyView) -> AnyView)?
+    private let libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)?
 
-    public init(onExit: @escaping () -> Void, imports: TiyiPDFImportController? = nil) {
+    public init(onExit: @escaping () -> Void, imports: TiyiPDFImportController? = nil,
+                libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)? = nil) {
         _libraries = StateObject(wrappedValue: imports?.libraries ?? DocumentLibraryManager())
         self.imports = imports
         self.onExit = onExit
         librarySidebar = nil
         libraryContainer = nil
+        self.libraryHeader = libraryHeader
     }
 
     /// The host app's navigation is mounted only beside the library. Opening a document removes
@@ -23,6 +38,7 @@ public struct TiyiDocumentsView: View {
     public init<Sidebar: View>(
         onExit: @escaping () -> Void,
         imports: TiyiPDFImportController? = nil,
+        libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)? = nil,
         @ViewBuilder librarySidebar: () -> Sidebar
     ) {
         _libraries = StateObject(wrappedValue: imports?.libraries ?? DocumentLibraryManager())
@@ -30,6 +46,7 @@ public struct TiyiDocumentsView: View {
         self.onExit = onExit
         self.librarySidebar = AnyView(librarySidebar())
         libraryContainer = nil
+        self.libraryHeader = libraryHeader
     }
 
     /// A phone host can supply its drawer around the library only. The editor is rendered
@@ -37,6 +54,7 @@ public struct TiyiDocumentsView: View {
     public init<LibraryContainer: View>(
         onExit: @escaping () -> Void,
         imports: TiyiPDFImportController? = nil,
+        libraryHeader: ((TiyiDocumentLibraryHeaderContext) -> AnyView)? = nil,
         @ViewBuilder libraryContainer: @escaping (AnyView) -> LibraryContainer
     ) {
         _libraries = StateObject(wrappedValue: imports?.libraries ?? DocumentLibraryManager())
@@ -44,6 +62,7 @@ public struct TiyiDocumentsView: View {
         self.onExit = onExit
         librarySidebar = nil
         self.libraryContainer = { AnyView(libraryContainer($0)) }
+        self.libraryHeader = libraryHeader
     }
 
     public var body: some View {
@@ -53,6 +72,7 @@ public struct TiyiDocumentsView: View {
             onExit: onExit,
             librarySidebar: librarySidebar,
             libraryContainer: libraryContainer,
+            libraryHeader: libraryHeader,
             imports: imports,
             libraryManager: libraries,
             libraryID: libraries.selectedID
