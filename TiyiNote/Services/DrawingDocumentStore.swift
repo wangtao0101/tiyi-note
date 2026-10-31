@@ -8051,7 +8051,7 @@ final class DrawingDocumentStore: ObservableObject {
         in rect: CGRect,
         context: CGContext
     ) {
-        let lineWidth = max(0.5, payload.lineWidth)
+        let lineWidth = payload.strokeWidth
         let path = payload.path(in: rect, displayScale: 1)
         if let fill = payload.fillColorHex,
            ![.line, .arrow].contains(payload.kind) {

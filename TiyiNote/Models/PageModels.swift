@@ -342,6 +342,13 @@ struct PageShapePayload: Codable, Hashable, Sendable {
     // Optional so documents saved before vertex editing keep their default shape.
     var vertices: [PageShapeVertex]? = nil
 
+    /// Keep fractional ink widths in page coordinates across display and export.
+    var strokeWidth: CGFloat { lineWidth.isFinite ? max(0.001, CGFloat(lineWidth)) : 1 }
+
+    func renderedStrokeWidth(displayScale: CGFloat) -> CGFloat {
+        strokeWidth * max(displayScale, 0.0001)
+    }
+
     init(
         kind: PageShapeKind,
         strokeColorHex: String = "#111111FF",

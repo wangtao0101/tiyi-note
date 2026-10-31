@@ -2831,6 +2831,7 @@ private struct PageShapeEditorSheet: View {
     @Binding var fillColor: InkPaletteColor
     @Binding var lineWidth: Double
     @Binding var isDashed: Bool
+    var lineWidthRange: ClosedRange<Double> = 1...20
     let onCancel: () -> Void
     let onSave: () -> Void
 
@@ -2841,7 +2842,8 @@ private struct PageShapeEditorSheet: View {
                     colorPicker(selection: $strokeColor, prefix: "shape-stroke-color")
                     HStack {
                         Text("粗细")
-                        Slider(value: $lineWidth, in: 1...20, step: 0.5)
+                        Slider(value: $lineWidth, in: lineWidthRange,
+                               step: lineWidthRange.lowerBound < 1 ? 0.1 : 0.5)
                             .accessibilityIdentifier("shape-line-width")
                         Text(String(format: "%.1f", lineWidth))
                             .monospacedDigit()
@@ -2925,7 +2927,9 @@ private struct SelectionShapeStyleEditor: View {
         PageShapeEditorSheet(strokeColor: Binding(get: { stroke }, set: { stroke = $0; didChangeStroke = true }),
                              fillEnabled: $fillEnabled,
                              fillColor: Binding(get: { fill }, set: { fill = $0; didChangeFill = true }),
-                             lineWidth: $width, isDashed: $dashed, onCancel: onCancel) {
+                             lineWidth: $width, isDashed: $dashed,
+                             lineWidthRange: min(0.1, original.lineWidth)...max(20, original.lineWidth),
+                             onCancel: onCancel) {
             var updated = original
             if didChangeStroke { updated.strokeColorHex = stroke.rgbaHex }
             updated.lineWidth = width
@@ -2999,7 +3003,7 @@ private struct PageShapeElementView: View {
                 path,
                 with: .color(Color(uiColor: .tiyiColor(payload.strokeColorHex))),
                 style: StrokeStyle(
-                    lineWidth: max(1, CGFloat(payload.lineWidth) * displayScale),
+                    lineWidth: payload.renderedStrokeWidth(displayScale: displayScale),
                     lineCap: .round,
                     lineJoin: .round,
                     dash: payload.isDashed ? [7 * displayScale, 5 * displayScale] : []
@@ -5435,7 +5439,7 @@ enum LassoSnapshotRenderer {
         context: CGContext
     ) {
         context.setStrokeColor(UIColor.tiyiColor(payload.strokeColorHex).cgColor)
-        context.setLineWidth(CGFloat(payload.lineWidth))
+        context.setLineWidth(payload.strokeWidth)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.setLineDash(

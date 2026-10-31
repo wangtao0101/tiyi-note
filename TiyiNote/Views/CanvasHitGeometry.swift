@@ -32,7 +32,7 @@ extension PageShapePayload {
             return vertices.map { CGPoint(x: bounds.minX + $0.x * bounds.width,
                                           y: bounds.minY + $0.y * bounds.height) }
         }
-        let inset = max(CGFloat(lineWidth), 1 / max(displayScale, 0.0001)) / 2
+        let inset = strokeWidth / 2
         let rect = bounds.insetBy(dx: min(inset, bounds.width / 2), dy: min(inset, bounds.height / 2))
         switch kind {
         case .line, .arrow:
@@ -52,8 +52,7 @@ extension PageShapePayload {
 
     func path(in bounds: CGRect, displayScale: CGFloat) -> CGPath {
         let scale = max(displayScale, 0.0001)
-        let rect = bounds.insetBy(dx: max(CGFloat(lineWidth), 1 / scale) / 2,
-                                 dy: max(CGFloat(lineWidth), 1 / scale) / 2)
+        let rect = bounds.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2)
         let path = CGMutablePath()
         if kind == .ellipse, let vertices, vertices.count >= 8,
            vertices.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) {
@@ -128,7 +127,7 @@ extension CanvasPageElement {
         var width: CGFloat = 0
         var fillsInterior = includesInterior
         if case .shape(let shape) = payload {
-            width = max(CGFloat(shape.lineWidth), 1 / max(displayScale, 0.0001))
+            width = shape.strokeWidth
             fillsInterior = (includesInterior || shape.fillColorHex != nil)
                 && shape.kind != .line && shape.kind != .arrow
         }
@@ -152,6 +151,94 @@ extension CanvasPageElement {
             CanvasHitGeometry.segment(from: polygon[index], to: polygon[(index + 1) % polygon.count],
                                       intersects: area, step: max(tolerance, 1 / displayScale))
         }
+    }
+}
+
+/// PencilKit point footprints are ink-specific, not Core Graphics stroke widths.
+/// Measure bounded cross-sections in the original renderer, away from line caps.
+private enum NativeInkWidth {
+    private static let cache: NSCache<NSData, NSNumber> = {
+        let cache = NSCache<NSData, NSNumber>()
+        cache.countLimit = 128
+        cache.totalCostLimit = 2 * 1024 * 1024
+        return cache
+    }()
+
+    static func measure(_ stroke: PKStroke) -> CGFloat? {
+        let samples = Array(stroke.path)
+        guard samples.count >= 2 else { return nil }
+        let transform = stroke.transform
+        let points = samples.map { $0.location.applying(transform) }
+        let alpha = stroke.ink.color.cgColor.alpha
+        guard alpha > 0 else { return nil }
+        var signature: [Double] = [Double(stroke.randomSeed), Double(alpha),
+            Double(transform.a), Double(transform.b), Double(transform.c), Double(transform.d)]
+        for (sample, point) in zip(samples, points) {
+            signature += [Double(point.x - points[0].x), Double(point.y - points[0].y),
+                Double(sample.size.width), Double(sample.size.height), Double(sample.opacity),
+                Double(sample.force), Double(sample.azimuth), Double(sample.altitude), Double(sample.secondaryScale)]
+        }
+        var key = Data(stroke.ink.inkType.rawValue.utf8)
+        signature.withUnsafeBytes { key.append(contentsOf: $0) }
+        if let cached = cache.object(forKey: key as NSData) { return CGFloat(cached.doubleValue) }
+
+        var distances = [CGFloat](repeating: 0, count: points.count)
+        for index in 1..<points.count {
+            distances[index] = distances[index - 1] + hypot(points[index].x - points[index - 1].x,
+                                                           points[index].y - points[index - 1].y)
+        }
+        guard let length = distances.last, length > 0 else { return nil }
+        let drawing = PKDrawing(strokes: [stroke])
+        let transformScale = sqrt(transform.a * transform.a + transform.b * transform.b
+            + transform.c * transform.c + transform.d * transform.d)
+        let footprint = samples.map { max($0.size.width, $0.size.height) }.max() ?? 1
+        let radius = min(128, max(8, footprint * transformScale * 2 + 4))
+        var widths: [CGFloat] = []
+        for fraction: CGFloat in [0.23, 0.47, 0.73] {
+            let distance = length * fraction
+            guard let index = (1..<points.count).first(where: { distances[$0] >= distance }),
+                  distances[index] > distances[index - 1] else { continue }
+            let a = points[index - 1], b = points[index]
+            let t = (distance - distances[index - 1]) / (distances[index] - distances[index - 1])
+            let center = CGPoint(x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y))
+            let rotation = CGAffineTransform(translationX: -center.x, y: -center.y)
+                .concatenating(CGAffineTransform(rotationAngle: -atan2(b.y - a.y, b.x - a.x)))
+            let scale: CGFloat = 8
+            let rect = CGRect(x: -2, y: -radius, width: 4, height: radius * 2)
+            guard let image = drawing.transformed(using: rotation).image(from: rect, scale: scale).cgImage,
+                  let width = crossSectionWidth(image, scale: scale, alpha: alpha) else { continue }
+            widths.append(width)
+        }
+        guard !widths.isEmpty else { return nil }
+        let result = max(0.001, widths.sorted()[widths.count / 2])
+        cache.setObject(NSNumber(value: Double(result)), forKey: key as NSData, cost: key.count)
+        return result
+    }
+
+    private static func crossSectionWidth(_ image: CGImage, scale: CGFloat, alpha: CGFloat) -> CGFloat? {
+        let width = image.width, height = image.height
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        let rendered = bytes.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(data: buffer.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { return nil }
+        let columns = (width / 4)..<(width - width / 4)
+        let coverage = (0..<height).map { y in
+            columns.reduce(CGFloat.zero) { $0 + CGFloat(bytes[(y * width + $1) * 4 + 3]) / 255 }
+                / CGFloat(columns.count) / alpha
+        }
+        // Ignore another edge of a small closed shape crossing the same crop.
+        guard let center = coverage.indices.filter({ coverage[$0] > 0.005 })
+            .min(by: { abs($0 - height / 2) < abs($1 - height / 2) }) else { return nil }
+        var lower = center, upper = center
+        while lower > 0, coverage[lower - 1] > 0.005 { lower -= 1 }
+        while upper + 1 < height, coverage[upper + 1] > 0.005 { upper += 1 }
+        guard lower > 0, upper + 1 < height else { return nil }
+        return coverage[lower...upper].reduce(0, +) / scale
     }
 }
 
@@ -188,10 +275,9 @@ enum CanvasHitGeometry {
         stroke.ink.color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         let color = String(format: "#%02X%02X%02X%02X", Int((red * 255).rounded()),
                            Int((green * 255).rounded()), Int((blue * 255).rounded()), Int((alpha * 255).rounded()))
-        let scale = sqrt(abs(stroke.transform.a * stroke.transform.d - stroke.transform.b * stroke.transform.c))
-        let width = stroke.path.map { $0.size.width }.reduce(0, +) / CGFloat(stroke.path.count) * scale
+        guard let width = NativeInkWidth.measure(stroke) else { return nil }
         var element = CanvasPageElement(logicalBounds: stroke.renderBounds,
-            payload: .shape(PageShapePayload(kind: kind, strokeColorHex: color, lineWidth: max(1, min(20, width)))))
+            payload: .shape(PageShapePayload(kind: kind, strokeColorHex: color, lineWidth: Double(width))))
         element.setShapeVertices(points)
         return element
     }
