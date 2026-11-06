@@ -85,8 +85,15 @@ final class LibraryOrganizationController: ObservableObject {
         Logger(subsystem: "com.tiyi.note", category: "LibraryOrganization").notice("Begin library drag, items=\(selection.count)")
 #endif
         let provider = NSItemProvider()
+        if selection.count == 1, let documentID = selection.documentIDs.first {
+            LibraryDragPDFRepresentation.register(on: provider) {
+                try store.exportFlattenedPDF(documentID: documentID)
+            }
+        }
         let data = Data(drag.token.uuidString.utf8)
-        provider.registerDataRepresentation(forTypeIdentifier: Self.itemType.identifier, visibility: .all) { completion in
+        // This token is only for moving items inside Tiyi. Finder must receive
+        // the PDF file representation rather than saving this UUID as a .pdf.
+        provider.registerDataRepresentation(forTypeIdentifier: Self.itemType.identifier, visibility: .ownProcess) { completion in
             completion(data, nil)
             return nil
         }
@@ -163,6 +170,58 @@ final class LibraryOrganizationController: ObservableObject {
         let key = "library.move.recent." + store.libraryOrganizationKey
         let value = destination ?? "__root__"
         UserDefaults.standard.set([value], forKey: key)
+    }
+}
+
+@MainActor
+enum LibraryDragPDFRepresentation {
+    static func register(on provider: NSItemProvider, export: @escaping @MainActor () throws -> URL) {
+        let file = LazyFile(export: export)
+        provider.registerFileRepresentation(forTypeIdentifier: UTType.pdf.identifier, fileOptions: [], visibility: .all) { completion in
+            let progress = Progress(totalUnitCount: 1)
+            Task { @MainActor in
+                defer { progress.completedUnitCount = 1 }
+                do {
+                    guard !progress.isCancelled else { throw CocoaError(.userCancelled) }
+                    completion(try file.url(), false, nil)
+                } catch {
+                    completion(nil, false, error)
+                }
+            }
+            return progress
+        }
+        // Catalyst drag destinations may request PDF bytes rather than a file
+        // promise. Both forms must vend the same complete exported snapshot.
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.pdf.identifier, visibility: .all) { completion in
+            let progress = Progress(totalUnitCount: 1)
+            Task { @MainActor in
+                defer { progress.completedUnitCount = 1 }
+                do {
+                    guard !progress.isCancelled else { throw CocoaError(.userCancelled) }
+                    completion(try Data(contentsOf: file.url()), nil)
+                } catch {
+                    completion(nil, error)
+                }
+            }
+            return progress
+        }
+    }
+
+    // Finder can ask for the same representation more than once. Export only
+    // when it requests the file, and reuse that snapshot for the whole drag.
+    @MainActor
+    private final class LazyFile {
+        let export: @MainActor () throws -> URL
+        private var exportedURL: URL?
+
+        init(export: @escaping @MainActor () throws -> URL) { self.export = export }
+
+        func url() throws -> URL {
+            if let exportedURL { return exportedURL }
+            let url = try export()
+            exportedURL = url
+            return url
+        }
     }
 }
 
