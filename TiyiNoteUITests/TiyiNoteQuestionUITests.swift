@@ -85,6 +85,43 @@ final class TiyiNoteQuestionUITests: XCTestCase {
         XCTAssertTrue(practice.buttons["tool-lasso"].exists)
     }
 
+    func testWholePaperQuestionRestoresWithoutChangingSourcePage() throws {
+        let app = launch("practice-sidebar-web-paper")
+        let source = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(source.waitForExistence(timeout: 10))
+        let sourceFrame = source.frame
+        circle(in: app, canvas: source)
+        app.buttons["question-confirm"].tap()
+        let editor = app.descendants(matching: .any)["question-answer-editor"]
+        let exit = editor.buttons["practice-exit"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["tool-question"].waitForNonExistence(timeout: 10))
+        XCTAssertTrue(exit.waitForExistence(timeout: 10))
+        let answer = editor.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(answer.waitForExistence(timeout: 5))
+        answer.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5)).press(forDuration: 0.05,
+            thenDragTo: answer.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.6)))
+        XCTAssertTrue(waitValue("笔迹 1", element: answer))
+        let ink = try XCTUnwrap(field("范围 ", of: answer))
+        exit.tap()
+        let marker = app.descendants(matching: .any)["question-marker"]
+        XCTAssertTrue(marker.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["tool-question"].exists)
+        XCTAssertEqual(source.frame, sourceFrame)
+        XCTAssertTrue(waitValue("笔迹 0", element: source))
+
+        app.terminate()
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.launch()
+        XCTAssertTrue(marker.waitForExistence(timeout: 10))
+        openMarker(in: app, marker: marker)
+        XCTAssertTrue(app.buttons["tool-question"].waitForNonExistence(timeout: 10))
+        XCTAssertTrue(waitValue("笔迹 1", element: answer))
+        XCTAssertEqual(field("范围 ", of: answer), ink)
+        exit.tap()
+        XCTAssertTrue(marker.waitForExistence(timeout: 10))
+    }
+
     func testMarkerLassoEnterDeleteAndDragPersist() {
         let app = launch("question-marker-lasso")
         let canvas = app.descendants(matching: .any)["page-canvas-0"]

@@ -122,17 +122,28 @@ private struct PracticeSidebarUITestHost: View {
             UserDefaults(suiteName: "tiyi.practice.\(configuration.token)")?
                 .removePersistentDomain(forName: "tiyi.practice.\(configuration.token)")
         }
-        let sections = [TiyiPracticeSection(id: "a", label: "第 1 题"), .init(id: "b", label: "第 2 题")]
-        let seeds = sections.map { section in
-            let image = UIGraphicsImageRenderer(size: CGSize(width: 696, height: 220)).image { context in
-                UIColor.white.setFill(); context.fill(CGRect(x: 0, y: 0, width: 696, height: 220))
-                ("\(section.label)：已知 x² + 1 = 5，求 x 的值。" as NSString).draw(
-                    at: CGPoint(x: 20, y: 24), withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
-                )
+        let workspace: TiyiPracticeWorkspace
+        if configuration.token.hasPrefix("practice-sidebar-web-paper") {
+            let pdf = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 595, height: 842)).pdfData { context in
+                context.beginPage()
+                ("1. 已知 x² + 1 = 5，求 x 的值。" as NSString).draw(
+                    at: CGPoint(x: 114, y: 155), withAttributes: [.font: UIFont.systemFont(ofSize: 20)])
             }
-            return TiyiPracticePageSeed(questionID: section.id, image: image)
+            workspace = try! TiyiPracticeWorkspace(directory: directory, title: "整卷作答自测",
+                sections: [.init(id: "paper", label: "整卷作答")], preservesSourcePages: true, sourcePDF: pdf)
+        } else {
+            let sections = [TiyiPracticeSection(id: "a", label: "第 1 题"), .init(id: "b", label: "第 2 题")]
+            let seeds = sections.map { section in
+                let image = UIGraphicsImageRenderer(size: CGSize(width: 696, height: 220)).image { context in
+                    UIColor.white.setFill(); context.fill(CGRect(x: 0, y: 0, width: 696, height: 220))
+                    ("\(section.label)：已知 x² + 1 = 5，求 x 的值。" as NSString).draw(
+                        at: CGPoint(x: 20, y: 24), withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
+                    )
+                }
+                return TiyiPracticePageSeed(questionID: section.id, image: image)
+            }
+            workspace = try! TiyiPracticeWorkspace(directory: directory, title: "作答页面自测", sections: sections, seeds: seeds)
         }
-        let workspace = try! TiyiPracticeWorkspace(directory: directory, title: "作答页面自测", sections: sections, seeds: seeds)
         _workspace = StateObject(wrappedValue: workspace)
     }
 

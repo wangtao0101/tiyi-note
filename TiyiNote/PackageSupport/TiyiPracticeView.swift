@@ -60,6 +60,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     let defaults: UserDefaults
     public let documentID: String
     public let title: String
+    public let preservesSourcePages: Bool
     @Published public private(set) var sections: [TiyiPracticeSection]
     @Published public private(set) var currentPageID: String?
     @Published var requestedPageID: String?
@@ -91,9 +92,11 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     private let layoutURL: URL
 
     public init(directory: URL, title: String, sections: [TiyiPracticeSection], packageData: Data? = nil,
-                seeds: [TiyiPracticePageSeed] = [], lastPageID: String? = nil, cachedQuestionPDFs: Bool = false) throws {
+                seeds: [TiyiPracticePageSeed] = [], lastPageID: String? = nil, cachedQuestionPDFs: Bool = false,
+                preservesSourcePages: Bool = false, sourcePDF: Data? = nil) throws {
         self.title = title
         self.cachedQuestionPDFs = cachedQuestionPDFs
+        self.preservesSourcePages = preservesSourcePages
         questionCache = directory.appendingPathComponent("QuestionPDFCache-v1")
         closeReadingCache = directory.appendingPathComponent("CloseReadingPDFCache-v6")
         try FileManager.default.createDirectory(at: questionCache, withIntermediateDirectories: true)
@@ -110,6 +113,18 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
             try (cachedQuestionPDFs ? Self.hydrateCachelessPackage(packageData) : packageData).write(to: temporary, options: .atomic)
             defer { try? FileManager.default.removeItem(at: temporary) }
             documentID = try store.importEditableDocumentPackage(from: temporary).id
+        } else if preservesSourcePages {
+            guard let sourcePDF, sections.count == 1, let pdf = PDFDocument(data: sourcePDF),
+                  (1...500).contains(pdf.pageCount) else { throw CocoaError(.fileReadCorruptFile) }
+            let validTitle = String(title.prefix(100)).replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+            let temporary = directory.appendingPathComponent(validTitle).appendingPathExtension("pdf")
+            try sourcePDF.write(to: temporary, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            guard let document = try store.importPDFs(from: [temporary], into: nil).first else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            documentID = document.id
+            mapped[0].pageIDs = store.pages(in: document.id).map(\.id)
         } else if cachedQuestionPDFs {
             guard !sections.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
             let document = try store.createCanvas(named: String(title.prefix(100)).replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-"), in: nil, backgroundStyle: .blank, backgroundColor: .white, size: CGSize(width: 768, height: 1086))
@@ -137,7 +152,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
             for index in mapped.indices { mapped[index].pageIDs = zip(seeds, pages).filter { $0.0.questionID == mapped[index].id }.map { $0.1.id } }
         }
         // Also migrate existing local workspaces and packages restored from older app versions.
-        try store.enableUnboundedCanvas(for: documentID)
+        if !preservesSourcePages { try store.enableUnboundedCanvas(for: documentID) }
         self.sections = mapped
         currentPageID = lastPageID ?? mapped.first?.pageIDs.first
         defaults.set(documentID, forKey: "pdfWorkspace.activeDocumentID")
@@ -295,7 +310,7 @@ extension Notification.Name { static let tiyiPracticeCheckpoint = Notification.N
     }
 
     public func appendPage() throws {
-        guard let section = currentSection else { return }
+        guard !preservesSourcePages, let section = currentSection else { return }
         try performPageMutation {
             let page = try store.insertTemplatePage(after: section.pageIDs.last, in: documentID, size: CGSize(width: 768, height: 1086))
             selectPage(page.id)
@@ -526,7 +541,9 @@ public struct TiyiPracticeActions: View {
                     Button("重试准备剩余题面") { Task { await workspace.prepareRemainingQuestions() } }
                         .help(error)
                 }
-                Button("插入作答页", systemImage: "doc.badge.plus") { do { try workspace.appendPage() } catch { workspace.errorMessage = error.localizedDescription } }.accessibilityIdentifier("practice-add-page")
+                if !workspace.preservesSourcePages {
+                    Button("插入作答页", systemImage: "doc.badge.plus") { do { try workspace.appendPage() } catch { workspace.errorMessage = error.localizedDescription } }.accessibilityIdentifier("practice-add-page")
+                }
                 if workspace.onAnswer != nil && workspace.currentSection?.isReferencePage != true {
                     Button("答案与解析", systemImage: "text.book.closed") { if let id = workspace.currentSection?.id { workspace.onAnswer?(id) } }
                 }

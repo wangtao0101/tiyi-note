@@ -64,6 +64,11 @@ extension DrawingDocumentStore {
 extension TiyiPracticeWorkspace {
     public func assistantImages(includesAnswer: Bool = true) throws -> [TiyiAssistantImage] {
         try checkpoint()
+        if preservesSourcePages {
+            guard let pageID = currentPageID, let index = store.pageIndex(for: pageID, in: documentID) else { return [] }
+            return [TiyiAssistantImage(id: pageID, label: "试卷第 \(index + 1) 页",
+                data: try store.assistantImage(documentID: documentID, pageIndex: index, includesAnswer: includesAnswer))]
+        }
         guard let section = currentSection else { return [] }
         let pageIDs = includesAnswer ? section.pageIDs : section.pageIDs.filter { id in
             guard let index = store.pageIndex(for: id, in: documentID) else { return false }

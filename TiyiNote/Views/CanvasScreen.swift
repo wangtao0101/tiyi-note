@@ -20,6 +20,10 @@ struct CanvasScreen: View {
     var handout: TiyiHandoutWorkspace?
     var navigation: TiyiWorkspaceNavigation?
 
+    private var allowsQuestionCapture: Bool {
+        handout == nil && (practice == nil || practice?.preservesSourcePages == true)
+    }
+
     @AppStorage("pdfWorkspace.activeDocumentID") private var storedActiveDocumentID = "congruence"
     private let documentSelection: Binding<String>?
     private var activeDocumentID: String {
@@ -171,7 +175,10 @@ struct CanvasScreen: View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
                 workspaceHeader
+                    .accessibilityElement(children: .contain)
+                    .accessibilityHidden(questionSession != nil)
                 workspaceToolbar
+                    .accessibilityHidden(questionSession != nil)
                 AssistantSplitView(
                     maximumWidth: min(480, geometry.size.width * 0.48),
                     assistant: showsAssistant && geometry.size.width >= 900 ? assistantPanel : nil,
@@ -312,7 +319,7 @@ struct CanvasScreen: View {
                 canClearPage: activeController != nil,
                 onDocumentAction: handleDocumentOutput,
                 onClearPage: requestClearCurrentPage,
-                allowsQuestionCapture: practice == nil && handout == nil,
+                allowsQuestionCapture: allowsQuestionCapture,
                 onAssistant: onAssistant,
                 isAssistantOpen: showsAssistant,
                 practiceVersionTitle: practiceVersionTitle,
@@ -366,9 +373,9 @@ struct CanvasScreen: View {
                             isScribbleEraseEnabled: isScribbleEraseEnabled,
                             isAnnotationEditingEnabled: annotationEditingEnabled,
                             practice: practice,
+                            allowsQuestionCapture: allowsQuestionCapture,
                             initialPageIndex: documentStore.lastViewedPage(for: activeDocument.id),
                             onOpenQuestionSession: { session in
-                                guard practice == nil else { return }
                                 questionSession = session
                             },
                             onSelectLassoTool: {
@@ -436,10 +443,19 @@ struct CanvasScreen: View {
             closingQuestionSession = nil
         }) { session in
             TiyiPracticeEditor(workspace: session.workspace) {
+                // The child editor has saved into the source page. Include that
+                // attachment in the parent attempt before returning to the PDF.
+                do { try practice?.checkpoint() }
+                catch {
+                    session.workspace.errorMessage = "整卷作答保存失败：\(error.localizedDescription)"
+                    return
+                }
                 closingQuestionSession = session
                 questionSession = nil
             }
             .interactiveDismissDisabled()
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("question-answer-editor")
         }
         .onAppear(perform: prepareWorkspace)
         .onChange(of: handout?.requestedPageID) { _, id in
@@ -471,7 +487,12 @@ struct CanvasScreen: View {
             // drain from blocking the first Pencil samples when the interruption disappears.
             guard phase == .background else { return }
             flushPendingAnnotations()
-            if let practice { do { try practice.checkpoint() } catch { practice.errorMessage = error.localizedDescription } }
+            if let practice {
+                do {
+                    try questionSession?.workspace.checkpoint()
+                    try practice.checkpoint()
+                } catch { (questionSession?.workspace ?? practice).errorMessage = error.localizedDescription }
+            }
         }
         .fileImporter(
             isPresented: $showsPDFImporter,

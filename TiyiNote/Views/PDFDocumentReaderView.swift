@@ -32,6 +32,7 @@ struct PDFDocumentReaderView: View {
     let isScribbleEraseEnabled: Bool
     let isAnnotationEditingEnabled: Bool
     let practice: TiyiPracticeWorkspace?
+    let allowsQuestionCapture: Bool
     let onOpenQuestionSession: (DocumentQuestionSession) -> Void
     let onSelectLassoTool: () -> Void
     let onSelectTextTool: () -> Void
@@ -55,7 +56,7 @@ struct PDFDocumentReaderView: View {
         documentStore.document(withID: documentID)?.kind == .canvas
     }
     private var usesContinuousPDFScrolling: Bool {
-        !isUnboundedCanvas && practice == nil && documentStore.handoutWorkspace == nil
+        !isUnboundedCanvas && (practice == nil || practice?.preservesSourcePages == true) && documentStore.handoutWorkspace == nil
     }
     private let minimumZoomScale = CanvasViewport.minimumZoomScale
     private let maximumZoomScale = CanvasViewport.maximumZoomScale
@@ -76,6 +77,7 @@ struct PDFDocumentReaderView: View {
         isScribbleEraseEnabled: Bool = true,
         isAnnotationEditingEnabled: Bool = true,
         practice: TiyiPracticeWorkspace? = nil,
+        allowsQuestionCapture: Bool = false,
         initialPageIndex: Int,
         onOpenQuestionSession: @escaping (DocumentQuestionSession) -> Void,
         onSelectLassoTool: @escaping () -> Void,
@@ -97,6 +99,7 @@ struct PDFDocumentReaderView: View {
         self.isScribbleEraseEnabled = isScribbleEraseEnabled
         self.isAnnotationEditingEnabled = isAnnotationEditingEnabled
         self.practice = practice
+        self.allowsQuestionCapture = allowsQuestionCapture
         self.onOpenQuestionSession = onOpenQuestionSession
         self.onSelectLassoTool = onSelectLassoTool
         self.onSelectTextTool = onSelectTextTool
@@ -139,7 +142,7 @@ struct PDFDocumentReaderView: View {
                     documentStore: documentStore,
                     documentID: documentID,
                     currentPageIndex: currentPageIndex,
-                    isEditingEnabled: isAnnotationEditingEnabled,
+                    isEditingEnabled: isAnnotationEditingEnabled && practice?.preservesSourcePages != true,
                     practice: practice,
                     onSelectPage: requestPage,
                     onClose: {
@@ -271,7 +274,7 @@ struct PDFDocumentReaderView: View {
                 }
                 // SwiftUI can re-enable its pager recognizer after a sidebar/layout update.
                 // Keep the scroll policy in SwiftUI as well as the native camera bridge.
-                .scrollDisabled(practice != nil)
+                .scrollDisabled(practice != nil && !usesContinuousPDFScrolling)
                 .modifier(DocumentScrollTargetModifier(continuous: usesContinuousPDFScrolling))
                 .modifier(DocumentScrollPositionModifier(continuous: usesContinuousPDFScrolling,
                     position: $pdfScrollPosition, pageID: $visiblePageID))
@@ -354,9 +357,9 @@ struct PDFDocumentReaderView: View {
             eraserMode: eraserMode,
             isScribbleEraseEnabled: isScribbleEraseEnabled,
             isAnnotationEditingEnabled: isAnnotationEditingEnabled,
-            pagesNavigateFromSidebarOnly: practice != nil || documentStore.handoutWorkspace != nil,
+            pagesNavigateFromSidebarOnly: (practice != nil && !usesContinuousPDFScrolling) || documentStore.handoutWorkspace != nil,
             usesContinuousPDFScrolling: usesContinuousPDFScrolling,
-            allowsQuestionCapture: practice == nil && documentStore.handoutWorkspace == nil,
+            allowsQuestionCapture: allowsQuestionCapture,
             onOpenQuestionSession: onOpenQuestionSession,
             onSelectLassoTool: onSelectLassoTool,
             onSelectTextTool: onSelectTextTool,
