@@ -120,6 +120,7 @@ final class CanvasController: NSObject, ObservableObject {
     private var usesStrokeEraser = false
     private var heldShape: (drawing: PKDrawing, kind: HeldInkShapeKind, points: [CGPoint])?
     private var shapePreview: UIImageView?
+    private var heldLinePreview: (imageView: UIImageView, worldRect: CGRect, zoom: CGFloat, tipOffset: CGPoint)?
     private var originalCanvasMask: CALayer?
     private var isShapePreviewVisible = false
     private var authoritativeSnappedDrawing: PKDrawing? {
@@ -221,6 +222,7 @@ final class CanvasController: NSObject, ObservableObject {
             self.beginShapeTracking()
         }
         heldInkRecognizer.onHold = { [weak self] points in self?.previewHeldShape(points) ?? false }
+        heldInkRecognizer.onPreviewMoved = { [weak self] point in self?.moveHeldLineEndpoint(to: point) ?? false }
         heldInkRecognizer.onResume = { [weak self] in
             guard let self else { return }
 #if DEBUG
@@ -235,7 +237,7 @@ final class CanvasController: NSObject, ObservableObject {
             if cancelled {
                 self.pendingScribbles.removeAll()
                 self.discardShapePreview()
-            } else if self.scribbleAllowedForContact, self.isScribbleEraseEnabled,
+            } else if self.heldShape == nil, self.scribbleAllowedForContact, self.isScribbleEraseEnabled,
                       self.selectedToolKind.isPenVariant, let index = self.shapeGestureOriginStrokeCount {
                 let scale = max(self.canvasView.zoomScale, 0.0001)
                 let worldPoints = points.map { CGPoint(x: $0.x + self.canvasWorldOrigin.x,
@@ -1184,6 +1186,11 @@ final class CanvasController: NSObject, ObservableObject {
                 let line = Self.straightenedStroke(source, endpoints: shape.points)
                 heldShape = (PKDrawing(strokes: Array(shape.drawing.strokes.prefix(originCount)) + [line]),
                              shape.kind, shape.points)
+            } else if shape.kind == .line, let style = shapeSnapInkStyle {
+                // Even if native delivery times out, commit the last dragged endpoint.
+                let line = regularStroke(points: shape.points, inkStyle: style)
+                heldShape = (PKDrawing(strokes: Array(shape.drawing.strokes.prefix(originCount)) + [line]),
+                             shape.kind, shape.points)
             }
         }
 
@@ -1384,7 +1391,9 @@ final class CanvasController: NSObject, ObservableObject {
             width: canvasView.bounds.width / zoom,
             height: canvasView.bounds.height / zoom
         )
-        let inkImage = snapped.image(from: visibleWorldRect, scale: zoom * canvasView.traitCollection.displayScale)
+        // Cache existing ink once. Moving a held line only redraws that one line, never the page.
+        let background = candidate.kind == .line ? PKDrawing(strokes: Array(existing.prefix(originCount))) : snapped
+        let inkImage = background.image(from: visibleWorldRect, scale: zoom * canvasView.traitCollection.displayScale)
         let preview = UIImageView(image: inkImage)
         preview.frame = canvasView.frame
         preview.isOpaque = false
@@ -1396,6 +1405,15 @@ final class CanvasController: NSObject, ObservableObject {
         preview.accessibilityLabel = "规整预览"
         preview.accessibilityValue = candidate.kind.title
         shapePreview = preview
+        if candidate.kind == .line, let tip = localPoints.last, let end = worldPoints.last {
+            let linePreview = UIImageView()
+            linePreview.isUserInteractionEnabled = false
+            preview.addSubview(linePreview)
+            heldLinePreview = (linePreview, visibleWorldRect, zoom,
+                               CGPoint(x: end.x - tip.x - canvasWorldOrigin.x,
+                                       y: end.y - tip.y - canvasWorldOrigin.y))
+            updateHeldLinePreview(stroke)
+        }
         originalCanvasMask = canvasView.layer.mask
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -1410,6 +1428,39 @@ final class CanvasController: NSObject, ObservableObject {
         return true
     }
 
+    private func moveHeldLineEndpoint(to localPoint: CGPoint) -> Bool {
+        guard isShapePreviewVisible, heldShape?.kind == .line,
+              let preview = heldLinePreview, let start = heldShape?.points.first,
+              let style = shapeSnapInkStyle else { return false }
+        let end = CGPoint(x: localPoint.x + canvasWorldOrigin.x + preview.tipOffset.x,
+                          y: localPoint.y + canvasWorldOrigin.y + preview.tipOffset.y)
+        let points = [start, end]
+        // Keep the original drawing/date until Pencil-up; finalization replaces its last stroke
+        // once, using the native contact's ink attributes and these latest endpoints.
+        heldShape?.points = points
+        updateHeldLinePreview(regularStroke(points: points, inkStyle: style))
+        return true
+    }
+
+    private func updateHeldLinePreview(_ stroke: PKStroke) {
+        guard let preview = heldLinePreview else { return }
+        let rect = stroke.renderBounds.insetBy(dx: -2, dy: -2).intersection(preview.worldRect)
+        guard !rect.isNull, !rect.isEmpty else {
+            preview.imageView.image = nil
+            return
+        }
+        let image = PKDrawing(strokes: [stroke]).image(
+            from: rect, scale: preview.zoom * canvasView.traitCollection.displayScale
+        )
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        preview.imageView.frame = CGRect(x: (rect.minX - preview.worldRect.minX) * preview.zoom,
+                                        y: (rect.minY - preview.worldRect.minY) * preview.zoom,
+                                        width: rect.width * preview.zoom, height: rect.height * preview.zoom)
+        preview.imageView.image = image
+        CATransaction.commit()
+    }
+
     private func discardShapePreview() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -1420,6 +1471,7 @@ final class CanvasController: NSObject, ObservableObject {
         CATransaction.commit()
         isShapePreviewVisible = false
         shapePreview = nil
+        heldLinePreview = nil
         originalCanvasMask = nil
         heldShape = nil
     }

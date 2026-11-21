@@ -4128,27 +4128,72 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         XCTAssertEqual(drawingGeometryValue(of: relaunchedCanvas), finalGeometry)
     }
 
-    func testMovingAfterHeldPreviewRestoresTheSameFreehandStroke() throws {
-        let app = launchIsolatedApp(prefix: "shape-hold-resume")
+    func testMovingAfterHeldLineDragsEndpointAndKeepsOneUndoStep() throws {
+        let app = launchIsolatedApp(prefix: "shape-hold-endpoint")
         let canvas = app.descendants(matching: .any)["page-canvas-0"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        app.buttons["tool-pen"].tap()
+        app.buttons["pen-variant-fountainPen"].tap()
+        app.buttons["ink-width-preset-0"].tap()
+        app.buttons["ink-color-graphite"].tap()
         let frame = canvas.frame
         let points = [CGPoint(x: frame.minX + frame.width * 0.25, y: frame.minY + frame.height * 0.3),
                       CGPoint(x: frame.minX + frame.width * 0.65, y: frame.minY + frame.height * 0.3),
                       CGPoint(x: frame.minX + frame.width * 0.45, y: frame.minY + frame.height * 0.5),
-                      CGPoint(x: frame.minX + frame.width * 0.7, y: frame.minY + frame.height * 0.55)]
+                      CGPoint(x: frame.minX + frame.width * 0.4, y: frame.minY + frame.height * 0.55)]
         try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 0.1,
                                 pauseAfterPointIndex: 1, pauseDuration: 1.15)
         waitForValue("笔迹 1", of: canvas)
-        XCTAssertTrue((canvas.value as? String)?.contains("吸附 无") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("吸附 直线") == true)
         XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 1") == true)
-        XCTAssertTrue((canvas.value as? String)?.contains("恢复手绘 1") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("恢复手绘 0") == true)
         let viewport = try canvasViewportRect(of: canvas)
-        XCTAssertGreaterThan(try drawingBounds(of: canvas).height, viewport.height * 0.23)
+        let bounds = try drawingBounds(of: canvas)
+        XCTAssertEqual(bounds.minX, viewport.minX + viewport.width * 0.25, accuracy: 10)
+        XCTAssertEqual(bounds.minY, viewport.minY + viewport.height * 0.3, accuracy: 10)
+        XCTAssertEqual(bounds.maxX, viewport.minX + viewport.width * 0.4, accuracy: 10)
+        XCTAssertEqual(bounds.maxY, viewport.minY + viewport.height * 0.55, accuracy: 10)
+        let pixels = canvas.screenshot().pngRepresentation
+        XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: pixels, around: CGPoint(x: 0.325, y: 0.425), radius: 12)), 300)
+        XCTAssertLessThan(try XCTUnwrap(inkDarkness(in: pixels, around: CGPoint(x: 0.55, y: 0.3), radius: 12)), 100)
+        let geometry = drawingGeometryValue(of: canvas)
         app.buttons["撤销"].tap()
         waitForValue("笔迹 0", of: canvas)
         app.buttons["重做"].tap()
         waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+        drawStroke(on: canvas, from: CGVector(dx: 0.25, dy: 0.75), to: CGVector(dx: 0.6, dy: 0.76))
+        waitForValue("笔迹 2", of: canvas)
+        app.buttons["撤销"].tap()
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertEqual(drawingGeometryValue(of: canvas), geometry)
+        RunLoop.current.run(until: Date().addingTimeInterval(2))
+        app.launchArguments.append("--reuse-text-interaction-ui-test-workspace")
+        app.terminate()
+        app.launch()
+        let relaunchedCanvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(relaunchedCanvas.waitForExistence(timeout: 8))
+        waitForValue("笔迹 1", of: relaunchedCanvas, timeout: 5)
+        XCTAssertEqual(drawingGeometryValue(of: relaunchedCanvas), geometry)
+    }
+
+    func testMovingAfterHeldCircleStillRestoresFreehand() throws {
+        let app = launchIsolatedApp(prefix: "shape-hold-circle-resume")
+        let canvas = app.descendants(matching: .any)["page-canvas-0"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let frame = canvas.frame
+        let radius = min(frame.width, frame.height) * 0.12
+        var points = (0...32).map { index in
+            let angle = CGFloat(index) / 32 * .pi * 2
+            return CGPoint(x: frame.midX + cos(angle) * radius, y: frame.midY + sin(angle) * radius)
+        }
+        points.append(CGPoint(x: frame.minX + frame.width * 0.8, y: frame.minY + frame.height * 0.75))
+        try synthesizeTouchPath(points, on: canvas, in: app, holdBeforeLift: 0.1,
+                                pauseAfterPointIndex: 32, pauseDuration: 1.15)
+        waitForValue("笔迹 1", of: canvas)
+        XCTAssertTrue((canvas.value as? String)?.contains("吸附 无") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("停笔预览 1") == true)
+        XCTAssertTrue((canvas.value as? String)?.contains("恢复手绘 1") == true)
     }
 
     func testHeldShapeAtReducedZoomUsesWorldCoordinatesAndKeepsTheNextContact() throws {
@@ -4162,7 +4207,8 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let firstStart = CGPoint(x: frame.minX + frame.width * 0.22, y: frame.minY + frame.height * 0.22)
         let firstEnd = CGPoint(x: frame.minX + frame.width * 0.5, y: firstStart.y)
         try synthesizeTouchPaths([
-            SynthesizedTouchPath(samples: [(firstStart, 0), (firstEnd, 0.3)], liftOffset: 1.5),
+            SynthesizedTouchPath(samples: [(firstStart, 0), (firstEnd, 0.3), (firstEnd, 1.35),
+                                           (CGPoint(x: firstEnd.x + 60, y: firstEnd.y), 1.45)], liftOffset: 1.5),
             SynthesizedTouchPath(samples: [(CGPoint(x: firstEnd.x, y: firstEnd.y + 80), 1.54),
                                            (CGPoint(x: firstEnd.x + 80, y: firstEnd.y + 100), 1.84)], liftOffset: 1.94)
         ], on: canvas, in: app)
@@ -4173,6 +4219,7 @@ final class TiyiNoteTextInteractionUITests: XCTestCase {
         let bounds = try drawingBounds(of: canvas)
         XCTAssertEqual(bounds.minX, viewport.minX + viewport.width * 0.22, accuracy: 12)
         XCTAssertEqual(bounds.midY, viewport.minY + viewport.height * 0.22, accuracy: 12)
+        XCTAssertEqual(bounds.maxX, viewport.minX + viewport.width * (0.5 + 60 / frame.width), accuracy: 12)
         XCTAssertLessThan(bounds.minY, 0)
         XCTAssertGreaterThan(try XCTUnwrap(inkDarkness(in: canvas.screenshot().pngRepresentation,
                                                      around: CGPoint(x: 0.35, y: 0.22), radius: 10)), 300)

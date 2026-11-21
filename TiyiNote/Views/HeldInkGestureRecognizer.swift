@@ -6,6 +6,8 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
     var canTrack: (() -> Bool)?
     var onContactBegan: (() -> Void)?
     var onHold: (([CGPoint]) -> Bool)?
+    /// Return true to keep the held preview and move its endpoint during this same contact.
+    var onPreviewMoved: ((CGPoint) -> Bool)?
     var onResume: (() -> Void)?
     var onContactEnded: (([CGPoint], Bool) -> Void)?
 
@@ -16,6 +18,7 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
     private var lastMotionAt: TimeInterval = 0
     private var holdWorkItem: DispatchWorkItem?
     private var isPreviewing = false
+    private var isDraggingPreview = false
     private let holdDuration: TimeInterval = 0.62
 
     init() {
@@ -50,6 +53,12 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
         guard let touch = trackedTouch, touches.contains(touch) else { return }
         let screenPoint = touch.location(in: nil)
         let motion = hypot(screenPoint.x - stationaryAnchor.x, screenPoint.y - stationaryAnchor.y)
+        if isPreviewing, isDraggingPreview || motion > 6,
+           let point = canvasPoint(touch), onPreviewMoved?(point) == true {
+            isDraggingPreview = true
+            // Endpoint motion is not another freehand stroke or a scribble-erase gesture.
+            return
+        }
         if motion > (isPreviewing ? 6 : 2.5) {
             stationaryAnchor = screenPoint
             lastMotionAt = CACurrentMediaTime()
@@ -64,6 +73,7 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = trackedTouch, touches.contains(touch) else { return }
+        if isDraggingPreview, let point = canvasPoint(touch) { _ = onPreviewMoved?(point) }
         append(touch)
         endContact(cancelled: false)
         state = .failed
@@ -96,14 +106,20 @@ final class HeldInkGestureRecognizer: UIGestureRecognizer {
         let completedPoints = points
         points.removeAll(keepingCapacity: true)
         isPreviewing = false
+        isDraggingPreview = false
         onContactEnded?(completedPoints, cancelled)
     }
 
-    private func append(_ touch: UITouch) {
-        guard let canvas = view as? PKCanvasView else { return }
+    private func canvasPoint(_ touch: UITouch) -> CGPoint? {
+        guard let canvas = view as? PKCanvasView else { return nil }
         let zoom = max(canvas.zoomScale, 0.001)
         let location = touch.location(in: canvas)
-        let point = CGPoint(x: location.x / zoom, y: location.y / zoom)
+        return CGPoint(x: location.x / zoom, y: location.y / zoom)
+    }
+
+    private func append(_ touch: UITouch) {
+        guard let canvas = view as? PKCanvasView, let point = canvasPoint(touch) else { return }
+        let zoom = max(canvas.zoomScale, 0.001)
         if let last = points.last, hypot(point.x - last.x, point.y - last.y) * zoom < 1 { return }
         points.append(point)
         if points.count > 768 {
